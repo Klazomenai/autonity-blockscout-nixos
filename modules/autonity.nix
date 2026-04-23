@@ -3,15 +3,15 @@
 # hardening follows the matrix documented in the `nix-modules-hardening`
 # Claude skill; see `../CONTRIBUTING.md` for the per-repo summary.
 #
-# Expects `autonityPkgs` to be passed via `_module.args` from the flake
-# output (see `../flake.nix`). `autonityPkgs.default` is the minimal ELF
-# variant; operators wanting the bash-wrapped `autonity-portable` can
-# set `services.autonity.package` explicitly.
+# The `klazomenai/autonity` flake is wired into `pkgs` via a
+# `nixpkgs.overlays` entry on the glue-repo's `nixosModules.default`
+# (see `../flake.nix`), so `pkgs.autonity` resolves to the minimal ELF
+# variant and `pkgs.autonity-portable` to the bash-wrapped one.
+# Operators can override `services.autonity.package` to pick either.
 {
   config,
   lib,
   pkgs,
-  autonityPkgs,
   ...
 }:
 
@@ -20,9 +20,9 @@ let
   inherit (lib)
     mkEnableOption
     mkOption
+    mkPackageOption
     mkIf
     types
-    literalExpression
     concatStringsSep
     ;
 
@@ -66,23 +66,21 @@ in
   options.services.autonity = {
     enable = mkEnableOption "Autonity blockchain node";
 
-    package = mkOption {
-      type = types.package;
-      default = autonityPkgs.default;
-      defaultText = literalExpression "autonityPkgs.default";
-      description = ''
-        The Autonity package to run. Defaults to the `klazomenai/autonity`
-        flake input's `packages.<system>.default` (minimal ELF variant).
-      '';
-    };
+    package = mkPackageOption pkgs "autonity" { };
 
     dataDir = mkOption {
       type = types.str;
       default = "/var/lib/autonity";
       description = ''
-        Chain-data directory, surfaced via systemd `StateDirectory`. The
-        path is managed by systemd and does not need to exist on the host
-        ahead of service start.
+        Chain-data directory. Must be an absolute path under `/var/lib/`
+        (enforced via `config.assertions`). The relative part of the
+        path is used as the systemd `StateDirectory`, so the directory
+        is created, owned, and permission-hardened by systemd on each
+        service start — no manual `mkdir` or `chown` needed on the host.
+        Paths outside `/var/lib/` are not supported by this module:
+        `ProtectSystem = "strict"` would block writes there, so an
+        operator needing a custom location must provide their own
+        systemd override rather than just changing this option.
       '';
     };
 
@@ -198,7 +196,7 @@ in
         description = ''
           P2P discovery (UDP) and RLPx (TCP) port. Autonity binds this
           externally on all interfaces by design; it is the only
-          non-loopback port this module opens.
+          non-loopback port this module configures Autonity to bind.
         '';
       };
       maxPeers = mkOption {
@@ -214,6 +212,15 @@ in
           Autonity advertises the interface IP as seen inside its
           network namespace (often `127.0.0.1` behind NAT), and peers
           cannot reach the node.
+        '';
+      };
+      openFirewall = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Open the P2P port in the host firewall. Peer discovery needs
+          both UDP (discovery) and TCP (RLPx) on the same port number,
+          so both families are opened when this is true.
         '';
       };
     };
@@ -241,6 +248,25 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = lib.hasPrefix "/var/lib/" cfg.dataDir && cfg.dataDir != "/var/lib/";
+        message = ''
+          services.autonity.dataDir (`${cfg.dataDir}`) must be an
+          absolute path under `/var/lib/`. Paths outside `/var/lib/`
+          are not supported by this module — `ProtectSystem = "strict"`
+          blocks writes elsewhere and systemd `StateDirectory` is
+          scoped to `/var/lib/`. If you need a custom location,
+          provide a systemd override rather than changing this option.
+        '';
+      }
+    ];
+
+    networking.firewall = mkIf cfg.p2p.openFirewall {
+      allowedTCPPorts = [ cfg.p2p.port ];
+      allowedUDPPorts = [ cfg.p2p.port ];
+    };
+
     systemd.services.autonity = {
       description = "Autonity blockchain node";
       after = [ "network-online.target" ];
@@ -253,7 +279,11 @@ in
         RestartSec = "5s";
 
         DynamicUser = true;
-        StateDirectory = "autonity";
+        # Derived from cfg.dataDir so overriding dataDir also moves the
+        # systemd-managed state directory. The `config.assertions` above
+        # enforces that cfg.dataDir lives under /var/lib/, so this
+        # removePrefix is always defined.
+        StateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
         StateDirectoryMode = "0700";
 
         # Defense-in-depth hardening. See `nix-modules-hardening` skill
@@ -301,12 +331,22 @@ in
 
     # Surface a warning if an operator broadens the JSON-RPC or WS bind
     # beyond loopback — the default is 127.0.0.1 for both, and exposure
-    # should be a conscious decision (typically mediated via nginx).
+    # should be a conscious decision (typically mediated via nginx). The
+    # loopback-safe set includes both IPv4 (`127.0.0.1`) and IPv6 (`::1`)
+    # loopback addresses plus the `localhost` hostname so IPv6-only dev
+    # setups do not trip a false-positive warning.
     warnings =
-      lib.optional (cfg.http.enable && cfg.http.addr != "127.0.0.1" && cfg.http.addr != "localhost")
-        "services.autonity.http.addr is `${cfg.http.addr}` — the HTTP JSON-RPC server will be reachable beyond loopback. Ensure a TLS reverse proxy and authentication front it."
+      let
+        loopbackSafe = [
+          "127.0.0.1"
+          "::1"
+          "localhost"
+        ];
+      in
+      lib.optional (cfg.http.enable && !builtins.elem cfg.http.addr loopbackSafe)
+        "services.autonity.http.addr is `${cfg.http.addr}` — the HTTP JSON-RPC server will be reachable beyond loopback. Ensure a TLS reverse proxy and authentication in front of it."
       ++
-        lib.optional (cfg.ws.enable && cfg.ws.addr != "127.0.0.1" && cfg.ws.addr != "localhost")
-          "services.autonity.ws.addr is `${cfg.ws.addr}` — the WebSocket server will be reachable beyond loopback. Ensure a TLS reverse proxy and authentication front it.";
+        lib.optional (cfg.ws.enable && !builtins.elem cfg.ws.addr loopbackSafe)
+          "services.autonity.ws.addr is `${cfg.ws.addr}` — the WebSocket server will be reachable beyond loopback. Ensure a TLS reverse proxy and authentication in front of it.";
   };
 }

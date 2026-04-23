@@ -33,15 +33,18 @@
       # Top-level aggregate module. Service modules are imported from
       # `modules/default.nix`. Flake inputs that provide runtime packages
       # (autonity for now; blockscout / blockscout-frontend as they
-      # integrate) are exposed to every imported service module via
-      # `_module.args` so the modules stay pure — they never reach into
-      # the flake-outputs closure directly.
-      nixosModules.default =
-        { pkgs, ... }:
-        {
-          imports = [ ./modules ];
-          _module.args.autonityPkgs = autonity.packages.${pkgs.stdenv.hostPlatform.system};
-        };
+      # integrate) are exposed via a `nixpkgs.overlays` entry so service
+      # modules can use the standard `mkPackageOption pkgs "<name>" { }`
+      # idiom — uniform with `CONTRIBUTING.md` and the rest of nixpkgs.
+      nixosModules.default = {
+        imports = [ ./modules ];
+        nixpkgs.overlays = [
+          (final: _prev: {
+            autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
+            autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
+          })
+        ];
+      };
       nixosModules.autonity-blockscout = self.nixosModules.default;
     }
     // flake-utils.lib.eachSystem systems (
