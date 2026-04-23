@@ -9,8 +9,8 @@
 
 {
   imports = [
+    ./autonity.nix
     # Service modules land here as they ship:
-    #   ./autonity.nix
     #   ./blockscout-postgresql.nix
     #   ./blockscout-redis.nix
     #   ./blockscout-backend.nix
