@@ -3,7 +3,7 @@
 # Service modules are added to this imports list as they land in
 # subsequent PRs. The bootstrap aggregate is intentionally empty so the
 # glue-repo scaffolding (flake.nix, devenv.nix, CI, release-please,
-# issue/PR templates, LICENCE, CONTRIBUTING.md) can be reviewed and
+# issue/PR templates, LICENSE, CONTRIBUTING.md) can be reviewed and
 # merged independently of any service-module semantics.
 { ... }:
 

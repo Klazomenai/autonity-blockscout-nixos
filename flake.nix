@@ -4,7 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    flake-utils.inputs.nixpkgs.follows = "nixpkgs";
+    # flake-utils no longer carries a nixpkgs input, so no `follows` wiring
+    # is needed here.
   };
 
   outputs =
@@ -42,7 +43,10 @@
           ];
         };
 
-        # Placeholder flake checks that validate Nix formatting hygiene.
+        # Placeholder flake checks that validate Nix formatting hygiene
+        # across every tracked .nix file in the source tree. Discovery
+        # is filesystem-based so new modules are covered automatically
+        # as they land — no per-module maintenance on this check.
         # Real VM integration tests (`nixosTest`) land with the service
         # modules they exercise.
         checks.fmt =
@@ -51,9 +55,8 @@
               nativeBuildInputs = [ pkgs.nixfmt-rfc-style ];
             }
             ''
-              nixfmt --check ${./flake.nix}
-              nixfmt --check ${./modules/default.nix}
-              nixfmt --check ${./devenv.nix}
+              find ${self} -type f -name '*.nix' -print0 \
+                | xargs -0 nixfmt --check
               touch $out
             '';
       }

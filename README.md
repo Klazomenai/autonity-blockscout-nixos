@@ -33,17 +33,21 @@ Service modules land in subsequent PRs after this bootstrap merges. The current 
 ## Quickstart
 
 ```sh
-# Developer environment (nixfmt, statix, deadnix, pre-commit hooks)
+# Minimal developer environment from the flake — just nixfmt, statix,
+# deadnix on PATH. No hook installation.
 nix develop
-# or, with devenv installed:
+
+# Fuller environment via devenv — same linters PLUS pre-commit hooks
+# (nixfmt / statix / deadnix) installed into .git/hooks/.
 devenv shell
 
-# Run the flake checks
+# Run the flake checks (currently: Nix formatting across all tracked
+# .nix files; VM integration tests land with the first service module).
 nix flake check
 ```
 
 Service-module composition, operator host-config patterns, and VM integration-test runbooks will be documented here as they land.
 
-## Licence
+## License
 
 GPL-3.0-only. See [`LICENSE`](./LICENSE).
