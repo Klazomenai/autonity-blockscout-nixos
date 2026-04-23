@@ -1,0 +1,16 @@
+# Nix build outputs
+result
+result-*
+
+# direnv / devenv
+.direnv/
+.devenv/
+.devenv.flake.nix
+devenv.lock
+
+# Local tooling (pre-commit writes this at devenv-shell entry)
+.pre-commit-config.yaml
+
+# QEMU images (future VM integration tests)
+*.qcow2
+*.img
