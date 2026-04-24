@@ -44,9 +44,27 @@ in
         Name of the PostgreSQL role owning the Blockscout database.
         Created on first service start via
         `services.postgresql.ensureUsers` with
-        `ensureDBOwnership = true`. No password is set here — the
-        Blockscout backend module's `LoadCredential=` secrets pipeline
-        supplies the password at connection time.
+        `ensureDBOwnership = true`.
+
+        This wrapper does NOT set a role password and does NOT
+        configure `pg_hba.conf`. PostgreSQL authentication is a
+        separate concern from socket filesystem access and is left to
+        the consumer:
+
+        - The Blockscout backend module (upcoming PR) will either set
+          a role password from `LoadCredential=` at startup and add a
+          matching `scram-sha-256` entry in
+          `services.postgresql.authentication`, or configure a
+          `pg_ident.conf` username map if `peer` auth is preferred.
+        - Operators bypassing the backend module can configure
+          authentication themselves via
+          `services.postgresql.authentication`.
+
+        Nixpkgs' default `pg_hba.conf` uses `peer` auth for local
+        socket connections, which requires the OS username to match
+        the PostgreSQL role name — incompatible with the
+        `DynamicUser = true` pattern the backend uses (random OS
+        username per run), so additional wiring is always needed.
       '';
     };
 
@@ -85,12 +103,25 @@ in
         }
       ];
 
-      # UNIX-socket-only by default. Blockscout backend connects via
-      # /run/postgresql/.s.PGSQL.5432; joining the `postgres` group via
-      # SupplementaryGroups on its systemd unit grants socket access
-      # without needing a TCP listener or password. `mkDefault` so
-      # operators who genuinely need TCP (external monitoring, remote
-      # admin tools) can still override in their host config.
+      # UNIX-socket-only by default. Two independent layers are at
+      # play here; this wrapper handles only the first:
+      #   1. Socket FILESYSTEM access. /run/postgresql/.s.PGSQL.5432
+      #      is group-owned by `postgres`; consumers grant themselves
+      #      read/write access by joining that group via
+      #      SupplementaryGroups on their own systemd unit.
+      #   2. PostgreSQL AUTHENTICATION (pg_hba.conf). Controls whether
+      #      PostgreSQL trusts the connecting role once the socket has
+      #      been reached. Nixpkgs' default for `local` is `peer` — OS
+      #      username must match the PG role name — which breaks under
+      #      DynamicUser=true (random OS username). The Blockscout
+      #      backend module (or operator host config) must set up
+      #      either scram-sha-256 + a role password from LoadCredential,
+      #      or a pg_ident.conf username map. This wrapper deliberately
+      #      stays out of that second layer; see the upcoming
+      #      blockscout-backend module for the full auth wiring.
+      #
+      # `mkDefault` on each setting so operators who genuinely need TCP
+      # (external monitoring, remote admin tools) can override.
       settings = {
         listen_addresses = mkDefault "";
         unix_socket_directories = mkDefault "/run/postgresql";
