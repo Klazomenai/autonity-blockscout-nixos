@@ -60,7 +60,19 @@ in
     };
 
     extraSettings = mkOption {
-      type = types.attrsOf types.anything;
+      # Scalar-only. Matches the type used by the `blockscout-postgresql`
+      # wrapper for the same escape-hatch role, so both wrappers reject
+      # garbage (functions, derivations, paths, nested attrsets) at
+      # option-set time rather than failing deep in config rendering.
+      # Multi-value Redis options like `save` can be passed as a single
+      # space-separated string — Redis accepts both forms.
+      type = types.attrsOf (
+        types.oneOf [
+          types.bool
+          types.int
+          types.str
+        ]
+      );
       default = { };
       example = {
         maxmemory = "2gb";
