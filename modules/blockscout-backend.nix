@@ -41,10 +41,42 @@ let
     mkIf
     mkBefore
     types
-    concatMapStrings
-    attrNames
+    concatStringsSep
+    mapAttrsToList
     optional
     ;
+
+  # Static env values — Nix-interpolated at module-eval time, written
+  # verbatim into a Nix-store file by `pkgs.writeText`. Because Nix
+  # produces the file content directly (not via `echo` inside a shell
+  # script), values like `db$USER` or `db"quoted"` are stored as
+  # literal characters — no bash expansion, no quote-closure risk.
+  # The file is world-readable in the Nix store; this is fine because
+  # it contains ZERO secrets — only configuration derived from module
+  # options that are already visible in the flake source.
+  staticEnvFile = pkgs.writeText "blockscout-backend.env" (
+    concatStringsSep "\n" (
+      [
+        "DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
+        "ACCOUNT_DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
+        "ACCOUNT_REDIS_URL=unix:///run/redis-${cfg.redisServerName}/redis.sock"
+        "ETHEREUM_JSONRPC_VARIANT=geth"
+        "ETHEREUM_JSONRPC_HTTP_URL=${cfg.ethereumRpc.httpUrl}"
+        "ETHEREUM_JSONRPC_WS_URL=${cfg.ethereumRpc.wsUrl}"
+        "ETHEREUM_JSONRPC_TRACE_URL=${cfg.ethereumRpc.traceUrl}"
+        "CHAIN_ID=${toString cfg.chain.id}"
+        "COIN=${cfg.chain.coin}"
+        "COIN_NAME=${cfg.chain.coinName}"
+        "NETWORK=${cfg.chain.network}"
+        "SUBNETWORK=${cfg.chain.subnetwork}"
+        "PORT=${toString cfg.http.port}"
+        "BLOCKSCOUT_HOST=${cfg.http.host}"
+        "BLOCKSCOUT_PROTOCOL=${cfg.http.protocol}"
+      ]
+      ++ mapAttrsToList (k: v: "${k}=${v}") cfg.extraEnv
+    )
+    + "\n"
+  );
 in
 {
   options.services.blockscout-backend = {
@@ -149,6 +181,20 @@ in
       };
     };
 
+    # Note on the absence of a `bindAddress` option here:
+    # Blockscout binds its Phoenix endpoint on all interfaces
+    # (`{0, 0, 0, 0}`) and does not read an env var for the listen
+    # address in standard `config/runtime.exs`. Exposure is controlled
+    # by two layers outside this module:
+    #   1. NixOS `networking.firewall` is on by default with `http.port`
+    #      absent from `allowedTCPPorts`, so external TCP reach to :4000
+    #      is dropped.
+    #   2. The `blockscout-nginx` module (upcoming PR) reverse-proxies
+    #      from 127.0.0.1 to this port over loopback, which remains
+    #      reachable regardless of which interface Blockscout binds.
+    # Adding a `bindAddress` option without an upstream Blockscout
+    # patch would be cosmetic — it couldn't actually constrain the
+    # listen behaviour.
     http = {
       port = mkOption {
         type = types.port;
@@ -156,16 +202,10 @@ in
         description = ''
           TCP port the backend's Phoenix endpoint binds. The nginx
           reverse proxy (`blockscout-nginx` module, later PR) is
-          expected to terminate TLS and forward to this port.
-        '';
-      };
-      bindAddress = mkOption {
-        type = types.str;
-        default = "127.0.0.1";
-        description = ''
-          Listen address for the backend Phoenix endpoint. Defaults
-          to loopback — nginx reverse-proxies from the same host.
-          Overriding to a non-loopback value triggers a warning.
+          expected to terminate TLS and forward to this port. The
+          backend listens on all interfaces (Blockscout upstream
+          does not read a listen-IP env var); the NixOS firewall
+          drops external reach to this port by default.
         '';
       };
       host = mkOption {
@@ -218,6 +258,14 @@ in
         not expose as first-class options. Values must be strings —
         Blockscout's runtime-config layer treats all env vars as
         strings.
+
+        **Values MUST NOT contain newlines** — systemd's
+        `EnvironmentFile` parser treats each newline as an entry
+        boundary, so a multi-line value breaks the file. The `#`
+        character and whitespace are fine; quotes and shell
+        metacharacters are preserved literally (values are written
+        via `pkgs.writeText` at Nix-eval time, never via a shell
+        `echo` that could expand them).
       '';
     };
   };
@@ -291,57 +339,52 @@ in
         ];
 
         # ExecStartPre: compose $RUNTIME_DIRECTORY/env from the
-        # credential + config options. EnvironmentFile below reads
-        # that composed file, so the secret never appears in the
-        # unit file or anywhere in the Nix store.
+        # Nix-generated static env file + the secret read from
+        # $CREDENTIALS_DIRECTORY. EnvironmentFile= below reads the
+        # composed file.
+        #
+        # Static values (DATABASE_URL, CHAIN_ID, extraEnv entries,
+        # etc.) are interpolated at Nix-eval time into
+        # `${staticEnvFile}` — no bash `echo` touches them, so no
+        # shell expansion / quote-closure risk. The one secret
+        # (SECRET_KEY_BASE) is appended at runtime from the
+        # credential tmpfs via `printf` + `cat`, which doesn't
+        # interpolate the value.
         ExecStartPre = [
           (pkgs.writeShellScript "blockscout-compose-env" ''
             set -eu
             umask 077
 
-            secret_key_base=$(cat "$CREDENTIALS_DIRECTORY/secret_key_base")
+            # Install the Nix-generated static env file into the
+            # runtime dir at 0600.
+            install -m 0600 ${staticEnvFile} "$RUNTIME_DIRECTORY/env"
 
+            # Append the secret. `printf` + `cat` avoids shell
+            # expansion of the secret's contents; the credential
+            # file is expected to be a single line (operator
+            # responsibility — newlines break EnvironmentFile).
             {
-              echo "DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
-              echo "ACCOUNT_DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
-              echo "SECRET_KEY_BASE=$secret_key_base"
-
-              echo "ACCOUNT_REDIS_URL=unix:///run/redis-${cfg.redisServerName}/redis.sock"
-
-              echo "ETHEREUM_JSONRPC_VARIANT=geth"
-              echo "ETHEREUM_JSONRPC_HTTP_URL=${cfg.ethereumRpc.httpUrl}"
-              echo "ETHEREUM_JSONRPC_WS_URL=${cfg.ethereumRpc.wsUrl}"
-              echo "ETHEREUM_JSONRPC_TRACE_URL=${cfg.ethereumRpc.traceUrl}"
-
-              echo "CHAIN_ID=${toString cfg.chain.id}"
-              echo "COIN=${cfg.chain.coin}"
-              echo "COIN_NAME=${cfg.chain.coinName}"
-              echo "NETWORK=${cfg.chain.network}"
-              echo "SUBNETWORK=${cfg.chain.subnetwork}"
-
-              echo "PORT=${toString cfg.http.port}"
-              echo "BLOCKSCOUT_HOST=${cfg.http.host}"
-              echo "BLOCKSCOUT_PROTOCOL=${cfg.http.protocol}"
-
-              ${concatMapStrings (name: ''
-                echo "${name}=${cfg.extraEnv.${name}}"
-              '') (attrNames cfg.extraEnv)}
-            } > "$RUNTIME_DIRECTORY/env"
+              printf 'SECRET_KEY_BASE='
+              cat "$CREDENTIALS_DIRECTORY/secret_key_base"
+              printf '\n'
+            } >> "$RUNTIME_DIRECTORY/env"
           '')
         ]
         ++ optional cfg.autoMigrate (
-          "!"
-          + toString (
-            pkgs.writeShellScript "blockscout-migrate" ''
-              set -eu
-              # Source the env file composed above so the migration
-              # script sees DATABASE_URL, SECRET_KEY_BASE, etc.
-              set -a
-              . "$RUNTIME_DIRECTORY/env"
-              set +a
-              exec ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
-            ''
-          )
+          # No `!` prefix — the migrate step MUST run under the same
+          # DynamicUser + SupplementaryGroups context as the main
+          # unit so `psql` via /run/postgresql/.s.PGSQL.5432 uses the
+          # `blockscout` role's trust auth. Running as root (the `!`
+          # prefix) would bypass the blockscout role entirely.
+          pkgs.writeShellScript "blockscout-migrate" ''
+            set -eu
+            # Source the env file composed above so the migration
+            # script sees DATABASE_URL, SECRET_KEY_BASE, etc.
+            set -a
+            . "$RUNTIME_DIRECTORY/env"
+            set +a
+            exec ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
+          ''
         );
 
         # Use the systemd %t runtime-dir expansion so the path is
@@ -393,17 +436,5 @@ in
       };
     };
 
-    # Loud warning on non-loopback bindAddress. Same pattern as the
-    # autonity module: exposure should be a conscious choice.
-    warnings =
-      let
-        loopbackSafe = [
-          "127.0.0.1"
-          "::1"
-          "localhost"
-        ];
-      in
-      optional (!builtins.elem cfg.http.bindAddress loopbackSafe)
-        "services.blockscout-backend.http.bindAddress is `${cfg.http.bindAddress}` — the backend API will be reachable beyond loopback. Ensure nginx TLS termination and an auth gate are in front of it (the blockscout-nginx module handles this by default).";
   };
 }
