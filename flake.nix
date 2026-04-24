@@ -15,6 +15,14 @@
     autonity.url = "github:klazomenai/autonity";
     autonity.inputs.nixpkgs.follows = "nixpkgs";
     autonity.inputs.flake-utils.follows = "flake-utils";
+
+    # Blockscout backend release (Elixir mixRelease) — produced by the
+    # `klazomenai/blockscout` fork's flake. The NixOS blockscout-backend
+    # module defaults `services.blockscout-backend.package` to
+    # `pkgs.blockscout`, wired via the nixpkgs.overlays entry below.
+    blockscout.url = "github:klazomenai/blockscout";
+    blockscout.inputs.nixpkgs.follows = "nixpkgs";
+    blockscout.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
@@ -23,6 +31,7 @@
       nixpkgs,
       flake-utils,
       autonity,
+      blockscout,
     }:
     let
       # Scope locked to x86_64-linux for the glue repo and all service
@@ -43,6 +52,7 @@
           (final: _prev: {
             autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
             autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
+            blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
           })
         ];
       };

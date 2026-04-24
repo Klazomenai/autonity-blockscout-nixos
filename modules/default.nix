@@ -16,8 +16,8 @@
     ./autonity.nix
     ./blockscout-postgresql.nix
     ./blockscout-redis.nix
+    ./blockscout-backend.nix
     # Service modules land here as they ship:
-    #   ./blockscout-backend.nix
     #   ./blockscout-frontend.nix
     #   ./blockscout-nginx.nix
   ];

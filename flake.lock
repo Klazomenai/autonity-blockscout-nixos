@@ -23,6 +23,29 @@
         "type": "github"
       }
     },
+    "blockscout": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1776942568,
+        "narHash": "sha256-KIOu3HDPRaVRrkx6LEivkhL11VPkvw9anq2eZRIwgeY=",
+        "owner": "klazomenai",
+        "repo": "blockscout",
+        "rev": "69261addbe6137c3100707b4d027a760b070c3bb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "klazomenai",
+        "repo": "blockscout",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -60,6 +83,7 @@
     "root": {
       "inputs": {
         "autonity": "autonity",
+        "blockscout": "blockscout",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
