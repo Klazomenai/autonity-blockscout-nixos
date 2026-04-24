@@ -218,8 +218,9 @@ in
           When set, passed as `--nat extip:<value>` so Autonity
           advertises this external IP in its enode. Without this,
           Autonity advertises the interface IP as seen inside its
-          network namespace (often `127.0.0.1` behind NAT), and peers
-          cannot reach the node.
+          network namespace (often a private/NATed or container
+          interface address — RFC1918 in the typical case), and
+          peers cannot reach the node.
         '';
       };
       openFirewall = mkOption {
