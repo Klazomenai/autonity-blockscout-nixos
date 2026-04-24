@@ -4,12 +4,19 @@
 # blockscout-redis.nix finally comes together.
 #
 # Cross-service contract:
-#   - PostgreSQL: connects via UNIX socket /run/postgresql/.s.PGSQL.5432
-#     (joining the `postgres` group via SupplementaryGroups for socket
-#     filesystem access). Authentication: local `trust` auth scoped to
-#     the specific role+database via services.postgresql.authentication
-#     (mkBefore) — socket access is the auth boundary on a single-
-#     machine deployment; see the `databaseAuthRationale` comment below.
+#   - PostgreSQL (default: local UNIX socket): connects via
+#     /run/postgresql/.s.PGSQL.5432, joining the `postgres` group via
+#     SupplementaryGroups for socket filesystem access. Authentication:
+#     local `trust` scoped to the specific role+database via
+#     services.postgresql.authentication (mkBefore) — socket access is
+#     the auth boundary on a single-machine deployment; see the
+#     `databaseAuthRationale` comment below.
+#     If `databaseHost` is set to a TCP hostname, the module detects
+#     this (no leading `/`) and skips ALL local-PG assumptions: no
+#     `postgresql.service` dependency, no `postgres` SupplementaryGroup,
+#     no pg_hba.conf injection. `configurePostgresAuth` lets operators
+#     override the pg_hba-injection heuristic when the deployment shape
+#     is unusual.
 #   - Redis: connects via UNIX socket /run/redis-<name>/redis.sock
 #     (joining the `redis-<name>` group via SupplementaryGroups). Redis
 #     has no authentication configured; socket access is the auth
@@ -51,6 +58,7 @@ let
     types
     concatMapStringsSep
     mapAttrsToList
+    optional
     optionalString
     literalExpression
     ;
@@ -61,6 +69,25 @@ let
   # naming happens at a later pass in the module system; an assertion
   # gives a clearer error message pointing at the exact offending key.
   envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
+
+  # Derived fact: whether `databaseHost` points at a UNIX socket
+  # directory (absolute path starting with `/`). Used as the single
+  # source of truth for "is the PostgreSQL we talk to running locally
+  # and reachable by socket?" — gates four places consistently:
+  #   1. `services.postgresql.authentication` pg_hba injection
+  #      (operator can still override via `configurePostgresAuth`)
+  #   2. `systemd.services.blockscout-backend.after` dependency on
+  #      `postgresql.service`
+  #   3. …`requires` on `postgresql.service`
+  #   4. `SupplementaryGroups = [ "postgres" ]` — only needed for
+  #      UNIX-socket filesystem access; harmless for TCP but
+  #      references a group that doesn't exist without local PG
+  #
+  # TCP hosts (remote PG) → all four are skipped, so the module can
+  # be pointed at a remote PostgreSQL without dragging in a local
+  # `postgresql.service` dependency or a non-existent `postgres`
+  # group.
+  postgresLocal = lib.hasPrefix "/" cfg.databaseHost;
 
   # Bash wrapper that exports each LoadCredential-sourced secret into
   # the process environment, optionally runs the migration, then execs
@@ -465,11 +492,7 @@ in
     # services.blockscout-postgresql for the two realistic paths.
     services.postgresql.authentication =
       let
-        effective =
-          if cfg.configurePostgresAuth != null then
-            cfg.configurePostgresAuth
-          else
-            lib.hasPrefix "/" cfg.databaseHost;
+        effective = if cfg.configurePostgresAuth != null then cfg.configurePostgresAuth else postgresLocal;
       in
       mkIf effective (mkBefore ''
         local ${cfg.databaseName} ${cfg.databaseUser} trust
@@ -479,14 +502,14 @@ in
       description = "Blockscout Elixir/Phoenix backend (API + indexer)";
       after = [
         "network-online.target"
-        "postgresql.service"
         "redis-${cfg.redisServerName}.service"
-      ];
+      ]
+      ++ optional postgresLocal "postgresql.service";
       wants = [ "network-online.target" ];
       requires = [
-        "postgresql.service"
         "redis-${cfg.redisServerName}.service"
-      ];
+      ]
+      ++ optional postgresLocal "postgresql.service";
       wantedBy = [ "multi-user.target" ];
 
       # Static (non-secret) env — systemd emits these as `Environment=`
@@ -536,10 +559,14 @@ in
         # upstream modules; joining them here grants filesystem
         # access to /run/postgresql/.s.PGSQL.5432 and
         # /run/redis-<name>/redis.sock respectively.
+        #
+        # `postgres` is only added when `databaseHost` points at a
+        # UNIX socket (`postgresLocal`); for TCP remote PG we skip
+        # the group since it may not exist on the host at all.
         SupplementaryGroups = [
-          "postgres"
           "redis-${cfg.redisServerName}"
-        ];
+        ]
+        ++ optional postgresLocal "postgres";
 
         # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
