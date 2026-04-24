@@ -69,17 +69,25 @@ in
     package = mkPackageOption pkgs "autonity" { };
 
     dataDir = mkOption {
-      type = types.str;
+      # Regex enforces `/var/lib/<segment>(/<segment>)*` where each
+      # segment starts with a non-`.` non-`/` char. This rejects
+      # traversal (`/var/lib/../tmp`), current-dir (`/var/lib/./foo`),
+      # hidden names (`/var/lib/.hidden`), trailing slashes, and empty
+      # segments (`/var/lib//foo`) at option-set time, so the
+      # `removePrefix` below and the documented "under /var/lib/"
+      # guarantee are both actually safe.
+      type = types.strMatching "^/var/lib/[^./][^/]*(/[^./][^/]*)*$";
       default = "/var/lib/autonity";
       description = ''
-        Chain-data directory. Must be an absolute path under `/var/lib/`
-        (enforced via `config.assertions`). The relative part of the
-        path is used as the systemd `StateDirectory`, so the directory
-        is created, owned, and permission-hardened by systemd on each
-        service start — no manual `mkdir` or `chown` needed on the host.
-        Paths outside `/var/lib/` are not supported by this module:
-        `ProtectSystem = "strict"` would block writes there, so an
-        operator needing a custom location must provide their own
+        Chain-data directory. Must be an absolute path under `/var/lib/`,
+        with segments that do not start with `.` and contain no `..`
+        traversal (enforced via the option type). The relative part of
+        the path is used as the systemd `StateDirectory`, so the
+        directory is created, owned, and permission-hardened by systemd
+        on each service start — no manual `mkdir` or `chown` needed on
+        the host. Paths outside `/var/lib/` are not supported by this
+        module: `ProtectSystem = "strict"` would block writes there, so
+        an operator needing a custom location must provide their own
         systemd override rather than just changing this option.
       '';
     };
@@ -248,19 +256,9 @@ in
   };
 
   config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = lib.hasPrefix "/var/lib/" cfg.dataDir && cfg.dataDir != "/var/lib/";
-        message = ''
-          services.autonity.dataDir (`${cfg.dataDir}`) must be an
-          absolute path under `/var/lib/`. Paths outside `/var/lib/`
-          are not supported by this module — `ProtectSystem = "strict"`
-          blocks writes elsewhere and systemd `StateDirectory` is
-          scoped to `/var/lib/`. If you need a custom location,
-          provide a systemd override rather than changing this option.
-        '';
-      }
-    ];
+    # `dataDir` is validated at the option-type layer (`types.strMatching`)
+    # — no runtime assertion needed. The type-level check fails earlier
+    # and with a clearer error than `config.assertions`.
 
     networking.firewall = mkIf cfg.p2p.openFirewall {
       allowedTCPPorts = [ cfg.p2p.port ];
