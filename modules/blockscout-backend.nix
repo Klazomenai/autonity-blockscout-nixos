@@ -101,7 +101,12 @@ in
     package = mkPackageOption pkgs "blockscout" { };
 
     secretKeyBaseFile = mkOption {
-      type = types.path;
+      # types.str (not types.path) by design — Nix-path literals
+      # (`./secret`) auto-copy into the world-readable /nix/store,
+      # defeating the module's secrets contract. `types.str` accepts
+      # path strings as-is; `config.assertions` below additionally
+      # enforces that the value is absolute and not under /nix/store/.
+      type = types.str;
       example = "/run/secrets/blockscout/secret_key_base";
       description = ''
         Absolute path to a file containing Phoenix `secret_key_base` —
@@ -112,6 +117,12 @@ in
         source path. The file only needs to be readable by systemd
         (root at unit-start time), not by the `DynamicUser`-allocated
         UID.
+
+        MUST be an absolute path NOT under `/nix/store/` — the
+        module's secrets contract is that values never appear in the
+        world-readable Nix store, so accidentally pointing this at a
+        store path is a configuration error. Enforced via
+        `config.assertions` at option-set time.
       '';
     };
 
@@ -136,11 +147,26 @@ in
       # extra pg_hba rule).
       type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
       default = "blockscout";
+      description = ''
+        PostgreSQL database the Blockscout backend reads and writes.
+        Must match the `databaseName` configured on the
+        `blockscout-postgresql` wrapper (both default to
+        `"blockscout"` — override either side and you must align the
+        other manually).
+      '';
     };
 
     databaseUser = mkOption {
       type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
       default = "blockscout";
+      description = ''
+        PostgreSQL role the Blockscout backend connects as. Must
+        match the `username` configured on the `blockscout-postgresql`
+        wrapper (both default to `"blockscout"`). Used verbatim in
+        the generated `services.postgresql.authentication` stanza,
+        so the `types.strMatching` regex forbids any character that
+        could inject an extra pg_hba rule.
+      '';
     };
 
     redisServerName = mkOption {
@@ -269,6 +295,33 @@ in
       '';
     };
 
+    configurePostgresAuth = mkOption {
+      type = types.nullOr types.bool;
+      default = null;
+      description = ''
+        Whether this module should prepend a
+        `local ${"\${databaseName}"} ${"\${databaseUser}"} trust` rule to
+        `services.postgresql.authentication`.
+
+        - `null` (default): auto-detect from `databaseHost` — inject
+          the rule only when `databaseHost` is an absolute path (a
+          UNIX socket directory, which is where the rule applies).
+        - `true`: always inject (useful if the operator configures
+          PostgreSQL themselves but still wants this module's pg_hba
+          management).
+        - `false`: never inject — the operator will configure
+          `services.postgresql.authentication` themselves. Appropriate
+          when `databaseHost` is a TCP host (remote PostgreSQL) or
+          when the operator wants password auth instead of local
+          `trust`.
+
+        The auto-detect default avoids a historical bug where the
+        module unconditionally modified the local PostgreSQL's
+        pg_hba.conf even when `databaseHost` pointed at a TCP
+        hostname, weakening an unrelated local PG instance.
+      '';
+    };
+
     extraEnv = mkOption {
       type = types.attrsOf types.str;
       default = { };
@@ -306,8 +359,18 @@ in
           { name, ... }:
           {
             options.path = mkOption {
-              type = types.path;
-              description = "Absolute path to a file containing the value for env var `${name}`.";
+              # types.str (not types.path) — same rationale as
+              # `secretKeyBaseFile`: Nix-path literals would auto-copy
+              # into the world-readable /nix/store and defeat the
+              # secrets contract. Absolute-not-in-store is enforced
+              # via `config.assertions` at the module level so the
+              # error message names the offending key.
+              type = types.str;
+              description = ''
+                Absolute path (NOT under `/nix/store/`) to a file
+                containing the value for env var `${name}`. Enforced
+                via `config.assertions` at option-set time.
+              '';
             };
           }
         )
@@ -342,19 +405,46 @@ in
   };
 
   config = mkIf cfg.enable {
-    # Validate secretEnvFiles keys at option-set time. The key is used
-    # verbatim as both the LoadCredential= name and the
-    # $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe characters
-    # would leak into those paths. Checking via assertions rather than
-    # at the submodule level so the error message can name the exact
-    # offending key.
-    assertions = mapAttrsToList (name: _: {
-      assertion = builtins.match envVarNameRegex name != null;
-      message = "services.blockscout-backend.secretEnvFiles key `${name}` is not a valid POSIX env var name (must match `${envVarNameRegex}`).";
-    }) cfg.secretEnvFiles;
+    # Validate:
+    #   1. secretEnvFiles keys are valid POSIX env var names. The key
+    #      is used verbatim as both the LoadCredential= name and the
+    #      $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe chars
+    #      would leak into those paths.
+    #   2. Every secret path option (secretKeyBaseFile and each
+    #      secretEnvFiles.<name>.path) is absolute and NOT under
+    #      /nix/store/. The store is world-readable; letting a secret
+    #      path resolve there (e.g. via a Nix-path literal like
+    #      `./secret`) would silently defeat this module's secrets
+    #      contract. Assertions give a clearer error than a type check
+    #      because the message can name the exact offending option.
+    assertions =
+      (mapAttrsToList (name: _: {
+        assertion = builtins.match envVarNameRegex name != null;
+        message = "services.blockscout-backend.secretEnvFiles key `${name}` is not a valid POSIX env var name (must match `${envVarNameRegex}`).";
+      }) cfg.secretEnvFiles)
+      ++ [
+        {
+          assertion =
+            lib.hasPrefix "/" cfg.secretKeyBaseFile && !lib.hasPrefix "/nix/store/" cfg.secretKeyBaseFile;
+          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+        }
+      ]
+      ++ mapAttrsToList (name: entry: {
+        assertion = lib.hasPrefix "/" entry.path && !lib.hasPrefix "/nix/store/" entry.path;
+        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+      }) cfg.secretEnvFiles;
 
     # Local-socket `trust` authentication scoped to the specific role+
-    # database. Rationale (databaseAuthRationale):
+    # database — only injected when `configurePostgresAuth` resolves
+    # to true. Default auto-detect gates on `databaseHost` being an
+    # absolute path (UNIX socket directory): if the operator has
+    # pointed `databaseHost` at a TCP host, the `local` pg_hba rule
+    # would apply to an unrelated local PostgreSQL and could silently
+    # weaken its auth posture. Explicit override via
+    # `configurePostgresAuth = true/false` when the heuristic is
+    # wrong for the deployment.
+    #
+    # Rationale (databaseAuthRationale) when the rule IS installed:
     #   - Socket filesystem access is already gated by the `postgres`
     #     group. Only services joining that group via
     #     SupplementaryGroups can reach /run/postgresql/.s.PGSQL.5432
@@ -373,9 +463,17 @@ in
     # services.postgresql.authentication themselves and add a
     # password-sync mechanism; see the `username` description on
     # services.blockscout-postgresql for the two realistic paths.
-    services.postgresql.authentication = mkBefore ''
-      local ${cfg.databaseName} ${cfg.databaseUser} trust
-    '';
+    services.postgresql.authentication =
+      let
+        effective =
+          if cfg.configurePostgresAuth != null then
+            cfg.configurePostgresAuth
+          else
+            lib.hasPrefix "/" cfg.databaseHost;
+      in
+      mkIf effective (mkBefore ''
+        local ${cfg.databaseName} ${cfg.databaseUser} trust
+      '');
 
     systemd.services.blockscout-backend = {
       description = "Blockscout Elixir/Phoenix backend (API + indexer)";
