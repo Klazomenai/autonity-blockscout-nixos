@@ -14,6 +14,7 @@
     # with `autonity.packages.<system>.autonity-portable`.
     autonity.url = "github:klazomenai/autonity";
     autonity.inputs.nixpkgs.follows = "nixpkgs";
+    autonity.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
