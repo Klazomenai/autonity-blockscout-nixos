@@ -157,11 +157,32 @@ in
       type = types.str;
       default = "/run/postgresql";
       description = ''
-        PostgreSQL socket directory — the value passed as `host=` in
-        the libpq connection string. Defaults to the standard nixpkgs
-        location used by the `blockscout-postgresql` wrapper. Not a
-        hostname: an absolute path to the directory containing
-        `.s.PGSQL.<port>`.
+        PostgreSQL `host=` value for the libpq connection string.
+        Supports either:
+
+        - an absolute path to a Unix-domain socket directory
+          containing `.s.PGSQL.<port>` (for example
+          `"/run/postgresql"`, the standard nixpkgs location used by
+          the `blockscout-postgresql` wrapper); or
+        - a TCP hostname or address (for example `"localhost"` or a
+          remote PostgreSQL host).
+
+        When this is a socket directory, the connection uses the local
+        PostgreSQL Unix socket, the systemd unit gains an `after` /
+        `requires` dependency on `postgresql.service`,
+        `SupplementaryGroups` includes `"postgres"` for socket access,
+        and `services.postgresql.authentication` gets a `local
+        <db> <user> trust` rule (gated on `configurePostgresAuth`).
+
+        When this is a TCP hostname/address, the connection uses TCP
+        and none of the local-PG assumptions apply: no local
+        `postgresql.service` dependency, no `postgres`
+        SupplementaryGroup, no pg_hba injection. The operator is
+        responsible for ensuring the target PostgreSQL is reachable
+        and configured to authenticate `${cfg.databaseUser}` on
+        `${cfg.databaseName}` however they prefer (password,
+        certificate, SCRAM, etc.) — see `secretEnvFiles` for wiring
+        a `PGPASSWORD` or similar.
       '';
     };
 
