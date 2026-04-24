@@ -34,7 +34,14 @@ in
     enable = mkEnableOption "Blockscout's Redis (thin wrapper over services.redis.servers.<name>)";
 
     serverName = mkOption {
-      type = types.str;
+      # Regex enforces a POSIX-safe identifier so the value is valid
+      # across all three downstream interpolations (filesystem path,
+      # systemd unit name, auto-created system group): starts with a
+      # lowercase letter or digit, followed by lowercase letters,
+      # digits, underscores, or hyphens. Rejects paths (`foo/bar`),
+      # spaces, shell metacharacters, uppercase names (POSIX group
+      # names are lowercase), and leading underscores.
+      type = types.strMatching "^[a-z0-9][a-z0-9_-]*$";
       default = "blockscout";
       description = ''
         Name of the nixpkgs `services.redis.servers.<name>` instance.
@@ -43,6 +50,12 @@ in
         system group (`redis-<name>`) that consumers join via
         `SupplementaryGroups`, and the systemd unit name
         (`redis-<name>.service`).
+
+        Must match `^[a-z0-9][a-z0-9_-]*$` — lowercase alphanumeric,
+        underscore, and hyphen only; first character alphanumeric.
+        Enforced at option-set time via `types.strMatching` so the
+        three downstream interpolations (path, unit, group) never
+        receive unsafe characters.
       '';
     };
 
@@ -54,11 +67,13 @@ in
         maxmemory-policy = "allkeys-lru";
       };
       description = ''
-        Additional Redis settings merged into the underlying
-        `services.redis.servers.<name>.settings` on top of this
-        wrapper's defaults. Operator-supplied values win over wrapper
-        defaults. Escape hatch for any setting this wrapper does not
-        expose directly.
+        Redis settings forwarded verbatim to
+        `services.redis.servers.<name>.settings`. This wrapper does
+        NOT define any `settings` defaults of its own — the three
+        preset values (`port`, `unixSocket`, `unixSocketPerm`) are
+        sibling options on the nixpkgs module, not entries in
+        `settings`. Escape hatch for any `redis.conf` option this
+        wrapper does not expose directly.
       '';
     };
   };
