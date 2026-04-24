@@ -1,5 +1,28 @@
 {
   "nodes": {
+    "autonity": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1776506148,
+        "narHash": "sha256-OTEDw5t4DWg69/o8Gf/Kr4NMJpgB4ZZ5mGQLLueNWE8=",
+        "owner": "klazomenai",
+        "repo": "autonity",
+        "rev": "c857b7408b0057bd6e19bd018d2c1c7889714827",
+        "type": "github"
+      },
+      "original": {
+        "owner": "klazomenai",
+        "repo": "autonity",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +59,7 @@
     },
     "root": {
       "inputs": {
+        "autonity": "autonity",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }

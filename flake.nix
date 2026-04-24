@@ -6,6 +6,15 @@
     flake-utils.url = "github:numtide/flake-utils";
     # flake-utils no longer carries a nixpkgs input, so no `follows` wiring
     # is needed here.
+
+    # Autonity node package — produced by the `klazomenai/autonity` fork's
+    # flake. The NixOS autonity module defaults `services.autonity.package`
+    # to this input's `packages.<system>.default` (minimal ELF variant).
+    # Operators wanting the portable bash-wrapped variant can override
+    # with `autonity.packages.<system>.autonity-portable`.
+    autonity.url = "github:klazomenai/autonity";
+    autonity.inputs.nixpkgs.follows = "nixpkgs";
+    autonity.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
@@ -13,6 +22,7 @@
       self,
       nixpkgs,
       flake-utils,
+      autonity,
     }:
     let
       # Scope locked to x86_64-linux for the glue repo and all service
@@ -22,10 +32,21 @@
     in
     {
       # Top-level aggregate module. Service modules are imported from
-      # `modules/default.nix` — initially empty; filled as each service
-      # module lands via its own PR.
-      nixosModules.default = ./modules;
-      nixosModules.autonity-blockscout = ./modules;
+      # `modules/default.nix`. Flake inputs that provide runtime packages
+      # (autonity for now; blockscout / blockscout-frontend as they
+      # integrate) are exposed via a `nixpkgs.overlays` entry so service
+      # modules can use the standard `mkPackageOption pkgs "<name>" { }`
+      # idiom — uniform with `CONTRIBUTING.md` and the rest of nixpkgs.
+      nixosModules.default = {
+        imports = [ ./modules ];
+        nixpkgs.overlays = [
+          (final: _prev: {
+            autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
+            autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
+          })
+        ];
+      };
+      nixosModules.autonity-blockscout = self.nixosModules.default;
     }
     // flake-utils.lib.eachSystem systems (
       system:
