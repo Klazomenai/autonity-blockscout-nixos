@@ -17,10 +17,18 @@
 #   - Autonity: connects via loopback TCP to 127.0.0.1:8545 (http),
 #     8546 (ws); the Autonity module binds loopback-only on those
 #     ports by default.
-#   - Secrets: Phoenix `secret_key_base` ingested via systemd
-#     `LoadCredential=` so the service never reads the source file
-#     directly; composed into $RUNTIME_DIRECTORY/env by ExecStartPre
-#     and read back via EnvironmentFile.
+#   - Secrets: every secret-holding env var (SECRET_KEY_BASE plus each
+#     `secretEnvFiles` entry) is ingested via systemd `LoadCredential=`
+#     — the service reads each value from `$CREDENTIALS_DIRECTORY/<NAME>`
+#     at ExecStart time and `export`s it into the process environment
+#     via the `blockscout-start` shell wrapper. Secret values never
+#     touch the Nix store, EnvironmentFile, or the unit file.
+#   - Static env: passed via `systemd.services.*.environment` (direct
+#     systemd `Environment=` entries), not via an EnvironmentFile. This
+#     side-steps the EnvironmentFile mechanism's unit-start-time load
+#     ordering (EnvironmentFile is read BEFORE ExecStartPre, so a
+#     dynamically-composed env file wouldn't be seen) and its format /
+#     shell-parsing ambiguity.
 #
 # The `klazomenai/blockscout` flake is wired into pkgs via a
 # nixpkgs.overlays entry on the glue-repo's nixosModules.default (see
@@ -41,10 +49,9 @@ let
     mkIf
     mkBefore
     types
-    concatStringsSep
     concatMapStringsSep
     mapAttrsToList
-    optional
+    optionalString
     literalExpression
     ;
 
@@ -55,44 +62,37 @@ let
   # gives a clearer error message pointing at the exact offending key.
   envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
 
-  # Static env values — Nix-interpolated at module-eval time, written
-  # verbatim into a Nix-store file by `pkgs.writeText`. Because Nix
-  # produces the file content directly (not via `echo` inside a shell
-  # script), values like `db$USER` or `db"quoted"` are stored as
-  # literal characters — no bash expansion, no quote-closure risk.
+  # Bash wrapper that exports each LoadCredential-sourced secret into
+  # the process environment, optionally runs the migration, then execs
+  # the main server. Static env vars are provided by systemd's
+  # `Environment=` mechanism (see `systemd.services.*.environment`
+  # below); only secrets flow through this wrapper.
   #
-  # The file is world-readable in the Nix store. This is safe by
-  # convention: this module contracts that `extraEnv` carries no
-  # secrets. Secret-holding env vars (API keys, OAuth client secrets,
-  # SMTP credentials, etc.) go through `cfg.secretEnvFiles` instead —
-  # each value is ingested via `LoadCredential=` and appended at
-  # runtime, so it never touches the store. The contract is enforced
-  # via docs on `extraEnv` rather than a type-level check (operators
-  # are trusted; the surrounding deployment assumes operator
-  # awareness of Nix-store visibility).
-  staticEnvFile = pkgs.writeText "blockscout-backend.env" (
-    concatStringsSep "\n" (
-      [
-        "DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
-        "ACCOUNT_DATABASE_URL=postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}"
-        "ACCOUNT_REDIS_URL=unix:///run/redis-${cfg.redisServerName}/redis.sock"
-        "ETHEREUM_JSONRPC_VARIANT=geth"
-        "ETHEREUM_JSONRPC_HTTP_URL=${cfg.ethereumRpc.httpUrl}"
-        "ETHEREUM_JSONRPC_WS_URL=${cfg.ethereumRpc.wsUrl}"
-        "ETHEREUM_JSONRPC_TRACE_URL=${cfg.ethereumRpc.traceUrl}"
-        "CHAIN_ID=${toString cfg.chain.id}"
-        "COIN=${cfg.chain.coin}"
-        "COIN_NAME=${cfg.chain.coinName}"
-        "NETWORK=${cfg.chain.network}"
-        "SUBNETWORK=${cfg.chain.subnetwork}"
-        "PORT=${toString cfg.http.port}"
-        "BLOCKSCOUT_HOST=${cfg.http.host}"
-        "BLOCKSCOUT_PROTOCOL=${cfg.http.protocol}"
-      ]
-      ++ mapAttrsToList (k: v: "${k}=${v}") cfg.extraEnv
-    )
-    + "\n"
-  );
+  # Why a wrapper rather than an EnvironmentFile? EnvironmentFile is
+  # loaded by systemd at unit activation, BEFORE any ExecStartPre runs
+  # — so an env file composed during ExecStartPre would never be seen
+  # by ExecStart. The wrapper reads credentials at the moment
+  # ExecStart fires, which is the only reliable point by which
+  # LoadCredential has populated $CREDENTIALS_DIRECTORY.
+  startScript = pkgs.writeShellScript "blockscout-start" ''
+    set -eu
+
+    # $(cat …) captures the credential file's bytes verbatim. Bash
+    # variable assignment does not re-expand `$` / backticks in the
+    # value, so secrets containing shell metacharacters are preserved
+    # literally. Each credential file is expected to contain a single
+    # value with no trailing content beyond an optional final newline
+    # (bash command substitution strips trailing newlines).
+    export SECRET_KEY_BASE="$(cat "$CREDENTIALS_DIRECTORY/SECRET_KEY_BASE")"
+    ${concatMapStringsSep "\n    " (name: ''
+      export ${name}="$(cat "$CREDENTIALS_DIRECTORY/${name}")"
+    '') (lib.attrNames cfg.secretEnvFiles)}
+    ${optionalString cfg.autoMigrate ''
+      ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
+    ''}
+    exec ${cfg.package}/bin/blockscout start
+  '';
+
 in
 {
   options.services.blockscout-backend = {
@@ -106,11 +106,12 @@ in
       description = ''
         Absolute path to a file containing Phoenix `secret_key_base` —
         64+ bytes of random used to sign user sessions and verify CSRF
-        tokens. Ingested via systemd `LoadCredential=`; the service
-        reads from `$CREDENTIALS_DIRECTORY/secret_key_base`, never
-        from this source path. The file only needs to be readable by
-        systemd (root at unit-start time), not by the `DynamicUser`-
-        allocated UID.
+        tokens. Ingested via systemd `LoadCredential=SECRET_KEY_BASE=<path>`;
+        the ExecStart wrapper reads from
+        `$CREDENTIALS_DIRECTORY/SECRET_KEY_BASE`, never from this
+        source path. The file only needs to be readable by systemd
+        (root at unit-start time), not by the `DynamicUser`-allocated
+        UID.
       '';
     };
 
@@ -259,10 +260,12 @@ in
       type = types.bool;
       default = true;
       description = ''
-        Run `Explorer.Release.migrate()` as an `ExecStartPre` before
-        each service start. Idempotent — running against an already-
-        migrated database is a no-op. Disable only if migrations are
-        orchestrated externally (e.g. a separate admin tool).
+        Run `Explorer.Release.migrate()` in the ExecStart wrapper
+        before starting the server. Idempotent — running against an
+        already-migrated database is a no-op. Disable only if
+        migrations are orchestrated externally (e.g. a separate admin
+        tool) or if the migration step needs different error
+        handling than "fail the whole unit on migration error".
       '';
     };
 
@@ -275,26 +278,19 @@ in
         API_V2_ENABLED = "true";
       };
       description = ''
-        Non-secret environment variables passed to the backend.
+        Non-secret environment variables passed to the backend via
+        systemd's unit-level `environment =` attrset — i.e. as
+        `Environment=KEY=VALUE` entries in the generated unit file.
         Escape hatch for the 50+ Blockscout env vars this module does
-        not expose as first-class options. Values must be strings —
-        Blockscout's runtime-config layer treats all env vars as
-        strings.
+        not expose as first-class options.
 
-        **Values MUST NOT be secrets.** `extraEnv` entries are
-        interpolated into a `pkgs.writeText`-backed file in the Nix
-        store, which is world-readable. For secret-holding env vars
-        (API keys, OAuth client secrets, SMTP credentials, Sentry
-        DSNs, etc.), use `secretEnvFiles` below — those are ingested
-        via systemd `LoadCredential=` and never land in the store.
-
-        **Values MUST NOT contain newlines** — systemd's
-        `EnvironmentFile` parser treats each newline as an entry
-        boundary, so a multi-line value breaks the file. The `#`
-        character and whitespace are fine; quotes and shell
-        metacharacters are preserved literally (values are written
-        via `pkgs.writeText` at Nix-eval time, never via a shell
-        `echo` that could expand them).
+        **Values MUST NOT be secrets.** `extraEnv` entries land in
+        the unit file under `/etc/systemd/system/` (and its Nix-store
+        backing path), which is world-readable. For secret-holding
+        env vars (API keys, OAuth client secrets, SMTP credentials,
+        Sentry DSNs, etc.), use `secretEnvFiles` below — those are
+        ingested via systemd `LoadCredential=` at ExecStart time and
+        never appear in the unit file or the Nix store.
       '';
     };
 
@@ -329,15 +325,18 @@ in
         match `^[A-Z_][A-Z0-9_]*$`); `.path` is an absolute path to
         the file containing its value.
 
-        Each file is ingested via systemd `LoadCredential=` at unit
-        start — the service reads the value from
-        `$CREDENTIALS_DIRECTORY/<NAME>`, never from the source path —
-        and appended to the runtime env file by an `ExecStartPre`
-        step. The value never lands in the Nix store.
+        Each file is ingested via systemd `LoadCredential=<NAME>=<path>`
+        at unit start. The ExecStart shell wrapper reads the value
+        from `$CREDENTIALS_DIRECTORY/<NAME>` and `export`s it into
+        the process environment before `exec`ing the Blockscout
+        release. Values never appear in the Nix store, the unit file,
+        or any `EnvironmentFile`.
 
-        Each file's contents must be a single line (no trailing
-        newline required; a single trailing `\n` is fine). Embedded
-        newlines will break the `EnvironmentFile` parser downstream.
+        Each file's contents must be a single value. Trailing
+        newlines are fine (bash's `$(cat …)` strips them); embedded
+        newlines end up in the env var verbatim, which may or may
+        not be valid depending on how Blockscout parses the specific
+        variable.
       '';
     };
   };
@@ -392,8 +391,39 @@ in
       ];
       wantedBy = [ "multi-user.target" ];
 
+      # Static (non-secret) env — systemd emits these as `Environment=`
+      # directives in the unit file. No EnvironmentFile, no compose
+      # step, no shell parsing of values: systemd passes them directly
+      # to the process's env. Operator-supplied `extraEnv` is merged on
+      # top; a collision on a key Nix defined here is resolved by the
+      # usual attrset `//` semantics (operator wins).
+      environment = {
+        DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
+        ACCOUNT_DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
+        ACCOUNT_REDIS_URL = "unix:///run/redis-${cfg.redisServerName}/redis.sock";
+        ETHEREUM_JSONRPC_VARIANT = "geth";
+        ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
+        ETHEREUM_JSONRPC_WS_URL = cfg.ethereumRpc.wsUrl;
+        ETHEREUM_JSONRPC_TRACE_URL = cfg.ethereumRpc.traceUrl;
+        CHAIN_ID = toString cfg.chain.id;
+        COIN = cfg.chain.coin;
+        COIN_NAME = cfg.chain.coinName;
+        NETWORK = cfg.chain.network;
+        SUBNETWORK = cfg.chain.subnetwork;
+        PORT = toString cfg.http.port;
+        BLOCKSCOUT_HOST = cfg.http.host;
+        BLOCKSCOUT_PROTOCOL = cfg.http.protocol;
+      }
+      // cfg.extraEnv;
+
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/blockscout start";
+        # ExecStart is a small shell wrapper that reads credentials
+        # from $CREDENTIALS_DIRECTORY (populated by LoadCredential=
+        # below), optionally runs the migration, and execs the
+        # Blockscout release. See `startScript` in the top `let` for
+        # the implementation and rationale (EnvironmentFile load
+        # ordering makes it unsuitable for runtime-loaded secrets).
+        ExecStart = startScript;
         Restart = "on-failure";
         RestartSec = "5s";
 
@@ -415,74 +445,15 @@ in
 
         # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
-        # $CREDENTIALS_DIRECTORY/<name> — the DynamicUser UID never
-        # needs read access to the source paths. `secret_key_base` is
-        # mandatory; everything under `secretEnvFiles` is optional
-        # operator-supplied (API keys, OAuth secrets, etc.).
+        # $CREDENTIALS_DIRECTORY/<NAME> — the DynamicUser UID never
+        # needs read access to the source paths. Credential name
+        # equals env var name (uppercase), so `startScript` can
+        # `cat "$CREDENTIALS_DIRECTORY/$NAME"` and `export $NAME=…`
+        # without any name translation.
         LoadCredential = [
-          "secret_key_base:${cfg.secretKeyBaseFile}"
+          "SECRET_KEY_BASE:${cfg.secretKeyBaseFile}"
         ]
         ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;
-
-        # ExecStartPre: compose $RUNTIME_DIRECTORY/env from the
-        # Nix-generated static env file + all the secrets read from
-        # $CREDENTIALS_DIRECTORY. EnvironmentFile= below reads the
-        # composed file.
-        #
-        # Static values (DATABASE_URL, CHAIN_ID, extraEnv entries,
-        # etc.) are interpolated at Nix-eval time into
-        # `${staticEnvFile}` — no bash `echo` touches them, so no
-        # shell expansion / quote-closure risk. Secrets
-        # (SECRET_KEY_BASE and every `secretEnvFiles` entry) are
-        # appended at runtime from the credential tmpfs via `printf`
-        # + `cat`, which does not interpolate the values.
-        ExecStartPre = [
-          (pkgs.writeShellScript "blockscout-compose-env" ''
-            set -eu
-            umask 077
-
-            # Install the Nix-generated static env file into the
-            # runtime dir at 0600.
-            install -m 0600 ${staticEnvFile} "$RUNTIME_DIRECTORY/env"
-
-            # Append each secret. `printf` + `cat` avoids shell
-            # expansion of the secret contents; credential files are
-            # expected to be a single line (operator responsibility
-            # — embedded newlines would break EnvironmentFile).
-            append_secret() {
-              local key="$1"
-              {
-                printf '%s=' "$key"
-                cat "$CREDENTIALS_DIRECTORY/$key"
-                printf '\n'
-              } >> "$RUNTIME_DIRECTORY/env"
-            }
-
-            append_secret SECRET_KEY_BASE
-            ${concatMapStringsSep "\n" (name: "append_secret ${name}") (lib.attrNames cfg.secretEnvFiles)}
-          '')
-        ]
-        ++ optional cfg.autoMigrate (
-          # No `!` prefix — the migrate step MUST run under the same
-          # DynamicUser + SupplementaryGroups context as the main
-          # unit so `psql` via /run/postgresql/.s.PGSQL.5432 uses the
-          # `blockscout` role's trust auth. Running as root (the `!`
-          # prefix) would bypass the blockscout role entirely.
-          pkgs.writeShellScript "blockscout-migrate" ''
-            set -eu
-            # Source the env file composed above so the migration
-            # script sees DATABASE_URL, SECRET_KEY_BASE, etc.
-            set -a
-            . "$RUNTIME_DIRECTORY/env"
-            set +a
-            exec ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
-          ''
-        );
-
-        # Use the systemd %t runtime-dir expansion so the path is
-        # correct regardless of whether the service runs with or
-        # without DynamicUser.
-        EnvironmentFile = [ "-%t/blockscout-backend/env" ];
 
         # BEAM JIT needs writable + executable memory pages — opt out
         # of MemoryDenyWriteExecute. Per the nix-modules-hardening
@@ -490,15 +461,26 @@ in
         # keep the default `true`.
         MemoryDenyWriteExecute = false;
 
-        # Defense-in-depth hardening per the nix-modules-hardening
-        # skill matrix.
+        # `PrivateUsers = false` is load-bearing, not a missing
+        # hardening option. The service relies on `SupplementaryGroups`
+        # to reach the PostgreSQL and Redis UNIX sockets; those
+        # sockets are group-owned by `postgres` and `redis-<name>`
+        # respectively at the HOST UID/GID level. `PrivateUsers = true`
+        # would put the service in a user namespace where host GIDs
+        # are remapped (typically to `nobody`), making the kernel's
+        # permission check on the sockets fail with EACCES. Leave
+        # explicitly false with this comment so future hardening
+        # sweeps do not mistakenly re-enable it.
+        PrivateUsers = false;
+
+        # Rest of the defense-in-depth baseline per the
+        # nix-modules-hardening skill matrix.
         CapabilityBoundingSet = [ "" ];
         LockPersonality = true;
         NoNewPrivileges = true;
         PrivateDevices = true;
         PrivateMounts = true;
         PrivateTmp = true;
-        PrivateUsers = true;
         ProcSubset = "pid";
         ProtectClock = true;
         ProtectControlGroups = true;
@@ -527,6 +509,5 @@ in
         UMask = "0077";
       };
     };
-
   };
 }
