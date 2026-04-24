@@ -42,18 +42,34 @@ let
     mkBefore
     types
     concatStringsSep
+    concatMapStringsSep
     mapAttrsToList
     optional
+    literalExpression
     ;
+
+  # Env-var-name regex — used to assert that every `secretEnvFiles`
+  # key is a valid POSIX env var name. Enforced at `config.assertions`
+  # time rather than via the submodule's `name` because submodule
+  # naming happens at a later pass in the module system; an assertion
+  # gives a clearer error message pointing at the exact offending key.
+  envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
 
   # Static env values — Nix-interpolated at module-eval time, written
   # verbatim into a Nix-store file by `pkgs.writeText`. Because Nix
   # produces the file content directly (not via `echo` inside a shell
   # script), values like `db$USER` or `db"quoted"` are stored as
   # literal characters — no bash expansion, no quote-closure risk.
-  # The file is world-readable in the Nix store; this is fine because
-  # it contains ZERO secrets — only configuration derived from module
-  # options that are already visible in the flake source.
+  #
+  # The file is world-readable in the Nix store. This is safe by
+  # convention: this module contracts that `extraEnv` carries no
+  # secrets. Secret-holding env vars (API keys, OAuth client secrets,
+  # SMTP credentials, etc.) go through `cfg.secretEnvFiles` instead —
+  # each value is ingested via `LoadCredential=` and appended at
+  # runtime, so it never touches the store. The contract is enforced
+  # via docs on `extraEnv` rather than a type-level check (operators
+  # are trusted; the surrounding deployment assumes operator
+  # awareness of Nix-store visibility).
   staticEnvFile = pkgs.writeText "blockscout-backend.env" (
     concatStringsSep "\n" (
       [
@@ -111,12 +127,18 @@ in
     };
 
     databaseName = mkOption {
-      type = types.str;
+      # SQL identifier regex — letters, digits, underscores, starting
+      # with a letter or underscore. Enforced at option-set time so
+      # the value can be safely interpolated into pg_hba.conf via
+      # services.postgresql.authentication below (rejects whitespace,
+      # newlines, quotes, and any other char that could inject an
+      # extra pg_hba rule).
+      type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
       default = "blockscout";
     };
 
     databaseUser = mkOption {
-      type = types.str;
+      type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
       default = "blockscout";
     };
 
@@ -253,11 +275,18 @@ in
         API_V2_ENABLED = "true";
       };
       description = ''
-        Additional environment variables passed to the backend.
+        Non-secret environment variables passed to the backend.
         Escape hatch for the 50+ Blockscout env vars this module does
         not expose as first-class options. Values must be strings —
         Blockscout's runtime-config layer treats all env vars as
         strings.
+
+        **Values MUST NOT be secrets.** `extraEnv` entries are
+        interpolated into a `pkgs.writeText`-backed file in the Nix
+        store, which is world-readable. For secret-holding env vars
+        (API keys, OAuth client secrets, SMTP credentials, Sentry
+        DSNs, etc.), use `secretEnvFiles` below — those are ingested
+        via systemd `LoadCredential=` and never land in the store.
 
         **Values MUST NOT contain newlines** — systemd's
         `EnvironmentFile` parser treats each newline as an entry
@@ -268,9 +297,63 @@ in
         `echo` that could expand them).
       '';
     };
+
+    secretEnvFiles = mkOption {
+      # Keys constrained to the env-var-name shape — letters, digits,
+      # underscores, starting with a letter or underscore, uppercase
+      # by convention (POSIX env vars). The key is used verbatim as
+      # both the `LoadCredential=` name and the filename under
+      # $CREDENTIALS_DIRECTORY, so unsafe characters would leak into
+      # those paths.
+      type = types.attrsOf (
+        types.submodule (
+          { name, ... }:
+          {
+            options.path = mkOption {
+              type = types.path;
+              description = "Absolute path to a file containing the value for env var `${name}`.";
+            };
+          }
+        )
+      );
+      default = { };
+      example = literalExpression ''
+        {
+          ACCOUNT_AUTH0_CLIENT_SECRET.path = "/run/secrets/blockscout/auth0_client_secret";
+          ETHERSCAN_API_KEY.path          = "/run/secrets/blockscout/etherscan_key";
+        }
+      '';
+      description = ''
+        Secret-holding environment variables whose values come from
+        files. Each entry's attribute name is the env var name (must
+        match `^[A-Z_][A-Z0-9_]*$`); `.path` is an absolute path to
+        the file containing its value.
+
+        Each file is ingested via systemd `LoadCredential=` at unit
+        start — the service reads the value from
+        `$CREDENTIALS_DIRECTORY/<NAME>`, never from the source path —
+        and appended to the runtime env file by an `ExecStartPre`
+        step. The value never lands in the Nix store.
+
+        Each file's contents must be a single line (no trailing
+        newline required; a single trailing `\n` is fine). Embedded
+        newlines will break the `EnvironmentFile` parser downstream.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
+    # Validate secretEnvFiles keys at option-set time. The key is used
+    # verbatim as both the LoadCredential= name and the
+    # $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe characters
+    # would leak into those paths. Checking via assertions rather than
+    # at the submodule level so the error message can name the exact
+    # offending key.
+    assertions = mapAttrsToList (name: _: {
+      assertion = builtins.match envVarNameRegex name != null;
+      message = "services.blockscout-backend.secretEnvFiles key `${name}` is not a valid POSIX env var name (must match `${envVarNameRegex}`).";
+    }) cfg.secretEnvFiles;
+
     # Local-socket `trust` authentication scoped to the specific role+
     # database. Rationale (databaseAuthRationale):
     #   - Socket filesystem access is already gated by the `postgres`
@@ -330,26 +413,29 @@ in
           "redis-${cfg.redisServerName}"
         ];
 
-        # Secret ingestion. systemd reads the source file as root at
+        # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
-        # $CREDENTIALS_DIRECTORY/secret_key_base — the DynamicUser
-        # UID never needs read access to the source path.
+        # $CREDENTIALS_DIRECTORY/<name> — the DynamicUser UID never
+        # needs read access to the source paths. `secret_key_base` is
+        # mandatory; everything under `secretEnvFiles` is optional
+        # operator-supplied (API keys, OAuth secrets, etc.).
         LoadCredential = [
           "secret_key_base:${cfg.secretKeyBaseFile}"
-        ];
+        ]
+        ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;
 
         # ExecStartPre: compose $RUNTIME_DIRECTORY/env from the
-        # Nix-generated static env file + the secret read from
+        # Nix-generated static env file + all the secrets read from
         # $CREDENTIALS_DIRECTORY. EnvironmentFile= below reads the
         # composed file.
         #
         # Static values (DATABASE_URL, CHAIN_ID, extraEnv entries,
         # etc.) are interpolated at Nix-eval time into
         # `${staticEnvFile}` — no bash `echo` touches them, so no
-        # shell expansion / quote-closure risk. The one secret
-        # (SECRET_KEY_BASE) is appended at runtime from the
-        # credential tmpfs via `printf` + `cat`, which doesn't
-        # interpolate the value.
+        # shell expansion / quote-closure risk. Secrets
+        # (SECRET_KEY_BASE and every `secretEnvFiles` entry) are
+        # appended at runtime from the credential tmpfs via `printf`
+        # + `cat`, which does not interpolate the values.
         ExecStartPre = [
           (pkgs.writeShellScript "blockscout-compose-env" ''
             set -eu
@@ -359,15 +445,21 @@ in
             # runtime dir at 0600.
             install -m 0600 ${staticEnvFile} "$RUNTIME_DIRECTORY/env"
 
-            # Append the secret. `printf` + `cat` avoids shell
-            # expansion of the secret's contents; the credential
-            # file is expected to be a single line (operator
-            # responsibility — newlines break EnvironmentFile).
-            {
-              printf 'SECRET_KEY_BASE='
-              cat "$CREDENTIALS_DIRECTORY/secret_key_base"
-              printf '\n'
-            } >> "$RUNTIME_DIRECTORY/env"
+            # Append each secret. `printf` + `cat` avoids shell
+            # expansion of the secret contents; credential files are
+            # expected to be a single line (operator responsibility
+            # — embedded newlines would break EnvironmentFile).
+            append_secret() {
+              local key="$1"
+              {
+                printf '%s=' "$key"
+                cat "$CREDENTIALS_DIRECTORY/$key"
+                printf '\n'
+              } >> "$RUNTIME_DIRECTORY/env"
+            }
+
+            append_secret SECRET_KEY_BASE
+            ${concatMapStringsSep "\n" (name: "append_secret ${name}") (lib.attrNames cfg.secretEnvFiles)}
           '')
         ]
         ++ optional cfg.autoMigrate (
