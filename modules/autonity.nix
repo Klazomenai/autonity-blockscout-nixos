@@ -278,9 +278,9 @@ in
 
         DynamicUser = true;
         # Derived from cfg.dataDir so overriding dataDir also moves the
-        # systemd-managed state directory. The `config.assertions` above
-        # enforces that cfg.dataDir lives under /var/lib/, so this
-        # removePrefix is always defined.
+        # systemd-managed state directory. The `dataDir` option's
+        # `types.strMatching` constraint enforces that cfg.dataDir lives
+        # under /var/lib/, so this removePrefix is always defined.
         StateDirectory = lib.removePrefix "/var/lib/" cfg.dataDir;
         StateDirectoryMode = "0700";
 
