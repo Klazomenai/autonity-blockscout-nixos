@@ -5,11 +5,14 @@
 # for socket access.
 #
 # Hardening of `redis-<name>.service` itself is inherited from the
-# upstream nixpkgs module (DynamicUser=true, ProtectSystem=strict,
-# MemoryDenyWriteExecute=true — Redis has no runtime JIT, full
-# defense-in-depth systemd block). This wrapper only adds the
-# Blockscout-specific surface on top. Re-applying or weakening that
-# hardening is deliberately avoided.
+# upstream nixpkgs module (static `redis-<name>` user/group rather
+# than DynamicUser — load-bearing because consumers join the
+# auto-created group via `SupplementaryGroups` for socket access,
+# which requires a stable host GID; ProtectSystem=strict,
+# MemoryDenyWriteExecute=true — Redis has no runtime JIT — and the
+# rest of the defense-in-depth systemd block). This wrapper only
+# adds the Blockscout-specific surface on top. Re-applying or
+# weakening that hardening is deliberately avoided.
 #
 # Same socket-vs-auth separation of concerns established by
 # `blockscout-postgresql`: the wrapper handles socket filesystem access
