@@ -56,21 +56,33 @@ in
     enable = mkEnableOption "the Blockscout reverse proxy + ACME TLS termination";
 
     serverName = mkOption {
-      # Server name regex: hostname-shape characters only. Used verbatim
-      # as both the `services.nginx.virtualHosts.<name>` attribute key
-      # AND interpolated into the nginx `server_name` directive — so
-      # rejecting whitespace, quotes, semicolons, and other unsafe
-      # nginx-config metacharacters at option-set time prevents config
-      # injection regardless of where the value flows.
-      type = types.strMatching "^[a-zA-Z0-9.-]+$";
+      # Server name regex: RFC 1035 DNS labels — each label 1-63 chars,
+      # starts and ends with alphanumeric, may contain hyphens internally;
+      # one or more labels separated by dots; total length not enforced
+      # at the regex level (DNS allows 253 chars, far longer than any
+      # realistic explorer hostname). This is stricter than a generic
+      # "hostname-shape characters" regex because the loose form admits
+      # leading dots, trailing dots, empty labels (`a..b`), and lone
+      # `-` — all of which evaluate cleanly here but produce a broken
+      # nginx / ACME config later. Fail at option-set time instead.
+      #
+      # Used verbatim as both the `services.nginx.virtualHosts.<name>`
+      # attribute key AND interpolated into the nginx `server_name`
+      # directive — the regex is also the single point of truth for
+      # safe nginx-config interpolation (rejects whitespace / quotes /
+      # semicolons by construction).
+      type = types.strMatching "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$";
       example = "explorer.example.com";
       description = ''
-        Public hostname this reverse proxy serves. Must be a DNS-shape
-        hostname (letters, digits, dots, hyphens). The operator is
-        responsible for ensuring an A / AAAA record points at this
-        host's public IP before enabling ACME — Let's Encrypt's HTTP-01
-        challenge fails closed if the hostname does not resolve to the
-        validating server.
+        Public hostname this reverse proxy serves. Must be a valid
+        DNS hostname per RFC 1035: one or more labels separated by
+        dots; each label 1-63 characters of alphanumerics with
+        optional internal hyphens; no leading or trailing dots, no
+        empty labels, no leading or trailing hyphens within a label.
+        The operator is responsible for ensuring an A / AAAA record
+        points at this host's public IP before enabling ACME — Let's
+        Encrypt's HTTP-01 challenge fails closed if the hostname does
+        not resolve to the validating server.
       '';
     };
 
@@ -90,16 +102,33 @@ in
       };
 
       email = mkOption {
-        type = types.str;
+        # Pragmatic email-shape regex: `<local>@<domain-with-dot>`.
+        # Not RFC 5322 (that grammar is famously unparsable by regex)
+        # and not a deliverability check — just enough shape validation
+        # to reject obvious typos at option-set time rather than at
+        # ACME registration time, where the failure surfaces as a
+        # `journalctl -u acme-…` line that operators don't always see.
+        # Empty string is permitted at the type level so operators
+        # evaluating with `acme.enable = false` aren't forced to
+        # provide a placeholder; the assertion in `config` requires
+        # non-empty when ACME is on.
+        type = types.strMatching "^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$";
         default = "";
         example = "ops@example.com";
         description = ''
           Account email for the Let's Encrypt registration. Required
           when `acme.enable = true` (enforced via `config.assertions`).
           LE uses this address for expiry warnings and TOS update
-          notifications; an unattended deployment that never reads
-          this mailbox is fine, but the registration itself requires
-          a valid email format.
+          notifications.
+
+          Validated at option-set time against an
+          `^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$` shape —
+          a pragmatic "looks like an email" check rather than a full
+          RFC 5322 grammar. Empty string is accepted by the type to
+          let operators evaluate with `acme.enable = false` without
+          providing a placeholder; the non-empty requirement is
+          enforced separately via `config.assertions` only when ACME
+          is enabled.
         '';
       };
 
@@ -123,23 +152,39 @@ in
     };
 
     frontend.upstream = mkOption {
-      type = types.str;
+      # `host:port` shape — host part hostname-or-IPv4 characters
+      # (alphanumerics, dots, hyphens), port part digits-only. Used in
+      # `proxyPass = "http://${cfg.frontend.upstream}"`, so a typo
+      # (embedded whitespace, semicolon, double colon) would surface
+      # only at `nginx -t` during unit ExecStartPre. Catching it at
+      # option-set time produces a clearer error pointing at the
+      # offending option.
+      type = types.strMatching "^[a-zA-Z0-9.-]+:[0-9]+$";
       default = "127.0.0.1:3000";
       description = ''
-        `host:port` of the Blockscout frontend service. Defaults match
+        `host:port` of the Blockscout frontend service (no scheme —
+        the module proxies via `http://`). Defaults match
         `services.blockscout-frontend.{host,port}`'s defaults. All
         traffic not matching a backend prefix is proxied here.
+
+        Validated at option-set time against
+        `^[a-zA-Z0-9.-]+:[0-9]+$` to catch typos before they reach
+        the nginx config-test stage.
       '';
     };
 
     backend.upstream = mkOption {
-      type = types.str;
+      type = types.strMatching "^[a-zA-Z0-9.-]+:[0-9]+$";
       default = "127.0.0.1:4000";
       description = ''
-        `host:port` of the Blockscout backend service. Defaults match
+        `host:port` of the Blockscout backend service (no scheme —
+        the module proxies via `http://`). Defaults match
         `services.blockscout-backend.http.port` on loopback. The
         `/api`, `/api/v2`, `/socket`, `/health`, and `/metrics` path
         prefixes are proxied here.
+
+        Same `^[a-zA-Z0-9.-]+:[0-9]+$` validation as
+        `frontend.upstream`.
       '';
     };
 
@@ -182,15 +227,25 @@ in
   };
 
   config = mkIf cfg.enable {
-    # ACME requires a contact email when enabled. The empty default on
-    # `acme.email` keeps the option non-required at the type level so
-    # operators evaluating with `acme.enable = false` don't have to
-    # provide a placeholder; the assertion fires only when ACME is
-    # actually enabled.
+    # Two assertions:
+    #   1. ACME requires a contact email when enabled. The empty
+    #      default on `acme.email` keeps the option non-required at
+    #      the type level so operators evaluating with
+    #      `acme.enable = false` don't have to provide a placeholder.
+    #   2. `services.nginx.enable` is set to `mkDefault true` below,
+    #      but another module (or operator config) explicitly setting
+    #      `services.nginx.enable = false` wins by priority. Without
+    #      this assertion the module would still open firewall ports
+    #      and configure ACME state for a non-existent nginx unit.
+    #      Fail fast with a clear message instead.
     assertions = [
       {
         assertion = !cfg.acme.enable || cfg.acme.email != "";
         message = "services.blockscout-nginx.acme.email must be set (non-empty) when services.blockscout-nginx.acme.enable is true. Let's Encrypt registration requires a contact email for expiry warnings and TOS updates.";
+      }
+      {
+        assertion = config.services.nginx.enable;
+        message = "services.blockscout-nginx.enable = true requires services.nginx.enable = true (this module sets it via lib.mkDefault, but another module or your configuration is explicitly disabling it).";
       }
     ];
 
@@ -202,23 +257,41 @@ in
       443
     ];
 
-    # ACME terms acceptance + default email. `mkIf cfg.acme.enable`
-    # ensures we don't touch `security.acme` at all when the operator
-    # is wiring their own cert — same pattern blockscout-backend uses
-    # for `services.postgresql.authentication`.
-    security.acme = mkIf cfg.acme.enable (
-      {
-        acceptTerms = true;
-        defaults.email = cfg.acme.email;
+    # ACME terms acceptance is a global one-time setting (legal accept
+    # for using ACME at all on this host) — it has to live at the
+    # top level, but it's idempotent across multiple ACME consumers.
+    # The email and (when staging) server URL are scoped to OUR cert
+    # via `security.acme.certs.${cfg.serverName}` rather than
+    # `security.acme.defaults.*`, so other ACME-consuming modules on
+    # the same host (e.g. a separate vhost the operator manages) keep
+    # their own per-cert email and staging choices. This module owns
+    # one vhost; it doesn't speak for the host.
+    #
+    # The double gate (`cfg.acme.enable && config.services.nginx.enable`)
+    # keeps us from defining a partial `security.acme.certs.<name>`
+    # entry when nginx is explicitly disabled — that would surface as
+    # nixpkgs' "exactly one of dnsProvider/webroot/listenHTTP/s3Bucket
+    # is required" assertion (because the nginx-vhost integration
+    # auto-populates `webroot`, but only if nginx is enabled). Our
+    # `cfg.enable -> services.nginx.enable` assertion above already
+    # explains the operator-facing problem; this gate suppresses the
+    # downstream nixpkgs assertion that would otherwise clutter the
+    # error output.
+    security.acme = mkIf (cfg.acme.enable && config.services.nginx.enable) {
+      acceptTerms = true;
+      certs.${cfg.serverName} = {
+        email = cfg.acme.email;
       }
       // optionalAttrs cfg.acme.useStaging {
-        # LE staging directory. Issued certs are signed by a non-trusted
-        # root, so browsers warn until the operator flips back to
-        # production. Useful for first-run validation without burning
-        # the production rate limit on configuration errors.
-        defaults.server = "https://acme-staging-v02.api.letsencrypt.org/directory";
-      }
-    );
+        # LE staging directory. Issued certs are signed by a non-
+        # trusted root, so browsers warn until the operator flips
+        # back to production. Useful for first-run validation without
+        # burning the production rate limit on configuration errors.
+        # Scoped to this cert only — staging on the explorer vhost
+        # does not bleed into other ACME certs the host issues.
+        server = "https://acme-staging-v02.api.letsencrypt.org/directory";
+      };
+    };
 
     # Compose the reverse proxy vhost. Zero overrides on
     # `systemd.services.nginx` — nixpkgs ships the nginx unit with
