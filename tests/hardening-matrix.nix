@@ -69,6 +69,13 @@ let
         boot.loader.grub.enable = false;
         fileSystems."/".device = "tmpfs";
         fileSystems."/".fsType = "tmpfs";
+        # Pinned (rather than left at the nixpkgs default-from-release
+        # fallback) purely to silence the eval-time warning on every
+        # `nix flake check` run. The value is never observed — this
+        # NixOS system is built only for serviceConfig inspection,
+        # never deployed — so any frozen release tag works. Update
+        # opportunistically on nixpkgs major bumps to match.
+        system.stateVersion = "24.05";
         services.autonity.enable = true;
         services.blockscout-postgresql.enable = true;
         services.blockscout-redis.enable = true;
@@ -90,21 +97,31 @@ let
   # Keys whose values represent set semantics (order-irrelevant). The
   # comparator sorts both sides before diffing so a future nixpkgs
   # upgrade reordering elements in `RestrictAddressFamilies` doesn't
-  # spuriously fail the check. SystemCallFilter is more nuanced —
-  # systemd's parser treats the list-of-strings as ordered (later
-  # entries can re-allow earlier denies), but in practice none of the
-  # six units rely on order, and treating it as a set keeps the
-  # check stable across cosmetic upstream rewrites.
+  # spuriously fail the check.
+  #
+  # SystemCallFilter is included here despite a subtlety: systemd
+  # treats EACH list element as an independent `SystemCallFilter=`
+  # directive in the unit file, with the `~` invert-prefix scoped to
+  # the directive it appears on. So `"~@cpu @debug"` (single line)
+  # and `[ "~@cpu" "@debug" ]` (two lines) are NOT semantically
+  # equivalent — the latter would deny @cpu but ALLOW @debug. The
+  # normaliser below therefore deliberately does NOT split strings
+  # on whitespace; it only lifts a bare string into a single-element
+  # list (handling the redis `""` vs blockscout `[ "" ]` case for
+  # CapabilityBoundingSet, where the empty string is the systemd
+  # sentinel "no caps" with no whitespace to split). A real
+  # representation flip on SystemCallFilter is something the operator
+  # SHOULD see — it changes the semantics of the syscall filter, and
+  # the maintenance contract handles it cleanly: PR fails, operator
+  # confirms semantic equivalence, updates the expected entry.
   setKeys = [
     "CapabilityBoundingSet"
     "RestrictAddressFamilies"
     "SystemCallFilter"
   ];
 
-  # Normalise: lift a bare string to a single-element list (nixpkgs
-  # ships some keys as either form depending on how the upstream
-  # module composed them — redis ships CapabilityBoundingSet as ""
-  # while our modules ship [ "" ]; both are systemd-equivalent).
+  # Normalise: lift a bare string to a single-element list. Does NOT
+  # split on whitespace (see the SystemCallFilter caveat above).
   toList = v: if builtins.isList v then v else [ v ];
 
   # Compare two values, normalising for set semantics on the listed
@@ -351,10 +368,10 @@ let
     # Redis — nixpkgs upstream unit. CapabilityBoundingSet ships as
     # bare string "" (not [ "" ] like the data-plane modules); the
     # set-key normaliser handles this. Several keys absent that the
-    # data-plane modules carry: ProcSubset, ProtectProc, RemoveIPC,
-    # SystemCallArchitectures-listed but not as native. SystemCallFilter
-    # ships as a single string (not list). DynamicUser is false (the
-    # nixpkgs `services.redis.servers.<name>` unit allocates a static
+    # data-plane modules carry: ProcSubset, ProtectProc, RemoveIPC.
+    # SystemCallFilter ships as a single string (not list).
+    # DynamicUser is false (the nixpkgs
+    # `services.redis.servers.<name>` unit allocates a static
     # `redis-<name>` user so that the auto-created group can be joined
     # by clients via SupplementaryGroups).
     redis-blockscout = {
