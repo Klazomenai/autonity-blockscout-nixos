@@ -42,7 +42,7 @@
   flake,
   system,
   # Optional list of additional NixOS modules merged into the stub
-  # system. Production use (the `flake.checks.<system>.hardening`
+  # system. Production use (the `checks.<system>.hardening`
   # output) leaves this empty. Regression-test use sites pass override
   # modules to inject deliberate perturbations and confirm the diff
   # detection fires correctly without requiring a temporary edit to
@@ -55,8 +55,8 @@ let
 
   # Stub NixOS system with all six service modules enabled at sane
   # defaults — enough to render unit files, not enough to actually
-  # deploy. The fileSystem.tmpfs root and disabled bootloader are
-  # standard `eval-only` test boilerplate; the secret path is a
+  # deploy. The tmpfs root via `fileSystems` and disabled bootloader
+  # are standard `eval-only` test boilerplate; the secret path is a
   # placeholder that satisfies the `secretKeyBaseFile` not-in-store
   # assertion without needing the file to exist (we never start the
   # unit).
