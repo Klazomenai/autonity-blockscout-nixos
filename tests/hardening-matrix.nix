@@ -134,21 +134,45 @@ let
       a == b;
 
   # Diff one unit. Returns a list of diff descriptors (empty on match).
+  #
+  # The unit-lookup is guarded: a unit listed in `expected` but absent
+  # from `evaluated.config.systemd.services` (because it was renamed,
+  # removed, or its enabling option was flipped off) produces ONE
+  # diff entry pointing at the unit-name level rather than letting the
+  # check fail with a generic `attribute '<name>' missing` Nix trace.
+  # Without the guard, the spike's actionable-error contract breaks
+  # exactly when an operator most needs a clear pointer at what
+  # changed. Emitting just one entry (rather than one-per-expected-key)
+  # keeps the CI output focused on "the unit is gone" rather than
+  # padding with N copies of the same diagnostic.
   diffUnit =
     unitName: expectedSc:
     let
-      actual = evaluated.config.systemd.services.${unitName}.serviceConfig;
-      keys = builtins.attrNames expectedSc;
-      mismatches = lib.filter (
-        k: !(builtins.hasAttr k actual) || !(valueEq k expectedSc.${k} actual.${k})
-      ) keys;
+      serviceMaybe = evaluated.config.systemd.services.${unitName} or null;
     in
-    map (k: {
-      unit = unitName;
-      key = k;
-      expected = expectedSc.${k};
-      actual = actual.${k} or "MISSING";
-    }) mismatches;
+    if serviceMaybe == null then
+      [
+        {
+          unit = unitName;
+          key = "<unit>";
+          expected = "present in systemd.services";
+          actual = "MISSING — unit removed, renamed, or disabled since the expected-shape table was last updated";
+        }
+      ]
+    else
+      let
+        actual = serviceMaybe.serviceConfig;
+        keys = builtins.attrNames expectedSc;
+        mismatches = lib.filter (
+          k: !(builtins.hasAttr k actual) || !(valueEq k expectedSc.${k} actual.${k})
+        ) keys;
+      in
+      map (k: {
+        unit = unitName;
+        key = k;
+        expected = expectedSc.${k};
+        actual = actual.${k} or "MISSING";
+      }) mismatches;
 
   # Per-unit expected `serviceConfig` slices. Encodes the ACTUAL
   # shipped state on `main` as of merging this spike — not an
