@@ -157,19 +157,38 @@ in
 
         **NEXT_PUBLIC_* keys belong in `publicEnv`, not here.** Only
         `publicEnv` is reflected into the browser-readable envs.js.
+
+        **Do not put secrets here.** Values from `extraEnv` are passed
+        via `systemd.services.*.environment`, so they end up in the
+        generated systemd unit and its Nix-store backing path, which
+        are world-readable.
       '';
     };
   };
 
   config = mkIf cfg.enable {
-    # Validate every publicEnv key matches the NEXT_PUBLIC_* shape.
-    # Catches typos (NEXT_PUBLI_*) and deliberate non-public values
-    # (API tokens, secrets) that would otherwise leak into the
-    # client-readable envs.js.
-    assertions = mapAttrsToList (name: _: {
-      assertion = builtins.match publicEnvKeyRegex name != null;
-      message = "services.blockscout-frontend.publicEnv key `${name}` must match `${publicEnvKeyRegex}`. Non-public env vars belong in `extraEnv` (server-side only).";
-    }) cfg.publicEnv;
+    # Validate the public/private env split:
+    #   - publicEnv keys MUST match the NEXT_PUBLIC_* shape (catches
+    #     typos like `NEXT_PUBLI_FOO` and rejects deliberate non-public
+    #     values such as API tokens that would otherwise leak into the
+    #     client-readable envs.js).
+    #   - extraEnv keys MUST NOT match the NEXT_PUBLIC_* shape — these
+    #     are server-side only. publicEnv is the single source of truth
+    #     for `NEXT_PUBLIC_*` values, which feed both the server's
+    #     process.env (via Environment= directives) and the browser's
+    #     window.__envs (via envsJs + BindReadOnlyPaths). If extraEnv
+    #     could carry NEXT_PUBLIC_* keys, they'd land in process.env
+    #     for the SSR layer but NOT in envs.js, so server-rendered
+    #     pages and client-side hydration would disagree.
+    assertions =
+      mapAttrsToList (name: _: {
+        assertion = builtins.match publicEnvKeyRegex name != null;
+        message = "services.blockscout-frontend.publicEnv key `${name}` must match `${publicEnvKeyRegex}`. Non-public env vars belong in `extraEnv` (server-side only).";
+      }) cfg.publicEnv
+      ++ mapAttrsToList (name: _: {
+        assertion = builtins.match publicEnvKeyRegex name == null;
+        message = "services.blockscout-frontend.extraEnv key `${name}` must not match `${publicEnvKeyRegex}`. Public env vars belong in `publicEnv` so process.env.NEXT_PUBLIC_* and window.__envs stay in sync.";
+      }) cfg.extraEnv;
 
     systemd.services.blockscout-frontend = {
       description = "Blockscout Next.js frontend";
@@ -190,8 +209,9 @@ in
       # serviceConfig below). HOSTNAME and PORT control the bind address
       # of the Next.js standalone server (`server.js` reads
       # process.env.HOSTNAME and process.env.PORT). NEXT_TELEMETRY is
-      # always disabled — telemetry collection has no place in a
-      # production explorer.
+      # disabled by default; an operator can override via `extraEnv` if
+      # they explicitly want it on, but the default is off because
+      # telemetry collection has no place in a production explorer.
       environment = {
         HOSTNAME = cfg.host;
         PORT = toString cfg.port;
