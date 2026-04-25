@@ -17,8 +17,8 @@
     ./blockscout-postgresql.nix
     ./blockscout-redis.nix
     ./blockscout-backend.nix
+    ./blockscout-frontend.nix
     # Service modules land here as they ship:
-    #   ./blockscout-frontend.nix
     #   ./blockscout-nginx.nix
   ];
 }
