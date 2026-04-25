@@ -23,6 +23,16 @@ New NixOS service modules MUST follow the patterns below. Full rationale and the
 - **`MemoryDenyWriteExecute`**: `true` by default. JIT runtimes (BEAM, V8, LuaJIT, JVM, ONNX, PyPy) opt out with an inline comment explaining the runtime. Go and Rust do NOT need an opt-out.
 - **Unit ordering**: `after=` on every dependency. `requires=` only when the dependency failing should propagate. `wants=` for soft dependencies.
 
+## Hardening matrix validation
+
+Every PR runs `checks.<system>.hardening` (defined by `tests/hardening-matrix.nix`) as part of `nix flake check`. The check renders a stub NixOS system with all six service modules enabled at sane defaults, walks each unit's merged `serviceConfig`, and compares against an expected-shape table encoded inline. Any drift — a key with a different value, or an expected key gone missing — fails the build with a per-unit per-key error report.
+
+The expected-shape table is the **as-shipped** state, not an aspirational uniform baseline. nixpkgs' upstream nginx / postgresql / redis units differ from the data-plane modules in several places (`CapabilityBoundingSet` shape, `SystemCallFilter` style, `AF_NETLINK` presence). The check enforces the *current* shipped values; nixpkgs upstream choices are nixpkgs' problem.
+
+**Maintenance contract**: when a module change legitimately requires updating one of these expectations — adding a new module, introducing a new per-unit deviation (e.g. another JIT runtime joining the `MemoryDenyWriteExecute = false` list), or absorbing a nixpkgs upstream change to a wrapped unit — update the relevant `expected.<unit>` entry in `tests/hardening-matrix.nix` in the same PR, with the reasoning captured both in a code comment on the deviating unit's `serviceConfig` and in the PR description. Without that paper trail, the check stops being meaningful: it would just be a rubber stamp for whatever the tree happens to ship.
+
+The check covers `serviceConfig` keys only. ExecStart paths, `Environment=` values, `LoadCredential=` entries, and similar are validated by per-module `config.assertions` (option-set time) and by the full-stack `nixosTest` (behavioural validation, separate PR).
+
 ## PR workflow
 
 1. Open an issue describing the change.
