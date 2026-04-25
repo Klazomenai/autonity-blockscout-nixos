@@ -23,6 +23,18 @@
     blockscout.url = "github:klazomenai/blockscout";
     blockscout.inputs.nixpkgs.follows = "nixpkgs";
     blockscout.inputs.flake-utils.follows = "flake-utils";
+
+    # Blockscout frontend (Next.js standalone) — produced by the
+    # `klazomenai/blockscout-frontend` fork's flake. The NixOS
+    # blockscout-frontend module defaults
+    # `services.blockscout-frontend.package` to `pkgs.blockscout-frontend`,
+    # wired via the nixpkgs.overlays entry below. Runtime configuration
+    # (NEXT_PUBLIC_*) is regenerated into envs.js by the module at unit
+    # start and overlaid onto the package's shipped placeholder via
+    # `BindReadOnlyPaths`.
+    blockscout-frontend.url = "github:klazomenai/blockscout-frontend";
+    blockscout-frontend.inputs.nixpkgs.follows = "nixpkgs";
+    blockscout-frontend.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
@@ -32,6 +44,7 @@
       flake-utils,
       autonity,
       blockscout,
+      blockscout-frontend,
     }:
     let
       # Scope locked to x86_64-linux for the glue repo and all service
@@ -53,6 +66,7 @@
             autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
             autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
             blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
+            blockscout-frontend = blockscout-frontend.packages.${final.stdenv.hostPlatform.system}.default;
           })
         ];
       };
