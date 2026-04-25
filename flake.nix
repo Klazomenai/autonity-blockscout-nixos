@@ -88,12 +88,23 @@
           ];
         };
 
-        # Placeholder flake checks that validate Nix formatting hygiene
-        # across every tracked .nix file in the source tree. Discovery
-        # is filesystem-based so new modules are covered automatically
-        # as they land — no per-module maintenance on this check.
-        # Real VM integration tests (`nixosTest`) land with the service
-        # modules they exercise.
+        # Flake checks. Static analysis only — behavioural validation
+        # (real syscall denials, namespace restrictions, cross-service
+        # connectivity) lives in the upcoming full-stack `nixosTest`.
+        #
+        # `fmt` validates Nix formatting hygiene across every tracked
+        # .nix file in the source tree. Discovery is filesystem-based
+        # so new modules are covered automatically as they land — no
+        # per-module maintenance on this check.
+        #
+        # `hardening` validates the systemd `serviceConfig` hardening
+        # matrix shipped on each of the six service units, against the
+        # expected-shape table in `tests/hardening-matrix.nix`. Catches
+        # drift cheaply at NixOS evaluation time so a future module
+        # change can't silently regress on a hardening flag — the
+        # matrix is frozen across 6 modules through 18 Copilot review
+        # rounds; without an automated guard, only manual sweeps would
+        # catch drift.
         checks.fmt =
           pkgs.runCommand "check-fmt"
             {
@@ -104,6 +115,11 @@
                 | xargs -0 nixfmt --check
               touch $out
             '';
+
+        checks.hardening = import ./tests/hardening-matrix.nix {
+          inherit pkgs nixpkgs system;
+          flake = self;
+        };
       }
     );
 }
