@@ -29,9 +29,9 @@
     # blockscout-frontend module defaults
     # `services.blockscout-frontend.package` to `pkgs.blockscout-frontend`,
     # wired via the nixpkgs.overlays entry below. Runtime configuration
-    # (NEXT_PUBLIC_*) is regenerated into envs.js by the module at unit
-    # start and overlaid onto the package's shipped placeholder via
-    # `BindReadOnlyPaths`.
+    # (NEXT_PUBLIC_*) is generated into envs.js via `pkgs.writeText`
+    # during Nix evaluation/build time and overlaid onto the package's
+    # shipped placeholder via `BindReadOnlyPaths`.
     blockscout-frontend.url = "github:klazomenai/blockscout-frontend";
     blockscout-frontend.inputs.nixpkgs.follows = "nixpkgs";
     blockscout-frontend.inputs.flake-utils.follows = "flake-utils";

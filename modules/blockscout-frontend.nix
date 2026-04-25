@@ -50,11 +50,13 @@ let
     mapAttrsToList
     ;
 
-  # NEXT_PUBLIC_* — same regex Next.js itself uses to decide which env
-  # vars are inlined into the client bundle. Everything else stays
-  # server-only. Enforced at config.assertions time so a typo'd or
-  # deliberately non-public key (e.g. an API token) cannot end up in
-  # the client-readable envs.js by accident.
+  # NEXT_PUBLIC_* — Next.js itself exposes env vars to the client based
+  # on the `NEXT_PUBLIC_` prefix. This module intentionally applies the
+  # stricter `^NEXT_PUBLIC_[A-Z0-9_]+$` validation when accepting keys
+  # for `publicEnv`, so everything else stays server-only. Enforced at
+  # config.assertions time so a typo'd or deliberately non-public key
+  # (e.g. an API token) cannot end up in the client-readable envs.js by
+  # accident.
   publicEnvKeyRegex = "^NEXT_PUBLIC_[A-Z0-9_]+$";
 
   # envs.js generated at Nix evaluation time. The frontend's
@@ -185,7 +187,7 @@ in
       # Single source of truth: publicEnv goes into both the server's
       # process.env (via these Environment= directives) and the
       # browser's window.__envs (via envsJs + BindReadOnlyPaths in
-      # serviceConfig below). HOST and PORT control the bind address
+      # serviceConfig below). HOSTNAME and PORT control the bind address
       # of the Next.js standalone server (`server.js` reads
       # process.env.HOSTNAME and process.env.PORT). NEXT_TELEMETRY is
       # always disabled — telemetry collection has no place in a
