@@ -140,7 +140,16 @@ let
       export ${name}="$(cat "$CREDENTIALS_DIRECTORY/${name}")"
     '') (lib.attrNames cfg.secretEnvFiles)}
     ${optionalString cfg.autoMigrate ''
-      ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
+      # Module name is `Explorer.ReleaseTasks`, NOT `Explorer.Release`
+      # — the fork ships the standard upstream-Blockscout
+      # release-tasks helper at apps/explorer/lib/release_tasks.ex,
+      # which `defmodule`s as `Explorer.ReleaseTasks`. The function is
+      # `migrate/1` taking an unused `_argv` argument; `[]` is the
+      # canonical "no argv" placeholder. Older Blockscout docs/issues
+      # sometimes reference `Explorer.Release` (no -Tasks suffix);
+      # that's a different module name from a different era and is
+      # not what this fork ships.
+      ${cfg.package}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
     ''}
     exec ${cfg.package}/bin/blockscout start
   '';
