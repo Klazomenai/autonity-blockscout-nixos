@@ -4,23 +4,26 @@
 # blockscout-redis.nix finally comes together.
 #
 # Cross-service contract:
-#   - PostgreSQL (default: local UNIX socket): connects via
-#     /run/postgresql/.s.PGSQL.5432, joining the `postgres` group via
-#     SupplementaryGroups for socket filesystem access. Authentication:
-#     local `trust` scoped to the specific role+database via
-#     services.postgresql.authentication (mkBefore) — socket access is
-#     the auth boundary on a single-machine deployment; see the
-#     `databaseAuthRationale` comment below.
-#     If `databaseHost` is set to a TCP hostname, the module detects
-#     this (no leading `/`) and skips ALL local-PG assumptions: no
-#     `postgresql.service` dependency, no `postgres` SupplementaryGroup,
-#     no pg_hba.conf injection. `configurePostgresAuth` lets operators
-#     override the pg_hba-injection heuristic when the deployment shape
-#     is unusual.
+#   - PostgreSQL: TCP-localhost connection on `databaseHost:databasePort`
+#     (default `localhost:5432`, matching the `blockscout-postgresql`
+#     wrapper's `listen_addresses = "localhost"` default). Auth is
+#     password-based via the standard nixpkgs pg_hba.conf
+#     `host all all 127.0.0.1/32 scram-sha-256` rule; the role's
+#     password is set by the wrapper's postStart from
+#     `services.blockscout-postgresql.passwordFile`, and the matching
+#     `databasePasswordFile` here drives `LoadCredential=` ingestion +
+#     percent-encoded URL composition in the ExecStart wrapper.
+#     UNIX-socket connections were attempted in earlier drafts but
+#     are NOT supported: Blockscout's
+#     `Explorer.Repo.ConfigHelper.extract_parameters/1` requires a
+#     `user:pass@host:port/db` URL form and Postgrex parses URL
+#     host/port for the actual TCP connect, ignoring libpq's
+#     `?host=` query parameter for socket overrides.
 #   - Redis: connects via UNIX socket /run/redis-<name>/redis.sock
 #     (joining the `redis-<name>` group via SupplementaryGroups). Redis
 #     has no authentication configured; socket access is the auth
-#     boundary.
+#     boundary. Blockscout's Redix client supports `unix:///path`
+#     URIs natively, so the Postgrex-style limitation doesn't apply.
 #   - Autonity: connects via loopback TCP to 127.0.0.1:8545 (http),
 #     8546 (ws); the Autonity module binds loopback-only on those
 #     ports by default.
@@ -70,25 +73,6 @@ let
   # gives a clearer error message pointing at the exact offending key.
   envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
 
-  # Derived fact: whether `databaseHost` points at a UNIX socket
-  # directory (absolute path starting with `/`). Used as the single
-  # source of truth for "is the PostgreSQL we talk to running locally
-  # and reachable by socket?" — gates four places consistently:
-  #   1. `services.postgresql.authentication` pg_hba injection
-  #      (operator can still override via `configurePostgresAuth`)
-  #   2. `systemd.services.blockscout-backend.after` dependency on
-  #      `postgresql.service`
-  #   3. …`requires` on `postgresql.service`
-  #   4. `SupplementaryGroups = [ "postgres" ]` — only needed for
-  #      UNIX-socket filesystem access; harmless for TCP but
-  #      references a group that doesn't exist without local PG
-  #
-  # TCP hosts (remote PG) → all four are skipped, so the module can
-  # be pointed at a remote PostgreSQL without dragging in a local
-  # `postgresql.service` dependency or a non-existent `postgres`
-  # group.
-  postgresLocal = lib.hasPrefix "/" cfg.databaseHost;
-
   # Bash wrapper that exports each LoadCredential-sourced secret into
   # the process environment, optionally runs the migration, then execs
   # the main server. Static env vars are provided by systemd's
@@ -122,6 +106,41 @@ let
     # value with no trailing content beyond an optional final newline
     # (bash command substitution strips trailing newlines).
     export SECRET_KEY_BASE="$(cat "$CREDENTIALS_DIRECTORY/SECRET_KEY_BASE")"
+
+    # DATABASE_URL composition with URL-encoded password. The
+    # password is read from $CREDENTIALS_DIRECTORY (populated by
+    # LoadCredential=DATABASE_PASSWORD via cfg.databasePasswordFile),
+    # then percent-encoded byte-by-byte so that any of `: @ / ? # %`
+    # in the password value doesn't break the URL parser. Composed
+    # at exec time (not via systemd's Environment= directives) so the
+    # password value never lands in the unit file or Nix store —
+    # same secret-handling contract as SECRET_KEY_BASE above.
+    #
+    # Blockscout's Ecto layer (`Explorer.Repo.ConfigHelper.
+    # extract_parameters/1`) requires URL form
+    # `user:pass@host:port/db` and parses `host:port` for the actual
+    # TCP connect — libpq's `?host=` query parameter for UNIX-socket
+    # overrides is NOT honoured. So `databaseHost` is always treated
+    # as a TCP host (loopback or remote), never as a socket path.
+    db_password_raw=$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")
+    db_password_enc=$(
+      LC_ALL=C
+      out=""
+      i=0
+      len=''${#db_password_raw}
+      while [ $i -lt $len ]; do
+        c=''${db_password_raw:$i:1}
+        case "$c" in
+          [a-zA-Z0-9._~-]) out="$out$c" ;;
+          *) out="$out$(printf '%%%02X' "'$c")" ;;
+        esac
+        i=$((i + 1))
+      done
+      printf '%s' "$out"
+    )
+    export DATABASE_URL="postgres://${cfg.databaseUser}:''${db_password_enc}@${cfg.databaseHost}:${toString cfg.databasePort}/${cfg.databaseName}"
+    export ACCOUNT_DATABASE_URL="$DATABASE_URL"
+    unset db_password_raw db_password_enc
 
     # RELEASE_COOKIE: if the operator provided `cookieFile`, systemd
     # ingested it into $CREDENTIALS_DIRECTORY/RELEASE_COOKIE via
@@ -238,35 +257,63 @@ in
     };
 
     databaseHost = mkOption {
-      type = types.str;
-      default = "/run/postgresql";
+      # Hostname-or-IPv4 shape — Blockscout's Ecto layer requires a
+      # TCP-style URL `user:pass@host:port/db`, so this MUST resolve
+      # to a TCP target; UNIX-socket paths are not supported. Local
+      # postgres (the default `blockscout-postgresql` wrapper) listens
+      # on `localhost`. Remote postgres uses the operator's hostname
+      # or IP.
+      type = types.strMatching "^[a-zA-Z0-9.-]+$";
+      default = "localhost";
       description = ''
-        PostgreSQL `host=` value for the libpq connection string.
-        Supports either:
+        TCP host for the PostgreSQL connection. The default
+        `"localhost"` matches what the `blockscout-postgresql`
+        wrapper listens on (`listen_addresses = "localhost"`).
+        Override when pointing at a remote database host.
 
-        - an absolute path to a Unix-domain socket directory
-          containing `.s.PGSQL.<port>` (for example
-          `"/run/postgresql"`, the standard nixpkgs location used by
-          the `blockscout-postgresql` wrapper); or
-        - a TCP hostname or address (for example `"localhost"` or a
-          remote PostgreSQL host).
+        UNIX-socket paths (e.g. `/run/postgresql`) are NOT supported.
+        Blockscout's `Explorer.Repo.ConfigHelper.extract_parameters/1`
+        parses the URL via a strict `user:pass@host:port/db` regex
+        and Postgrex resolves `host:port` for the actual TCP
+        connection without honouring libpq's `?host=` query parameter
+        for UNIX-socket overrides. The strMatching regex enforces
+        TCP-shape values at option-set time.
+      '';
+    };
 
-        When this is a socket directory, the connection uses the local
-        PostgreSQL Unix socket, the systemd unit gains an `after` /
-        `requires` dependency on `postgresql.service`,
-        `SupplementaryGroups` includes `"postgres"` for socket access,
-        and `services.postgresql.authentication` gets a `local
-        <db> <user> trust` rule (gated on `configurePostgresAuth`).
+    databasePort = mkOption {
+      type = types.port;
+      default = 5432;
+      description = ''
+        TCP port for the PostgreSQL connection. Default matches
+        `services.blockscout-postgresql.port`'s default. Override
+        both sides if the wrapper's port is changed.
+      '';
+    };
 
-        When this is a TCP hostname/address, the connection uses TCP
-        and none of the local-PG assumptions apply: no local
-        `postgresql.service` dependency, no `postgres`
-        SupplementaryGroup, no pg_hba injection. The operator is
-        responsible for ensuring the target PostgreSQL is reachable
-        and configured to authenticate `${cfg.databaseUser}` on
-        `${cfg.databaseName}` however they prefer (password,
-        certificate, SCRAM, etc.) — see `secretEnvFiles` for wiring
-        a `PGPASSWORD` or similar.
+    databasePasswordFile = mkOption {
+      # types.str (not types.path) — same Nix-store-leak rationale as
+      # `secretKeyBaseFile`. Absolute-not-under-/nix/store/ enforced
+      # via `config.assertions`.
+      type = types.str;
+      example = "/run/secrets/blockscout/db_password";
+      description = ''
+        Absolute path to a file containing the password for the
+        `databaseUser` PostgreSQL role. Ingested via
+        `LoadCredential=DATABASE_PASSWORD:<path>`; the ExecStart
+        wrapper reads the value, percent-encodes it for safe URL
+        embedding, and assembles `DATABASE_URL` at exec time. The
+        password value never appears in the systemd unit file or the
+        Nix store.
+
+        The matching `services.blockscout-postgresql.passwordFile`
+        should point at the SAME file so the role's password (set
+        by the postgres wrapper's postStart hook) and the backend's
+        connection password agree.
+
+        MUST be an absolute path NOT under `/nix/store/` — the
+        module's secrets contract is that values never appear in the
+        world-readable Nix store. Enforced via `config.assertions`.
       '';
     };
 
@@ -427,33 +474,6 @@ in
       '';
     };
 
-    configurePostgresAuth = mkOption {
-      type = types.nullOr types.bool;
-      default = null;
-      description = ''
-        Whether this module should prepend a
-        `local ${"\${databaseName}"} ${"\${databaseUser}"} trust` rule to
-        `services.postgresql.authentication`.
-
-        - `null` (default): auto-detect from `databaseHost` — inject
-          the rule only when `databaseHost` is an absolute path (a
-          UNIX socket directory, which is where the rule applies).
-        - `true`: always inject (useful if the operator configures
-          PostgreSQL themselves but still wants this module's pg_hba
-          management).
-        - `false`: never inject — the operator will configure
-          `services.postgresql.authentication` themselves. Appropriate
-          when `databaseHost` is a TCP host (remote PostgreSQL) or
-          when the operator wants password auth instead of local
-          `trust`.
-
-        The auto-detect default avoids a historical bug where the
-        module unconditionally modified the local PostgreSQL's
-        pg_hba.conf even when `databaseHost` pointed at a TCP
-        hostname, weakening an unrelated local PG instance.
-      '';
-    };
-
     extraEnv = mkOption {
       type = types.attrsOf types.str;
       default = { };
@@ -562,6 +582,11 @@ in
         }
         {
           assertion =
+            lib.hasPrefix "/" cfg.databasePasswordFile && !lib.hasPrefix "/nix/store/" cfg.databasePasswordFile;
+          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path NOT under /nix/store/. Same Nix-store-leak rationale as secretKeyBaseFile.";
+        }
+        {
+          assertion =
             cfg.cookieFile == null
             || (lib.hasPrefix "/" cfg.cookieFile && !lib.hasPrefix "/nix/store/" cfg.cookieFile);
           message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path NOT under /nix/store/. Same Nix-store-leak rationale as secretKeyBaseFile.";
@@ -572,55 +597,32 @@ in
         message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
       }) cfg.secretEnvFiles;
 
-    # Local-socket `trust` authentication scoped to the specific role+
-    # database — only injected when `configurePostgresAuth` resolves
-    # to true. Default auto-detect gates on `databaseHost` being an
-    # absolute path (UNIX socket directory): if the operator has
-    # pointed `databaseHost` at a TCP host, the `local` pg_hba rule
-    # would apply to an unrelated local PostgreSQL and could silently
-    # weaken its auth posture. Explicit override via
-    # `configurePostgresAuth = true/false` when the heuristic is
-    # wrong for the deployment.
-    #
-    # Rationale (databaseAuthRationale) when the rule IS installed:
-    #   - Socket filesystem access is already gated by the `postgres`
-    #     group. Only services joining that group via
-    #     SupplementaryGroups can reach /run/postgresql/.s.PGSQL.5432
-    #     at all — in this stack, that's blockscout-backend and
-    #     nothing else.
-    #   - Once the socket is reached, the role scope limits access to
-    #     the blockscout database + role.
-    #   - Password-based auth would add a layer, but the password
-    #     would have to be readable to the same process that already
-    #     has socket access — same blast radius.
-    #   - mkBefore puts this entry ahead of nixpkgs' default
-    #     `local all all peer`, so the scoped `trust` rule matches
-    #     first and the broader `peer` rule is never reached for this
-    #     role+database combination.
-    # Operators needing stronger auth can override
-    # services.postgresql.authentication themselves and add a
-    # password-sync mechanism; see the `username` description on
-    # services.blockscout-postgresql for the two realistic paths.
-    services.postgresql.authentication =
-      let
-        effective = if cfg.configurePostgresAuth != null then cfg.configurePostgresAuth else postgresLocal;
-      in
-      mkIf effective (mkBefore ''
-        local ${cfg.databaseName} ${cfg.databaseUser} trust
-      '');
+    # No `services.postgresql.authentication` injection: connection
+    # is TCP-localhost (or remote TCP), authenticated by password
+    # against nixpkgs' default pg_hba.conf `host all all 127.0.0.1/32
+    # scram-sha-256` rule. The matching role password is set by the
+    # `blockscout-postgresql` wrapper's postStart hook from the same
+    # `passwordFile`, and read on this side via LoadCredential into
+    # the ExecStart wrapper which percent-encodes it for safe
+    # embedding into the DATABASE_URL.
 
     systemd.services.blockscout-backend = {
       description = "Blockscout Elixir/Phoenix backend (API + indexer)";
+      # `postgresql.service` is unconditional: TCP-localhost is the
+      # only supported postgres connection mode (see `databaseHost`
+      # docstring). Operators pointing `databaseHost` at a remote
+      # postgres should override `requires` / `after` to drop the
+      # local-postgres dependency.
       after = [
         "network-online.target"
+        "postgresql.service"
         "redis-${cfg.redisServerName}.service"
-      ]
-      ++ optional postgresLocal "postgresql.service";
+      ];
       wants = [ "network-online.target" ];
       requires = [
+        "postgresql.service"
         "redis-${cfg.redisServerName}.service"
-      ]
-      ++ optional postgresLocal "postgresql.service";
+      ];
       wantedBy = [ "multi-user.target" ];
 
       # Static (non-secret) env — systemd emits these as `Environment=`
@@ -630,26 +632,13 @@ in
       # top; a collision on a key Nix defined here is resolved by the
       # usual attrset `//` semantics (operator wins).
       #
-      # DATABASE_URL note on the placeholder host:
-      #   When `databaseHost` is a UNIX socket directory (the default
-      #   `/run/postgresql`), the libpq idiom is to leave the URL host
-      #   empty and pass the socket dir via `?host=…`. Blockscout's
-      #   `apps/utils/lib/utils/config_helper.ex` `valid_url?` helper
-      #   however rejects URLs whose `URI.parse(...).host` is `nil`,
-      #   silently returning the default value (typically `nil`) from
-      #   `parse_url_env_var`. The Repo config then ends up without
-      #   the `:database` key and Postgrex.Protocol crashes on
-      #   connect.
-      #   We work around this by inserting a placeholder `localhost`
-      #   between `@` and `/` purely to satisfy `URI.parse` —
-      #   libpq's `host=` query parameter takes precedence at
-      #   connect time, so the actual connection still goes via the
-      #   UNIX socket dir specified in `databaseHost`. For TCP
-      #   `databaseHost` values the placeholder is overridden by
-      #   the explicit host below (no functional impact).
+      # DATABASE_URL deliberately NOT in this static-env block —
+      # the password value would otherwise land in the unit file,
+      # which is world-readable in the Nix store. Composed instead
+      # at exec time in `startScript` (top `let`) using the
+      # LoadCredential-sourced password percent-encoded for safe URL
+      # embedding. ACCOUNT_DATABASE_URL likewise.
       environment = {
-        DATABASE_URL = "postgres://${cfg.databaseUser}@localhost/${cfg.databaseName}?host=${cfg.databaseHost}";
-        ACCOUNT_DATABASE_URL = "postgres://${cfg.databaseUser}@localhost/${cfg.databaseName}?host=${cfg.databaseHost}";
         ACCOUNT_REDIS_URL = "unix:///run/redis-${cfg.redisServerName}/redis.sock";
         ETHEREUM_JSONRPC_VARIANT = "geth";
         ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
@@ -704,19 +693,16 @@ in
         RuntimeDirectory = "blockscout-backend";
         RuntimeDirectoryMode = "0700";
 
-        # Cross-service UNIX socket access. `postgres` and
-        # `redis-<name>` groups are auto-created by the respective
-        # upstream modules; joining them here grants filesystem
-        # access to /run/postgresql/.s.PGSQL.5432 and
-        # /run/redis-<name>/redis.sock respectively.
-        #
-        # `postgres` is only added when `databaseHost` points at a
-        # UNIX socket (`postgresLocal`); for TCP remote PG we skip
-        # the group since it may not exist on the host at all.
+        # Cross-service UNIX socket access — only Redis now.
+        # PostgreSQL connection moved from UNIX-socket to TCP-localhost
+        # because Blockscout's Ecto layer doesn't honour libpq's
+        # `?host=` query for socket overrides; see `databaseHost`
+        # docstring. Redis stays UNIX-socket-driven (Blockscout's
+        # Redix client handles `unix:///path` URIs natively, no
+        # equivalent issue).
         SupplementaryGroups = [
           "redis-${cfg.redisServerName}"
-        ]
-        ++ optional postgresLocal "postgres";
+        ];
 
         # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
@@ -727,6 +713,7 @@ in
         # without any name translation.
         LoadCredential = [
           "SECRET_KEY_BASE:${cfg.secretKeyBaseFile}"
+          "DATABASE_PASSWORD:${cfg.databasePasswordFile}"
         ]
         ++ optional (cfg.cookieFile != null) "RELEASE_COOKIE:${cfg.cookieFile}"
         ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;

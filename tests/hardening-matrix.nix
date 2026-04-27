@@ -77,11 +77,15 @@ let
         # opportunistically on nixpkgs major bumps to match.
         system.stateVersion = "24.05";
         services.autonity.enable = true;
-        services.blockscout-postgresql.enable = true;
+        services.blockscout-postgresql = {
+          enable = true;
+          passwordFile = "/run/secrets/db_password";
+        };
         services.blockscout-redis.enable = true;
         services.blockscout-backend = {
           enable = true;
           secretKeyBaseFile = "/run/secrets/skb";
+          databasePasswordFile = "/run/secrets/db_password";
         };
         services.blockscout-frontend.enable = true;
         services.blockscout-nginx = {

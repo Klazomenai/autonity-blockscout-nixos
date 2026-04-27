@@ -116,6 +116,16 @@ pkgs.testers.nixosTest {
       # use-sops-nix-or-agenix-instead pointer is at the
       # `testSecretKeyBase` definition above.
       environment.etc."test-secrets/skb".text = testSecretKeyBase;
+      # Test database password fixture. Same `environment.etc`
+      # caveat as the secretKeyBaseFile fixture above (content
+      # actually lives in /nix/store/, not for real secrets — see
+      # testSecretKeyBase docstring). The password is set on the
+      # postgres role by the `blockscout-postgresql` wrapper's
+      # postStart hook, and read back into DATABASE_URL by the
+      # backend's ExecStart wrapper via LoadCredential. Both sides
+      # MUST point at the same path for the role's password and the
+      # backend's connection password to agree.
+      environment.etc."test-secrets/db_password".text = "test-password-not-for-production";
 
       services.autonity = {
         enable = true;
@@ -126,12 +136,16 @@ pkgs.testers.nixosTest {
         extraArgs = [ "--nodiscover" ];
       };
 
-      services.blockscout-postgresql.enable = true;
+      services.blockscout-postgresql = {
+        enable = true;
+        passwordFile = "/etc/test-secrets/db_password";
+      };
       services.blockscout-redis.enable = true;
 
       services.blockscout-backend = {
         enable = true;
         secretKeyBaseFile = "/etc/test-secrets/skb";
+        databasePasswordFile = "/etc/test-secrets/db_password";
       };
 
       services.blockscout-frontend.enable = true;
