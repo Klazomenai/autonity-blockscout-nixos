@@ -629,9 +629,27 @@ in
       # to the process's env. Operator-supplied `extraEnv` is merged on
       # top; a collision on a key Nix defined here is resolved by the
       # usual attrset `//` semantics (operator wins).
+      #
+      # DATABASE_URL note on the placeholder host:
+      #   When `databaseHost` is a UNIX socket directory (the default
+      #   `/run/postgresql`), the libpq idiom is to leave the URL host
+      #   empty and pass the socket dir via `?host=…`. Blockscout's
+      #   `apps/utils/lib/utils/config_helper.ex` `valid_url?` helper
+      #   however rejects URLs whose `URI.parse(...).host` is `nil`,
+      #   silently returning the default value (typically `nil`) from
+      #   `parse_url_env_var`. The Repo config then ends up without
+      #   the `:database` key and Postgrex.Protocol crashes on
+      #   connect.
+      #   We work around this by inserting a placeholder `localhost`
+      #   between `@` and `/` purely to satisfy `URI.parse` —
+      #   libpq's `host=` query parameter takes precedence at
+      #   connect time, so the actual connection still goes via the
+      #   UNIX socket dir specified in `databaseHost`. For TCP
+      #   `databaseHost` values the placeholder is overridden by
+      #   the explicit host below (no functional impact).
       environment = {
-        DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
-        ACCOUNT_DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
+        DATABASE_URL = "postgres://${cfg.databaseUser}@localhost/${cfg.databaseName}?host=${cfg.databaseHost}";
+        ACCOUNT_DATABASE_URL = "postgres://${cfg.databaseUser}@localhost/${cfg.databaseName}?host=${cfg.databaseHost}";
         ACCOUNT_REDIS_URL = "unix:///run/redis-${cfg.redisServerName}/redis.sock";
         ETHEREUM_JSONRPC_VARIANT = "geth";
         ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
