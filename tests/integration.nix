@@ -74,10 +74,20 @@ pkgs.testers.nixosTest {
       virtualisation.cores = 2;
       virtualisation.diskSize = 4096;
 
-      networking.hostName = "explorer";
-      # Nginx vhost match needs the test-only DNS name to resolve to
-      # localhost from inside the VM (so `curl -H 'Host:
-      # explorer.test' https://127.0.0.1` reaches the right vhost).
+      # Nginx vhost match keys on the `Host:` header set by `curl -H`,
+      # so the VM's actual hostname doesn't matter for the proxied
+      # request paths. We deliberately leave `networking.hostName` at
+      # the test-framework default (`virtualisation.test.nodeName`,
+      # which evaluates to `"machine"` for `nodes.machine = …`):
+      # overriding it would change `system.name` and trip the test
+      # framework's `theOnlyMachine` heuristic into adding a duplicate
+      # `machine: QemuMachine;` type hint to the generated
+      # `testScriptWithTypes`, failing mypy with a name-redefinition
+      # error before the script ever runs.
+      #
+      # `extraHosts` is added defensively in case any in-VM DNS lookup
+      # of `${hostName}` is performed (currently none is — all curls
+      # use `Host:` headers against the loopback IP).
       networking.extraHosts = ''
         127.0.0.1 ${hostName}
       '';
