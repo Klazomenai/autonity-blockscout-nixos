@@ -10,11 +10,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1776506148,
-        "narHash": "sha256-OTEDw5t4DWg69/o8Gf/Kr4NMJpgB4ZZ5mGQLLueNWE8=",
+        "lastModified": 1777277451,
+        "narHash": "sha256-DdC+buSjjiOQigX7XiBBeryzdj0qvTbaDSccCfhxggs=",
         "owner": "klazomenai",
         "repo": "autonity",
-        "rev": "c857b7408b0057bd6e19bd018d2c1c7889714827",
+        "rev": "0a874740a4436ac1de1700f53b432a868cc7404e",
         "type": "github"
       },
       "original": {
@@ -33,11 +33,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1776942568,
-        "narHash": "sha256-KIOu3HDPRaVRrkx6LEivkhL11VPkvw9anq2eZRIwgeY=",
+        "lastModified": 1777275990,
+        "narHash": "sha256-F6IXqHCzaoHQFAWVb96fEDmeBYl8l64h6F86JAO+P6Q=",
         "owner": "klazomenai",
         "repo": "blockscout",
-        "rev": "69261addbe6137c3100707b4d027a760b070c3bb",
+        "rev": "9e3f112fba2a5a17b12c6c7a8eee446a309ec80d",
         "type": "github"
       },
       "original": {
