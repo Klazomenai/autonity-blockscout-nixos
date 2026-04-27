@@ -129,11 +129,21 @@ let
     # cookie inline. The latter is fine for single-node deployments
     # where no external Erlang node ever connects — for clustering
     # the operator MUST supply `cookieFile` so all nodes agree.
+    #
+    # `-hex 24` (48 hex chars) chosen over `-base64 24` because the
+    # base64 alphabet includes `+`, `/`, and `=` which can interact
+    # poorly with the elixir release wrapper's argument-quoting
+    # under specific systemd-environment conditions: an earlier
+    # base64 cookie would reach `beam.smp` with the leading `-` of
+    # `-setcookie` somehow dropped, leaving the cookie value as a
+    # positional flag (`unknown flag -<base64-value>` panic). Hex
+    # encoding sidesteps that entirely — `[0-9a-f]` survives any
+    # shell / wrapper arg-parsing path.
     ${
       if cfg.cookieFile != null then
         ''export RELEASE_COOKIE="$(cat "$CREDENTIALS_DIRECTORY/RELEASE_COOKIE")"''
       else
-        ''export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -base64 24)"''
+        ''export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -hex 24)"''
     }
 
     ${concatMapStringsSep "\n    " (name: ''
