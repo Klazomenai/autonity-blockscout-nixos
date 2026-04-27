@@ -31,7 +31,19 @@ The expected-shape table is the **as-shipped** state, not an aspirational unifor
 
 **Maintenance contract**: when a module change legitimately requires updating one of these expectations — adding a new module, introducing a new per-unit deviation (e.g. another JIT runtime joining the `MemoryDenyWriteExecute = false` list), or absorbing a nixpkgs upstream change to a wrapped unit — update the relevant `expected.<unit>` entry in `tests/hardening-matrix.nix` in the same PR, with the reasoning captured both in a code comment on the deviating unit's `serviceConfig` and in the PR description. Without that paper trail, the check stops being meaningful: it would just be a rubber stamp for whatever the tree happens to ship.
 
-The check covers `serviceConfig` keys only. ExecStart paths, `Environment=` values, `LoadCredential=` entries, and similar are validated by per-module `config.assertions` (option-set time) and by the full-stack `nixosTest` (behavioural validation, separate PR).
+The check covers `serviceConfig` keys only. ExecStart paths, `Environment=` values, `LoadCredential=` entries, and similar are validated by per-module `config.assertions` (option-set time) and by the full-stack `nixosTest` (behavioural validation, see below).
+
+## Full-stack VM integration test
+
+`checks.<system>.integration` (defined by `tests/integration.nix`) boots all six service modules inside a single `pkgs.nixosTest` VM and exercises real cross-service connectivity: loopback TCP between Autonity / backend / frontend / nginx, UNIX-socket access to PostgreSQL + Redis via `SupplementaryGroups`, the `BindReadOnlyPaths` envs.js overlay on the frontend, the nginx reverse-proxy paths (with `forceSSL`-enforced HTTP→HTTPS redirect via a self-signed cert), and restart resilience of the backend against Postgres + Redis + Autonity.
+
+The check runs as part of `nix flake check` alongside `fmt` and `hardening`, but it's significantly slower (4 GiB VM, ~5+ minutes on a cold cache) so iteration loops on this check should be local — `nix build .#checks.x86_64-linux.integration --print-build-logs` for full failure visibility.
+
+**Scope**: behavioural connectivity + reverse-proxy + restart paths. **Out of scope**:
+
+- Real chain sync — Autonity runs `--nodiscover --maxpeers=0` so it stays a single-node chain at genesis. Real MainNet sync is M3 OVH-deployment territory.
+- Real ACME / Let's Encrypt — a self-signed cert is wired directly into the nginx vhost; live HTTP-01 validation against a public DNS name is M3.
+- Performance / load testing.
 
 ## PR workflow
 

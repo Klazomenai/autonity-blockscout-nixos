@@ -120,6 +120,22 @@
           inherit pkgs nixpkgs system;
           flake = self;
         };
+
+        # Behavioural full-stack VM integration test — boots all six
+        # service modules in a `pkgs.nixosTest` VM and exercises real
+        # cross-service connectivity, the bind-mounted envs.js
+        # overlay, the nginx reverse-proxy paths, and restart
+        # resilience. Slow + memory-hungry (4 GiB VM, ~5+ min on a
+        # cold cache); runs on every PR via `nix flake check` but
+        # benefits massively from caching across repeated runs.
+        # Complementary to the static `hardening` check: that one
+        # asserts unit files render with the right `serviceConfig`;
+        # this one asserts the units actually run and talk to each
+        # other.
+        checks.integration = import ./tests/integration.nix {
+          inherit pkgs system;
+          flake = self;
+        };
       }
     );
 }
