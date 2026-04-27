@@ -35,7 +35,7 @@ The check covers `serviceConfig` keys only. ExecStart paths, `Environment=` valu
 
 ## Full-stack VM integration test
 
-`checks.<system>.integration` (defined by `tests/integration.nix`) boots all six service modules inside a single `pkgs.nixosTest` VM and exercises real cross-service connectivity: loopback TCP between Autonity / backend / frontend / nginx, UNIX-socket access to PostgreSQL + Redis via `SupplementaryGroups`, the `BindReadOnlyPaths` envs.js overlay on the frontend, the nginx reverse-proxy paths (with `forceSSL`-enforced HTTP→HTTPS redirect via a self-signed cert), and restart resilience of the backend against Postgres + Redis + Autonity.
+`checks.<system>.integration` (defined by `tests/integration.nix`) boots all six service modules inside a single `pkgs.testers.nixosTest` VM and exercises real cross-service connectivity: loopback TCP between Autonity / backend / frontend / nginx, UNIX-socket access to PostgreSQL + Redis via `SupplementaryGroups`, the `BindReadOnlyPaths` envs.js overlay on the frontend, the nginx reverse-proxy paths (with `forceSSL`-enforced HTTP→HTTPS redirect via a self-signed cert), and restart resilience of the backend against Postgres + Redis + Autonity.
 
 The check runs as part of `nix flake check` alongside `fmt` and `hardening`, but it's significantly slower (4 GiB VM, ~5+ minutes on a cold cache) so iteration loops on this check should be local — `nix build .#checks.x86_64-linux.integration --print-build-logs` for full failure visibility.
 

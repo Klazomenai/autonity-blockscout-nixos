@@ -51,7 +51,7 @@ let
           -addext "subjectAltName=DNS:${hostName}"
       '';
 
-  # Test secret: a fixed 64-byte hex string standing in for Phoenix's
+  # Test secret: a fixed 32-byte (64 hex chars) string standing in for Phoenix's
   # `secret_key_base`. Real deployments source this from sops-nix /
   # agenix. This is test-only: the fixture is materialised via
   # `environment.etc."test-secrets/skb"`, which makes `/etc/test-
@@ -106,9 +106,15 @@ pkgs.testers.nixosTest {
       # for the test, never deployed.
       system.stateVersion = "24.05";
 
-      # Test secret materialised at activation time. `/etc/<name>` is
-      # outside `/nix/store/` and absolute — satisfies the
-      # `secretKeyBaseFile` not-in-store assertion.
+      # Test secret materialised at activation time. This satisfies
+      # the `secretKeyBaseFile` not-in-store assertion only because
+      # that assertion checks the absolute `/etc/<name>` path string;
+      # the content provided via `environment.etc.<name>.text` still
+      # lives in the Nix store (NixOS realises `/etc/<name>` as a
+      # symlink into `/nix/store/`) and is NOT suitable for real
+      # secret handling. The full rationale + the
+      # use-sops-nix-or-agenix-instead pointer is at the
+      # `testSecretKeyBase` definition above.
       environment.etc."test-secrets/skb".text = testSecretKeyBase;
 
       services.autonity = {

@@ -122,7 +122,7 @@
         };
 
         # Behavioural full-stack VM integration test — boots all six
-        # service modules in a `pkgs.nixosTest` VM and exercises real
+        # service modules in a `pkgs.testers.nixosTest` VM and exercises real
         # cross-service connectivity, the bind-mounted envs.js
         # overlay, the nginx reverse-proxy paths, and restart
         # resilience. Slow + memory-hungry (4 GiB VM, ~5+ min on a
