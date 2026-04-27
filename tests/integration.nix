@@ -1,5 +1,5 @@
 # Behavioural full-stack VM integration test. Boots all six service
-# modules in a single `pkgs.nixosTest` VM, then exercises real
+# modules in a single `pkgs.testers.nixosTest` VM, then exercises real
 # cross-service connectivity (loopback TCP + UNIX sockets), unit
 # ordering, the bind-mounted envs.js overlay on the frontend, and
 # nginx reverse-proxy paths.
@@ -32,10 +32,11 @@
 let
   hostName = "explorer.test";
 
-  # Self-signed cert generated at Nix evaluation time. The test isn't
-  # validating CA-trust or HTTPS chain-of-trust — it's validating that
-  # nginx terminates TLS and reverse-proxies onto loopback. Self-signed
-  # is sufficient for that, and `curl -k` skips the trust check.
+  # Self-signed cert generated at build time by `pkgs.runCommand`,
+  # with the result stored in the Nix store. The test isn't validating
+  # CA-trust or HTTPS chain-of-trust — it's validating that nginx
+  # terminates TLS and reverse-proxies onto loopback. Self-signed is
+  # sufficient for that, and `curl -k` skips the trust check.
   selfSignedCerts =
     pkgs.runCommand "self-signed-${hostName}"
       {
@@ -51,11 +52,19 @@ let
       '';
 
   # Test secret: a fixed 64-byte hex string standing in for Phoenix's
-  # `secret_key_base`. Real deployments would source this from sops-nix
-  # / agenix; for the VM test we just need ANY value at a path that
-  # satisfies the module's "absolute and not under /nix/store/"
-  # assertion. `environment.etc` writes to `/etc/<name>` (managed
-  # outside the Nix store), so `/etc/test-secrets/skb` qualifies.
+  # `secret_key_base`. Real deployments source this from sops-nix /
+  # agenix. This is test-only: the fixture is materialised via
+  # `environment.etc."test-secrets/skb"`, which makes `/etc/test-
+  # secrets/skb` a symlink to a Nix-store path holding the content
+  # — so the underlying value IS in `/nix/store/` (world-readable),
+  # making this mechanism unsuitable for real secrets. The
+  # `secretKeyBaseFile` assertion only checks the literal path string
+  # (`/etc/test-secrets/skb`), not symlink targets, so eval passes and
+  # the systemd `LoadCredential=` reads the value via the symlink at
+  # runtime. The whole point of this fixture is determinism, not
+  # secrecy — for real deployments use sops-nix / agenix where the
+  # plaintext is decrypted into a tmpfs path that is genuinely
+  # outside `/nix/store/`.
   testSecretKeyBase = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 in
 pkgs.testers.nixosTest {
