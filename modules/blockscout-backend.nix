@@ -111,6 +111,20 @@ let
     # value with no trailing content beyond an optional final newline
     # (bash command substitution strips trailing newlines).
     export SECRET_KEY_BASE="$(cat "$CREDENTIALS_DIRECTORY/SECRET_KEY_BASE")"
+
+    # RELEASE_COOKIE: if the operator provided `cookieFile`, systemd
+    # ingested it into $CREDENTIALS_DIRECTORY/RELEASE_COOKIE via
+    # LoadCredential=. Otherwise we generate a random per-restart
+    # cookie inline. The latter is fine for single-node deployments
+    # where no external Erlang node ever connects — for clustering
+    # the operator MUST supply `cookieFile` so all nodes agree.
+    ${
+      if cfg.cookieFile != null then
+        ''export RELEASE_COOKIE="$(cat "$CREDENTIALS_DIRECTORY/RELEASE_COOKIE")"''
+      else
+        ''export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -base64 24)"''
+    }
+
     ${concatMapStringsSep "\n    " (name: ''
       export ${name}="$(cat "$CREDENTIALS_DIRECTORY/${name}")"
     '') (lib.attrNames cfg.secretEnvFiles)}
@@ -150,6 +164,46 @@ in
         world-readable Nix store, so accidentally pointing this at a
         store path is a configuration error. Enforced via
         `config.assertions` at option-set time.
+      '';
+    };
+
+    cookieFile = mkOption {
+      # Same `types.str` rationale as `secretKeyBaseFile`.
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/blockscout/release_cookie";
+      description = ''
+        Absolute path to a file containing the BEAM release cookie —
+        used as a shared-secret token authenticating distributed
+        Erlang nodes to each other. Ingested via systemd
+        `LoadCredential=RELEASE_COOKIE=<path>`; the ExecStart wrapper
+        reads from `$CREDENTIALS_DIRECTORY/RELEASE_COOKIE`, never
+        from this source path.
+
+        nixpkgs' `mixRelease` deliberately deletes `releases/COOKIE`
+        from the build output by default (`removeCookie = true`),
+        treating cookies as secret. The release startup wrapper
+        (`bin/.blockscout-wrapped`) falls back to
+        `cat releases/COOKIE` when `RELEASE_COOKIE` env is unset —
+        which produces a `cat: …/releases/COOKIE: No such file or
+        directory` error and a permanent restart loop. So the
+        operator (or this module) MUST provide `RELEASE_COOKIE`
+        somehow.
+
+        When this option is `null` (default), the module generates a
+        random per-deployment cookie at unit-start time via an
+        `ExecStartPre+` hook (32 bytes of openssl rand, base64-encoded)
+        written to `$RUNTIME_DIRECTORY/cookie`. This is sufficient
+        for single-node deployments where no external Erlang node
+        ever connects.
+
+        For multi-node BEAM clustering, set `cookieFile` to a path
+        sourced from sops-nix / agenix, with the same value across
+        every node in the cluster.
+
+        MUST be an absolute path NOT under `/nix/store/` (when
+        non-null). Enforced via `config.assertions` at option-set
+        time, same as `secretKeyBaseFile`.
       '';
     };
 
@@ -476,6 +530,12 @@ in
             lib.hasPrefix "/" cfg.secretKeyBaseFile && !lib.hasPrefix "/nix/store/" cfg.secretKeyBaseFile;
           message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
         }
+        {
+          assertion =
+            cfg.cookieFile == null
+            || (lib.hasPrefix "/" cfg.cookieFile && !lib.hasPrefix "/nix/store/" cfg.cookieFile);
+          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path NOT under /nix/store/. Same Nix-store-leak rationale as secretKeyBaseFile.";
+        }
       ]
       ++ mapAttrsToList (name: entry: {
         assertion = lib.hasPrefix "/" entry.path && !lib.hasPrefix "/nix/store/" entry.path;
@@ -599,6 +659,7 @@ in
         LoadCredential = [
           "SECRET_KEY_BASE:${cfg.secretKeyBaseFile}"
         ]
+        ++ optional (cfg.cookieFile != null) "RELEASE_COOKIE:${cfg.cookieFile}"
         ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;
 
         # BEAM JIT needs writable + executable memory pages — opt out
