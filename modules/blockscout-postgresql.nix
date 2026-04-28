@@ -181,22 +181,57 @@ in
     };
 
     # Set the role password from the operator-supplied passwordFile
-    # via a postStart hook. Runs after `ensureUsers` (nixpkgs creates
-    # the role earlier in postStart) so the ALTER ROLE has a target.
-    # ALTER ROLE WITH PASSWORD is idempotent — safe to re-run on
-    # every postgres start. `mkAfter` appends our hook AFTER nixpkgs'
-    # default postStart so $PSQL is available and the role exists.
+    # by appending to the `postgresql-setup.service` script. nixpkgs'
+    # `ensureUsers` and `ensureDatabases` run inside that one-shot
+    # unit (NOT in `postgresql.service.postStart` — that distinction
+    # changed in nixpkgs at some point and earlier drafts of this
+    # module attached the hook in the wrong place, with `mkAfter` on
+    # `postStart` running BEFORE the role was created and ALTER ROLE
+    # failing with `role "blockscout" does not exist`). `mkAfter` on
+    # the setup-service `script` appends our ALTER ROLE AFTER the
+    # `generateUserSetupScript` block that creates the role, so the
+    # role is guaranteed to exist when our hook fires.
     #
-    # Password handling: psql's `:'name'` syntax interpolates the
-    # value as a properly-escaped SQL string literal — quotes,
-    # backslashes, and embedded single-quotes round-trip safely
-    # without us hand-writing escape logic. The password value
-    # reaches psql via the `-v` (set variable) flag, sourced via
-    # `$(< file)` so it never appears in argv (no `ps` leak; bash
-    # builtin redirection avoids spawning a `cat` subprocess
-    # whose argv would otherwise contain the path).
-    systemd.services.postgresql.postStart = lib.mkAfter ''
-      $PSQL -v "pw=$(< ${cfg.passwordFile})" -c "ALTER ROLE \"${cfg.username}\" WITH PASSWORD :'pw';"
+    # The setup unit runs as `User=postgres` with
+    # `path = [ cfg.finalPackage ]`, so `psql` resolves on PATH; we
+    # use an explicit path anyway for clarity.
+    #
+    # Password handling — three constraints:
+    #
+    #   1. POSIX shell only. nixpkgs runs the setup script under
+    #      systemd's default `/bin/sh` (POSIX, not bash). Bash
+    #      extensions like `$(< file)` silently expand to nothing
+    #      under POSIX. Use standard shell features only.
+    #
+    #   2. No password in argv. Passing `-v "pw=$value"` to psql
+    #      would put the password in psql's argv, visible via
+    #      `ps -ef` to anyone on the host. Use psql's `\set name
+    #      \`shell-command\`` syntax inside a QUOTED heredoc
+    #      instead: psql itself runs the shell command (with
+    #      `cat <file>` as its argv — the password is never in any
+    #      argv) and captures stdout into the `:pw` variable.
+    #
+    #   3. Safe SQL string-literal escaping. `:'pw'` interpolates the
+    #      value as an SQL string literal with proper escaping
+    #      (quotes, backslashes, embedded single-quotes round-trip
+    #      safely) so we don't hand-write any escape logic.
+    #
+    # `<<'EOF'` (quoted heredoc) prevents the OUTER shell from
+    # interpreting `$`, backticks, etc. Nix `${...}` interpolation
+    # happens at build time (before the shell ever sees the script),
+    # so password file path and username are baked in. psql then
+    # parses the heredoc body itself, including the backticks
+    # which it (psql) executes via its own shell to capture the
+    # password file contents into `:pw`.
+    #
+    # `-v ON_ERROR_STOP=1` makes psql fail with non-zero exit if the
+    # ALTER ROLE doesn't apply, so the setup unit surfaces the
+    # failure to systemd instead of swallowing it.
+    systemd.services.postgresql-setup.script = lib.mkAfter ''
+      ${config.services.postgresql.package}/bin/psql -d postgres -v ON_ERROR_STOP=1 <<'EOF'
+      \set pw `cat ${cfg.passwordFile} | tr -d '\n'`
+      ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
+      EOF
     '';
   };
 }
