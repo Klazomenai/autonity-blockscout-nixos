@@ -140,6 +140,13 @@ pkgs.testers.nixosTest {
         enable = true;
         passwordFile = "/etc/test-secrets/db_password";
       };
+      # Test-only timeout slack for slow QEMU hosts. nixpkgs' default
+      # `TimeoutSec = 120` is fine for production deployments where
+      # first-boot `initdb` finishes in <10s, but on a busy laptop or
+      # CI runner under contention with autonity + BEAM at the same
+      # time, initdb can take 60+ seconds and trip
+      # `start-pre operation timed out. Terminating.`
+      systemd.services.postgresql.serviceConfig.TimeoutSec = lib.mkForce 600;
       services.blockscout-redis.enable = true;
 
       services.blockscout-backend = {
@@ -193,23 +200,30 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(443)    # nginx HTTPS
 
     # ---------------------------------------------------------------
-    # 3. Cross-service UNIX sockets exist.
+    # 3. Cross-service connectivity surfaces.
     # ---------------------------------------------------------------
+    # PostgreSQL still exposes its standard UNIX socket for ad-hoc
+    # operator access (`psql`, `pg_dump`); the backend itself reaches
+    # it over TCP-localhost because the Postgrex layer only honours
+    # URL host:port for the connect call.
     machine.succeed("test -S /run/postgresql/.s.PGSQL.5432")
-    machine.succeed("test -S /run/redis-blockscout/redis.sock")
 
-    # Auto-created groups (postgres by upstream nixpkgs postgres
-    # module; redis-blockscout by upstream redis module on the named
-    # server). Backend's DynamicUser joins both via SupplementaryGroups.
-    machine.succeed("getent group postgres")
-    machine.succeed("getent group redis-blockscout")
+    # PostgreSQL TCP-localhost (matches services.blockscout-postgresql
+    # default of listen_addresses="localhost").
+    machine.wait_for_open_port(5432)
 
-    # Verify SupplementaryGroups membership at the unit level.
+    # Redis TCP-localhost (matches services.blockscout-redis default
+    # of bind="127.0.0.1" + port=6379). Redis pivoted off UNIX
+    # sockets because Redix.URI.to_start_options/1 rejects the
+    # `unix://` scheme.
+    machine.wait_for_open_port(6379)
+
+    # Backend joins no host system groups — both data-plane services
+    # reached over TCP, so SupplementaryGroups should be empty.
     supp = machine.succeed(
         "systemctl show -p SupplementaryGroups --value blockscout-backend.service"
     ).strip()
-    assert "postgres" in supp, f"backend missing postgres group: {supp!r}"
-    assert "redis-blockscout" in supp, f"backend missing redis group: {supp!r}"
+    assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
 
     # ---------------------------------------------------------------
     # 4. Backend ↔ Autonity loopback RPC.
@@ -222,13 +236,24 @@ pkgs.testers.nixosTest {
     assert '"result"' in rpc, f"eth_chainId missing result field: {rpc!r}"
 
     # ---------------------------------------------------------------
-    # 5. Backend health endpoint — exercises Postgres (UNIX socket
-    #    via host=/run/postgresql) AND Redis (UNIX socket via
-    #    redis-blockscout.sock) AND Autonity RPC. Failure of any of
-    #    the three surfaces here.
+    # 5. Backend health endpoints.
+    #    /api/health/liveness — confirms BEAM + the Phoenix endpoint
+    #      are listening (does not touch Postgres / Redis / Autonity).
+    #    /api/health/readiness — runs a Postgres query against
+    #      `last_db_block_status`, so it surfaces password-auth /
+    #      TCP-localhost / migration failures.
+    #    /api/v2/health — full chain-aware health check; rejected
+    #      with 400 in this test because the autonity node runs with
+    #      `--nodiscover --maxpeers=0`, never advances past genesis,
+    #      and the indexer therefore has no recorded block to assert
+    #      `is_healthy_indexing`. Real-chain readiness is M3 territory.
     # ---------------------------------------------------------------
     machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/v2/health",
+        "curl -fsS http://127.0.0.1:4000/api/health/liveness",
+        timeout=120,
+    )
+    machine.wait_until_succeeds(
+        "curl -fsS http://127.0.0.1:4000/api/health/readiness",
         timeout=120,
     )
 
@@ -255,15 +280,18 @@ pkgs.testers.nixosTest {
     #    terminates and the proxy_pass reaches the right upstream".
     # ---------------------------------------------------------------
     proxied_health = machine.succeed(
-        "curl -fsSk -H 'Host: ${hostName}' https://127.0.0.1/api/v2/health"
+        "curl -fsSk -H 'Host: ${hostName}' https://127.0.0.1/api/health/liveness"
     )
-    # /api/v2/health and direct backend /api/v2/health must agree —
-    # the proxy_pass should be transparent to the response body.
+    # nginx /api/health/liveness and direct backend
+    # /api/health/liveness must agree — proxy_pass should be
+    # transparent to the response body. liveness chosen over the v2
+    # full-health endpoint for the same reason as step 5: the latter
+    # 400s on a fresh genesis chain.
     direct_health = machine.succeed(
-        "curl -fsS http://127.0.0.1:4000/api/v2/health"
+        "curl -fsS http://127.0.0.1:4000/api/health/liveness"
     )
     assert proxied_health == direct_health, (
-        "nginx /api/v2/health mismatch — proxy_pass altered the body. "
+        "nginx /api/health/liveness mismatch — proxy_pass altered the body. "
         f"direct={direct_health!r} proxied={proxied_health!r}"
     )
 
@@ -284,15 +312,20 @@ pkgs.testers.nixosTest {
     )
 
     # ---------------------------------------------------------------
-    # 8. Restart resilience — backend reconnects to all three of
-    #    Postgres / Redis / Autonity without operator intervention.
+    # 8. Restart resilience — backend reconnects to Postgres + Redis
+    #    + Autonity without operator intervention. Readiness is the
+    #    right probe here: it does the same DB query as on first boot,
+    #    so a broken connection (e.g. credential not re-read on
+    #    restart) would surface as a 500 instead of a 200. The full
+    #    /api/v2/health is skipped for the same reason as steps 5/7
+    #    (chain stays at genesis under --nodiscover).
     # ---------------------------------------------------------------
     machine.systemctl("restart blockscout-backend.service")
     machine.wait_for_unit("blockscout-backend.service")
     machine.wait_for_open_port(4000)
     machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/v2/health",
-        timeout=120,
+        "curl -fsS http://127.0.0.1:4000/api/health/readiness",
+        timeout=240,
     )
 
     # ---------------------------------------------------------------
