@@ -224,11 +224,14 @@ let
       UMask = "0077";
     };
 
-    # Blockscout backend — Elixir/BEAM JIT (MDWX off), depends on
-    # cross-service UNIX sockets via SupplementaryGroups so PrivateUsers
-    # MUST be false (host GID remapping inside a user namespace would
-    # break socket access). No AF_NETLINK (backend doesn't enumerate
-    # interfaces).
+    # Blockscout backend — Elixir/BEAM JIT (MDWX off). Talks to
+    # PostgreSQL and Redis over TCP-localhost (no UNIX sockets, so
+    # no SupplementaryGroups) — earlier drafts pinned PrivateUsers
+    # to false because socket access required host GIDs, but with
+    # both data-plane services on TCP the constraint goes away.
+    # PrivateUsers is now left at the systemd default (false)
+    # rather than set explicitly, so it isn't in the expected slice.
+    # No AF_NETLINK (backend doesn't enumerate interfaces).
     blockscout-backend = {
       CapabilityBoundingSet = [ "" ];
       DynamicUser = true;
@@ -238,7 +241,6 @@ let
       PrivateDevices = true;
       PrivateMounts = true;
       PrivateTmp = true;
-      PrivateUsers = false;
       ProcSubset = "pid";
       ProtectClock = true;
       ProtectControlGroups = true;

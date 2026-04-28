@@ -1,25 +1,35 @@
 # Thin wrapper over nixpkgs `services.redis.servers.<name>` preconfiguring
-# Blockscout's Redis instance with UNIX-socket-only binding. Blockscout
-# backend connects via `/run/redis-<name>/redis.sock` and joins the
-# `redis-<name>` group on its own systemd unit (via `SupplementaryGroups`)
-# for socket access.
+# Blockscout's Redis instance with TCP-localhost binding. Blockscout
+# backend connects via `redis://localhost:<port>`.
+#
+# Connection mode rationale:
+#   Blockscout's Redix client uses `Redix.URI.to_start_options/1` to
+#   parse the connection URL, and that parser only accepts the
+#   `redis://`, `valkey://`, and `rediss://` schemes — `unix:///path`
+#   URIs are rejected with `ArgumentError`. An earlier draft of this
+#   wrapper defaulted to UNIX-socket-only (`port = 0`,
+#   `unixSocket = ...`) on the assumption that Redix would handle the
+#   socket form natively, but that path was architecturally
+#   incompatible with the Elixir Redix client.
+#
+#   This module now defaults to TCP-localhost — matching upstream
+#   Blockscout's docker-compose deployment shape, and mirroring the
+#   same TCP-localhost pivot already applied to `blockscout-postgresql`
+#   for the analogous Postgrex limitation.
 #
 # Hardening of `redis-<name>.service` itself is inherited from the
 # upstream nixpkgs module (static `redis-<name>` user/group rather
-# than DynamicUser — load-bearing because consumers join the
-# auto-created group via `SupplementaryGroups` for socket access,
-# which requires a stable host GID; ProtectSystem=strict,
-# MemoryDenyWriteExecute=true — Redis has no runtime JIT — and the
-# rest of the defense-in-depth systemd block). This wrapper only
-# adds the Blockscout-specific surface on top. Re-applying or
-# weakening that hardening is deliberately avoided.
+# than DynamicUser; ProtectSystem=strict, MemoryDenyWriteExecute=true
+# — Redis has no runtime JIT — and the rest of the defense-in-depth
+# systemd block). This wrapper only adds the Blockscout-specific
+# surface on top. Re-applying or weakening that hardening is
+# deliberately avoided.
 #
-# Same socket-vs-auth separation of concerns established by
-# `blockscout-postgresql`: the wrapper handles socket filesystem access
-# (via `unixSocketPerm = 660` + the `redis-<name>` group auto-created
-# by the upstream module). Redis authentication (`requirePass`, ACL
-# files) is a separate layer, left to the consumer module or operator
-# host config.
+# Authentication: Redis on loopback with no `requirePass` configured.
+# Authentication remains a separate layer the consumer module or
+# operator host config can wire up (`requirePass` from a
+# LoadCredential file, ACL file, etc.) — same socket-vs-auth
+# separation of concerns established by `blockscout-postgresql`.
 { config, lib, ... }:
 
 let
@@ -48,17 +58,24 @@ in
       default = "blockscout";
       description = ''
         Name of the nixpkgs `services.redis.servers.<name>` instance.
-        Determines the runtime directory (`/run/redis-<name>/`), the
-        socket path (`/run/redis-<name>/redis.sock`), the auto-created
-        system group (`redis-<name>`) that consumers join via
-        `SupplementaryGroups`, and the systemd unit name
-        (`redis-<name>.service`).
+        Determines the runtime directory (`/run/redis-<name>/`) and
+        the systemd unit name (`redis-<name>.service`).
 
         Must match `^[a-z0-9][a-z0-9_-]*$` — lowercase alphanumeric,
         underscore, and hyphen only; first character alphanumeric.
         Enforced at option-set time via `types.strMatching` so the
-        three downstream interpolations (path, unit, group) never
-        receive unsafe characters.
+        downstream interpolations (path, unit) never receive unsafe
+        characters.
+      '';
+    };
+
+    port = mkOption {
+      type = types.port;
+      default = 6379;
+      description = ''
+        TCP port the Redis server listens on (loopback). The
+        `blockscout-backend` module's `redisPort` defaults to the
+        same value; override both sides if changed.
       '';
     };
 
@@ -83,12 +100,10 @@ in
       };
       description = ''
         Redis settings forwarded verbatim to
-        `services.redis.servers.<name>.settings`. This wrapper does
-        NOT define any `settings` defaults of its own — the three
-        preset values (`port`, `unixSocket`, `unixSocketPerm`) are
-        sibling options on the nixpkgs module, not entries in
-        `settings`. Escape hatch for any `redis.conf` option this
-        wrapper does not expose directly.
+        `services.redis.servers.<name>.settings`. The wrapper sets
+        `bind` and `port` as sibling options on the nixpkgs module,
+        not entries in `settings`. Escape hatch for any `redis.conf`
+        option this wrapper does not expose directly.
       '';
     };
   };
@@ -97,26 +112,17 @@ in
     services.redis.servers.${cfg.serverName} = {
       enable = true;
 
-      # UNIX-socket-only. Two independent layers are at play; this
-      # wrapper handles only the first:
-      #   1. Socket FILESYSTEM access. /run/redis-<name>/redis.sock is
-      #      group-owned by `redis-<name>` (auto-created by the
-      #      upstream module). Consumers grant themselves read/write
-      #      access by joining that group via SupplementaryGroups on
-      #      their own systemd unit.
-      #   2. Redis AUTHENTICATION (requirePass, ACL file). Controls
-      #      whether Redis trusts the connecting client once the
-      #      socket has been reached. This wrapper deliberately stays
-      #      out of that second layer — the Blockscout backend module
-      #      (or operator host config) can wire requirePass from a
-      #      LoadCredential file or provide an ACL file.
+      # TCP-localhost binding. Blockscout's Redix client uses
+      # `Redix.URI.to_start_options/1` which only accepts the
+      # `redis://`, `valkey://`, and `rediss://` URL schemes — so
+      # `unix:///path` URIs are rejected at startup. Same shape as
+      # the Postgrex limitation that drove the equivalent pivot in
+      # `blockscout-postgresql`.
       #
-      # `mkDefault` on each setting so operators can override in their
-      # host config (e.g. a monitoring host that needs TCP can set
-      # `services.redis.servers.blockscout.port = 6379;`).
-      port = mkDefault 0;
-      unixSocket = mkDefault "/run/redis-${cfg.serverName}/redis.sock";
-      unixSocketPerm = mkDefault 660;
+      # `mkDefault` on each setting so operators who need a different
+      # bind address (e.g. multi-host setups) can override.
+      bind = mkDefault "127.0.0.1";
+      port = mkDefault cfg.port;
 
       settings = cfg.extraSettings;
     };

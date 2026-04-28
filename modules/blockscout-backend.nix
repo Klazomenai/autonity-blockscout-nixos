@@ -19,11 +19,17 @@
 #     `user:pass@host:port/db` URL form and Postgrex parses URL
 #     host/port for the actual TCP connect, ignoring libpq's
 #     `?host=` query parameter for socket overrides.
-#   - Redis: connects via UNIX socket /run/redis-<name>/redis.sock
-#     (joining the `redis-<name>` group via SupplementaryGroups). Redis
-#     has no authentication configured; socket access is the auth
-#     boundary. Blockscout's Redix client supports `unix:///path`
-#     URIs natively, so the Postgrex-style limitation doesn't apply.
+#   - Redis: TCP-localhost connection on `redisHost:redisPort`
+#     (default `localhost:6379`, matching the `blockscout-redis`
+#     wrapper's `bind = "127.0.0.1"` default). Blockscout's Redix
+#     client uses `Redix.URI.to_start_options/1` which only accepts
+#     `redis://`, `valkey://`, and `rediss://` URL schemes — UNIX
+#     sockets via `unix:///path` URIs are rejected at startup with
+#     `ArgumentError`, the same shape as the Postgrex limitation
+#     above (and an earlier draft of this module attempted UNIX
+#     sockets here too before that fact surfaced). No authentication
+#     is configured on the loopback Redis instance; loopback binding
+#     is the auth boundary.
 #   - Autonity: connects via loopback TCP to 127.0.0.1:8545 (http),
 #     8546 (ws); the Autonity module binds loopback-only on those
 #     ports by default.
@@ -98,6 +104,18 @@ let
     # crashes the release at Config.Reader stage if CWD isn't the
     # release root.
     cd "${cfg.package}"
+
+    # HOME points at the StateDirectory. BEAM's `Mix.start/2` calls
+    # `Mix.Local.append_archives/0` → `Mix.path_for(:archives)` →
+    # `Path.expand("~/.mix/...")` → `System.user_home!/0`. With
+    # `DynamicUser=true` + `ProtectHome=true`, the dynamic user has
+    # no /home/<user> entry and System.user_home!/0 raises
+    # `RuntimeError: could not find the user home`. The
+    # StateDirectory ($STATE_DIRECTORY = /var/lib/private/<name>
+    # under DynamicUser) is writable by the unit's user and
+    # persisted across restarts, so it's the right HOME for
+    # Mix.Local's archive directory.
+    export HOME="$STATE_DIRECTORY"
 
     # $(cat …) captures the credential file's bytes verbatim. Bash
     # variable assignment does not re-expand `$` / backticks in the
@@ -353,11 +371,33 @@ in
       default = "blockscout";
       description = ''
         Name of the `services.blockscout-redis.serverName` this
-        backend talks to. Drives both the group the backend joins via
-        `SupplementaryGroups = [ "redis-<name>" ]` and the socket
-        path it connects to (`/run/redis-<name>/redis.sock`). Must
-        match `services.blockscout-redis.serverName` (enforced on
-        both sides via the same `types.strMatching` regex).
+        backend talks to. Drives the systemd unit name
+        (`redis-<name>.service`) that the backend orders against.
+        Must match `services.blockscout-redis.serverName` (enforced
+        on both sides via the same `types.strMatching` regex).
+      '';
+    };
+
+    redisHost = mkOption {
+      type = types.str;
+      default = "localhost";
+      description = ''
+        Hostname (or IP) the backend connects to for Redis. Defaults
+        to `localhost`, matching the `blockscout-redis` wrapper's
+        `bind = "127.0.0.1"` default. Blockscout's Redix client
+        rejects `unix://` URIs (only accepts `redis://`, `valkey://`,
+        `rediss://`), so TCP is the only supported transport. Set
+        this to a remote hostname only if running an external Redis.
+      '';
+    };
+
+    redisPort = mkOption {
+      type = types.port;
+      default = 6379;
+      description = ''
+        TCP port the backend uses to reach Redis. Defaults to 6379;
+        override here AND on `services.blockscout-redis.port` if
+        moved.
       '';
     };
 
@@ -639,7 +679,15 @@ in
       # LoadCredential-sourced password percent-encoded for safe URL
       # embedding. ACCOUNT_DATABASE_URL likewise.
       environment = {
-        ACCOUNT_REDIS_URL = "unix:///run/redis-${cfg.redisServerName}/redis.sock";
+        ACCOUNT_REDIS_URL = "redis://${cfg.redisHost}:${toString cfg.redisPort}";
+        # ECTO_USE_SSL is checked by Blockscout's runtime.exs / config_helper
+        # and defaults to "true" — but our local postgres
+        # (`blockscout-postgresql` wrapper) doesn't ship SSL certs and
+        # listens plaintext on localhost only. Forcing this off for
+        # the loopback connection avoids `Postgrex.Error: ssl not
+        # available` at startup. Operators connecting to an external
+        # SSL-enabled Postgres can override via `extraEnv`.
+        ECTO_USE_SSL = "false";
         ETHEREUM_JSONRPC_VARIANT = "geth";
         ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
         ETHEREUM_JSONRPC_WS_URL = cfg.ethereumRpc.wsUrl;
@@ -693,16 +741,13 @@ in
         RuntimeDirectory = "blockscout-backend";
         RuntimeDirectoryMode = "0700";
 
-        # Cross-service UNIX socket access — only Redis now.
-        # PostgreSQL connection moved from UNIX-socket to TCP-localhost
-        # because Blockscout's Ecto layer doesn't honour libpq's
-        # `?host=` query for socket overrides; see `databaseHost`
-        # docstring. Redis stays UNIX-socket-driven (Blockscout's
-        # Redix client handles `unix:///path` URIs natively, no
-        # equivalent issue).
-        SupplementaryGroups = [
-          "redis-${cfg.redisServerName}"
-        ];
+        # No SupplementaryGroups — both PostgreSQL and Redis are
+        # reached over TCP-localhost rather than UNIX sockets, so the
+        # backend has no need to join host system groups for socket
+        # filesystem access. PostgreSQL pivoted because the Ecto/
+        # Postgrex layer doesn't honour libpq's `?host=` for sockets;
+        # Redis pivoted because Redix's URI parser rejects the
+        # `unix://` scheme outright.
 
         # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
@@ -724,17 +769,14 @@ in
         # keep the default `true`.
         MemoryDenyWriteExecute = false;
 
-        # `PrivateUsers = false` is load-bearing, not a missing
-        # hardening option. The service relies on `SupplementaryGroups`
-        # to reach the PostgreSQL and Redis UNIX sockets; those
-        # sockets are group-owned by `postgres` and `redis-<name>`
-        # respectively at the HOST UID/GID level. `PrivateUsers = true`
-        # would put the service in a user namespace where host GIDs
-        # are remapped (typically to `nobody`), making the kernel's
-        # permission check on the sockets fail with EACCES. Leave
-        # explicitly false with this comment so future hardening
-        # sweeps do not mistakenly re-enable it.
-        PrivateUsers = false;
+        # PrivateUsers left at its systemd default (false): both
+        # PostgreSQL and Redis are now reached over TCP-localhost,
+        # not UNIX sockets, so a user-namespace GID remap would no
+        # longer break socket access. Setting `PrivateUsers = true`
+        # explicitly is *probably* safe today but unverified against
+        # the BEAM scheduler / Mix release loader; leave at the
+        # systemd default until a separate hardening pass evaluates
+        # it on a real workload.
 
         # Rest of the defense-in-depth baseline per the
         # nix-modules-hardening skill matrix.
