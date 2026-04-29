@@ -135,6 +135,18 @@ pkgs.testers.nixosTest {
         p2p.maxPeers = 0;
         p2p.openFirewall = false;
         extraArgs = [ "--nodiscover" ];
+
+        # Exercise the staticNodes ExecStartPre path. The list value
+        # itself is irrelevant for behaviour (the test runs with
+        # `--nodiscover --maxpeers=0`, so even the fake loopback peer
+        # below is never dialled); what we want to verify is that
+        # the wrapper renders `static-nodes.json` into StateDirectory
+        # at unit start with mode 0600 and JSON-serialised content.
+        # The pubkey is 64 zeros — syntactically valid enode URI but
+        # cryptographically meaningless.
+        staticNodes = [
+          "enode://00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:30303"
+        ];
       };
 
       services.blockscout-postgresql = {
@@ -235,6 +247,26 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("blockscout-backend.service")
     machine.wait_for_unit("blockscout-frontend.service")
     machine.wait_for_unit("nginx.service")
+
+    # ---------------------------------------------------------------
+    # 1a. `services.autonity.staticNodes` ExecStartPre side-effect.
+    #     The fixture above sets a one-element list; this step
+    #     asserts the wrapper rendered `static-nodes.json` into
+    #     StateDirectory with mode 0600 and that the JSON content
+    #     round-trips. With DynamicUser the file lives at
+    #     `/var/lib/private/autonity/static-nodes.json` (root has
+    #     full traversal regardless of permission bits), and the
+    #     symlink at `/var/lib/autonity` points there.
+    # ---------------------------------------------------------------
+    machine.succeed("test -f /var/lib/autonity/static-nodes.json")
+    mode = machine.succeed(
+        "stat -c %a /var/lib/autonity/static-nodes.json"
+    ).strip()
+    assert mode == "600", f"static-nodes.json mode is {mode!r}, expected 600"
+    static_nodes = machine.succeed("cat /var/lib/autonity/static-nodes.json")
+    assert "enode://" in static_nodes, (
+        f"static-nodes.json does not contain an enode entry: {static_nodes!r}"
+    )
 
     # ---------------------------------------------------------------
     # 2. Loopback ports listening.
