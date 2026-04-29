@@ -25,8 +25,8 @@
 #   needs — no `peer`-auth complexity, no DynamicUser-vs-fixed-username
 #   mismatch.
 #
-#   `passwordFile` (NEW): when set, this wrapper appends an `ALTER
-#   ROLE … WITH PASSWORD …` statement to
+#   `passwordFile` (REQUIRED whenever `enable = true`): the wrapper
+#   appends an `ALTER ROLE … WITH PASSWORD …` statement to
 #   `systemd.services.postgresql-setup.script` (NOT
 #   `postgresql.service.postStart`). nixpkgs runs `ensureUsers` and
 #   `ensureDatabases` inside the separate `postgresql-setup.service`
@@ -34,6 +34,16 @@
 #   role exists and ALTER ROLE would fail with `role "blockscout"
 #   does not exist`. `mkAfter` orders the appended SQL after the
 #   `generateUserSetupScript` block that creates the role.
+#
+#   No optional / null path: the wrapper is purpose-built for the
+#   Blockscout backend, which connects via TCP-localhost with
+#   password auth (peer auth on the local UNIX socket would not
+#   help because Blockscout's Postgrex layer connects via TCP).
+#   Without a password the role would have no credential the
+#   backend could authenticate against, so the option is mandatory
+#   — `types.str` without a default. Operators not comfortable with
+#   the surface this implies should configure `services.postgresql`
+#   directly rather than going through this wrapper.
 #
 #   The `blockscout-backend` module sets the matching
 #   `databasePasswordFile` to the same file via `LoadCredential=`.
@@ -104,9 +114,17 @@ in
       type = types.str;
       example = "/run/secrets/blockscout/db_password";
       description = ''
-        Absolute path to a file containing the password for the
-        `username` role. The wrapper appends an `ALTER ROLE … WITH
-        PASSWORD …` step to `systemd.services.postgresql-setup.script`
+        REQUIRED whenever `services.blockscout-postgresql.enable =
+        true`. Absolute path to a file containing the password for
+        the `username` role. The option is `types.str` with no
+        default — module evaluation fails fast if the operator
+        forgets to set it. (See the module header docstring for why
+        a `nullOr`-with-null-default isn't offered: there's no
+        coherent passwordless mode for Blockscout's TCP-Postgrex
+        client.)
+
+        The wrapper appends an `ALTER ROLE … WITH PASSWORD …` step to
+        `systemd.services.postgresql-setup.script`
         (NOT `postgresql.service.postStart` — nixpkgs runs
         `ensureUsers` / `ensureDatabases` inside the separate
         `postgresql-setup.service` one-shot unit, which is also where

@@ -25,8 +25,12 @@
 #     host/port for the actual TCP connect, ignoring libpq's
 #     `?host=` query parameter for socket overrides.
 #   - Redis: TCP-localhost connection on `redisHost:redisPort`
-#     (default `localhost:6379`, matching the `blockscout-redis`
-#     wrapper's `bind = "127.0.0.1"` default). Blockscout's Redix
+#     (default `127.0.0.1:6379`, matching the `blockscout-redis`
+#     wrapper's `bind = "127.0.0.1"` default byte-for-byte). The
+#     IPv4 literal is preferred over the `localhost` name because
+#     the wrapper binds IPv4 loopback only, and dual-stack glibc /
+#     nss-resolve setups can return `::1` first for `localhost`.
+#     Blockscout's Redix
 #     client uses `Redix.URI.to_start_options/1` which only accepts
 #     `redis://`, `valkey://`, and `rediss://` URL schemes — UNIX
 #     sockets via `unix:///path` URIs are rejected at startup with
@@ -464,7 +468,14 @@ in
     };
 
     redisHost = mkOption {
-      type = types.str;
+      # Same hostname-or-IPv4 regex shape as `databaseHost`. Both
+      # backends ultimately compose URLs (`redis://host:port`,
+      # `postgres://user:pass@host:port/db`) where `:` is a parser-
+      # significant separator, so accepting `:` in the host segment
+      # would conflict with bare-host URL parsing. IPv6-literal
+      # support is a future widening that would change both the
+      # regex AND the URL composition path on each side.
+      type = types.strMatching "^[a-zA-Z0-9.-]+$";
       default = "127.0.0.1";
       description = ''
         Hostname (or IP) the backend connects to for Redis. Defaults
@@ -739,8 +750,9 @@ in
     # No `services.postgresql.authentication` injection: connection
     # is TCP-localhost (or remote TCP), authenticated by password
     # against nixpkgs' default pg_hba.conf `host all all 127.0.0.1/32
-    # scram-sha-256` rule. The matching role password is set by the
-    # `blockscout-postgresql` wrapper's postStart hook from the same
+    # scram-sha-256` rule. The matching role password is set by
+    # `blockscout-postgresql` via an appended step in
+    # `systemd.services.postgresql-setup.script` from the same
     # `passwordFile`, and read on this side via LoadCredential into
     # the ExecStart wrapper which percent-encodes it for safe
     # embedding into the DATABASE_URL.

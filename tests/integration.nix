@@ -120,11 +120,12 @@ pkgs.testers.nixosTest {
       # caveat as the secretKeyBaseFile fixture above (content
       # actually lives in /nix/store/, not for real secrets — see
       # testSecretKeyBase docstring). The password is set on the
-      # postgres role by the `blockscout-postgresql` wrapper's
-      # postStart hook, and read back into DATABASE_URL by the
-      # backend's ExecStart wrapper via LoadCredential. Both sides
-      # MUST point at the same path for the role's password and the
-      # backend's connection password to agree.
+      # postgres role by an appended step the `blockscout-postgresql`
+      # wrapper attaches to `systemd.services.postgresql-setup.script`,
+      # and read back into DATABASE_URL by the backend's ExecStart
+      # wrapper via LoadCredential. Both sides MUST point at the same
+      # path for the role's password and the backend's connection
+      # password to agree.
       environment.etc."test-secrets/db_password".text = "test-password-not-for-production";
 
       services.autonity = {
