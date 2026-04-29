@@ -1,6 +1,10 @@
 # Thin wrapper over nixpkgs `services.redis.servers.<name>` preconfiguring
 # Blockscout's Redis instance with TCP-localhost binding. Blockscout
-# backend connects via `redis://localhost:<port>`.
+# backend connects via `redis://127.0.0.1:<port>` — the wrapper binds
+# IPv4 loopback only, and the matching `services.blockscout-backend.
+# redisHost` default uses the IPv4 literal for the same reason (avoids
+# `localhost` resolving to `::1` first on dual-stack systems where
+# Redis isn't listening).
 #
 # Connection mode rationale:
 #   Blockscout's Redix client uses `Redix.URI.to_start_options/1` to

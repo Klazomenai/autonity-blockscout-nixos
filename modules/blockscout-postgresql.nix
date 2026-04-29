@@ -1,6 +1,16 @@
 # Thin wrapper over nixpkgs `services.postgresql` preconfiguring the
 # PostgreSQL database + role Blockscout expects, listening on TCP
-# loopback (`127.0.0.1:5432`).
+# loopback. The actual `listen_addresses` setting is `"localhost"`
+# (matching upstream Blockscout's docker-compose deployment shape),
+# which resolves to both `127.0.0.1` and `::1` via /etc/hosts on
+# dual-stack systems — Postgres binds whichever loopback addresses
+# `localhost` resolves to. The asymmetric symbol-vs-literal choice
+# between this wrapper (`listen_addresses = "localhost"`) and
+# `blockscout-redis` (`bind = "127.0.0.1"`) is deliberate: Postgres
+# binds every resolved address so name-based `localhost` is safe,
+# whereas Redis binds only what's literally configured, so the
+# matching `redisHost` default uses the literal `127.0.0.1` to dodge
+# v6-resolution-first failures.
 #
 # Connection mode rationale:
 #   Blockscout's `Explorer.Repo.ConfigHelper.extract_parameters/1`
@@ -252,17 +262,21 @@ in
     # `<<'EOF'` (quoted heredoc) prevents the OUTER shell from
     # interpreting `$`, backticks, etc. Nix `${...}` interpolation
     # happens at build time (before the shell ever sees the script),
-    # so password file path and username are baked in. psql then
-    # parses the heredoc body itself, including the backticks
-    # which it (psql) executes via its own shell to capture the
-    # password file contents into `:pw`.
+    # so password file path and username are baked in.
+    # `lib.escapeShellArg` handles all shell-metacharacter cases
+    # (whitespace, globs, single quotes via the `'\''` idiom) for
+    # the path; relying on a single hand-written `'…'` wrapper would
+    # break on a path containing a literal single quote. psql then
+    # parses the heredoc body itself, including the backticks which
+    # it (psql) executes via its own shell to capture the password
+    # file contents into `:pw`.
     #
     # `-v ON_ERROR_STOP=1` makes psql fail with non-zero exit if the
     # ALTER ROLE doesn't apply, so the setup unit surfaces the
     # failure to systemd instead of swallowing it.
     systemd.services.postgresql-setup.script = lib.mkAfter ''
       ${config.services.postgresql.package}/bin/psql -d postgres -v ON_ERROR_STOP=1 <<'EOF'
-      \set pw `cat '${cfg.passwordFile}' | tr -d '\n'`
+      \set pw `cat ${lib.escapeShellArg cfg.passwordFile} | tr -d '\n'`
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
       EOF
     '';
