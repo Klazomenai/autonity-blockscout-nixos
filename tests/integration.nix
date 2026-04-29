@@ -154,6 +154,49 @@ pkgs.testers.nixosTest {
         enable = true;
         secretKeyBaseFile = "/etc/test-secrets/skb";
         databasePasswordFile = "/etc/test-secrets/db_password";
+
+        # Test-only fixture: short-circuit the upstream Blockscout
+        # `Explorer.Migrator.ReindexDuplicatedInternalTransactions`
+        # filling-migrator. Upstream PR blockscout/blockscout#14099
+        # (commit b16530084) removed the `block_hash` field from
+        # `Explorer.Chain.InternalTransaction` but did NOT update the
+        # migrator's query, which still does
+        # `select: it.block_hash, group_by: [it.block_hash, ...]`
+        # (apps/explorer/lib/explorer/migrator/
+        # reindex_duplicated_internal_transactions.ex:65). At BEAM
+        # startup the migrator GenServer enters a tight crash loop
+        # (Ecto.QueryError, ~100×/second) that's harmless on a fast
+        # KVM-accelerated host but saturates the BEAM scheduler on
+        # CI runners (TCG software emulation, no nested KVM, 2
+        # vCPUs) and starves the Next.js SSR thread, wedging step 6
+        # of this test indefinitely.
+        #
+        # The migrator inherits from `Explorer.Migrator.FillingMigration`
+        # whose init callback exits cleanly when
+        # `MigrationStatus.fetch/1` returns `%{status: "completed"}`
+        # (filling_migration.ex:217-227). There's no env var or
+        # runtime config to skip it (`enabled: true` is compile-time
+        # only), so we INSERT the completion row pre-supervisor.
+        #
+        # Scoped to this fixture (NOT in the production module
+        # default) so deployments don't silently skip a real
+        # data-fix migration once upstream patches the bug. Tracking
+        # follow-up: file an issue against `klazomenai/blockscout`
+        # to patch the broken migrator at source via `prePatch`,
+        # which would let us drop this fixture and let production
+        # deployments inherit the fix automatically.
+        extraPostMigrate = ''
+          INSERT INTO migrations_status
+            (migration_name, status, inserted_at, updated_at)
+          VALUES (
+            'reindex_duplicated_internal_transactions',
+            'completed',
+            now(),
+            now()
+          )
+          ON CONFLICT (migration_name)
+            DO UPDATE SET status = 'completed', updated_at = now();
+        '';
       };
 
       services.blockscout-frontend.enable = true;

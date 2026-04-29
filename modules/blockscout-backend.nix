@@ -231,41 +231,24 @@ let
       # that's a different module name from a different era and is
       # not what this fork ships.
       ${cfg.package}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
-
-      # Workaround for upstream Blockscout regression: PR
-      # blockscout/blockscout#14099 (commit b16530084) removed the
-      # `block_hash` field from `Explorer.Chain.InternalTransaction`
-      # but did NOT update the
-      # `Explorer.Migrator.ReindexDuplicatedInternalTransactions`
-      # migrator's query, which still does
-      # `select: it.block_hash, group_by: [it.block_hash, ...]`
-      # (apps/explorer/lib/explorer/migrator/
-      # reindex_duplicated_internal_transactions.ex:65). At BEAM
-      # startup the migrator GenServer enters a tight crash loop
-      # (Ecto.QueryError, ~100×/second) which saturates CPU on
-      # constrained runners — fine on a fast host but starves the
-      # frontend's Next.js SSR thread on slow CI runners (TCG
-      # software emulation, no nested KVM), causing the integration
-      # check to wedge on the first SSR request and time out.
+    ''}
+    ${optionalString (cfg.extraPostMigrate != "") ''
+      # Operator-supplied post-migration SQL. Runs after
+      # `Explorer.ReleaseTasks.migrate([])` (so any tables / columns
+      # the SQL touches must already exist by then), and BEFORE
+      # `${cfg.package}/bin/blockscout start` (so the BEAM supervisor
+      # tree sees the resulting state when it boots).
       #
-      # The migrator inherits from `Explorer.Migrator.FillingMigration`,
-      # which exits cleanly on init when `MigrationStatus.fetch/1`
-      # returns `%{status: "completed"}`
-      # (filling_migration.ex:217-227). There is no env var or
-      # runtime config to skip the migrator (its `enabled: true` is
-      # compile-time-only in apps/explorer/config/config.exs:138),
-      # so we mark it complete by inserting a row into
-      # `migrations_status` here. Idempotent on conflict.
+      # Logged at unit start so operators can see in journalctl that
+      # a workaround / fixture was applied — bypassing migrations is
+      # too easy to silently sneak past a maintenance review
+      # otherwise.
       #
-      # MUST run AFTER `migrate([])` because Ecto migrations create
-      # the `migrations_status` table; runs BEFORE
-      # `${cfg.package}/bin/blockscout start` so the supervisor sees
-      # the completion row when it boots the migrator child.
-      #
-      # PGPASSWORD is exported to psql via env so the password isn't
-      # in argv (matches the wrapper's secret-handling contract).
-      # Re-read from $CREDENTIALS_DIRECTORY because $db_password_raw
-      # was unset above to limit the in-memory exposure window.
+      # PGPASSWORD is exported via env (not argv — matches the
+      # wrapper's secret-handling contract). Re-read from
+      # $CREDENTIALS_DIRECTORY because $db_password_raw was unset
+      # above to limit the in-memory exposure window.
+      echo "blockscout-backend: applying services.blockscout-backend.extraPostMigrate SQL" >&2
       PGPASSWORD="$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")" \
         ${pkgs.postgresql}/bin/psql \
         --host="${cfg.databaseHost}" \
@@ -274,7 +257,7 @@ let
         --dbname="${cfg.databaseName}" \
         --no-psqlrc \
         -v ON_ERROR_STOP=1 \
-        -c "INSERT INTO migrations_status (migration_name, status, inserted_at, updated_at) VALUES ('reindex_duplicated_internal_transactions', 'completed', now(), now()) ON CONFLICT (migration_name) DO UPDATE SET status = 'completed', updated_at = now();"
+        -f ${pkgs.writeText "blockscout-extra-post-migrate.sql" cfg.extraPostMigrate}
     ''}
     exec ${cfg.package}/bin/blockscout start
   '';
@@ -621,6 +604,51 @@ in
         different module from a different era; this fork's release
         helper is `Explorer.ReleaseTasks.migrate/1` at
         `apps/explorer/lib/release_tasks.ex`.
+      '';
+    };
+
+    extraPostMigrate = mkOption {
+      type = types.lines;
+      default = "";
+      example = lib.literalExpression ''
+        '''
+          INSERT INTO migrations_status
+            (migration_name, status, inserted_at, updated_at)
+          VALUES ('some_migration_name', 'completed', now(), now())
+          ON CONFLICT (migration_name)
+            DO UPDATE SET status = 'completed', updated_at = now();
+        '''
+      '';
+      description = ''
+        SQL block run by `psql` against the configured database
+        AFTER `Explorer.ReleaseTasks.migrate([])` (so any tables /
+        columns the SQL touches must exist by then) and BEFORE the
+        BEAM supervisor tree starts. Empty by default — operators
+        opt in explicitly.
+
+        Use cases include (but are not limited to):
+        - Pre-seeding rows into `migrations_status` to skip a known-
+          broken upstream Blockscout filling-migration that would
+          otherwise crash-loop in the supervisor tree.
+        - Test-only fixtures (the integration check uses this option
+          to short-circuit one such broken migrator without altering
+          production-deployment defaults).
+
+        WARNING: SQL run here can silently bypass data-fix
+        migrations. The wrapper's ExecStart logs a stderr line
+        (`blockscout-backend: applying
+        services.blockscout-backend.extraPostMigrate SQL`) every
+        time the block fires so the bypass is visible in journalctl.
+        Restrict to known-and-named migrations, document each
+        statement's reason in the value, and revisit on every
+        Blockscout version bump — once the upstream bug is fixed,
+        leaving the row pinned at "completed" forever permanently
+        skips the real migration once Blockscout adds a working one.
+
+        Connection uses `databaseHost`, `databasePort`,
+        `databaseUser`, `databaseName`, and the value at
+        `databasePasswordFile` (read via the same `LoadCredential=
+        DATABASE_PASSWORD` ingestion the runtime URL uses).
       '';
     };
 
