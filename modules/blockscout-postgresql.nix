@@ -84,19 +84,34 @@ in
     enable = mkEnableOption "Blockscout's PostgreSQL (thin wrapper over services.postgresql)";
 
     databaseName = mkOption {
-      type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
+      # Lowercase-only by design. nixpkgs `ensureUsers` /
+      # `ensureDatabases` issues unquoted CREATE statements, which
+      # PostgreSQL folds to lowercase per SQL standard. This wrapper
+      # later issues `ALTER ROLE "${cfg.username}" …` with double
+      # quotes (case-sensitive identifier), so a mixed/upper-case
+      # value here would land in the SQL as e.g. `ALTER ROLE
+      # "Blockscout"` while the role nixpkgs created is named
+      # `blockscout` → `role "Blockscout" does not exist` at unit
+      # start. Constraining to lowercase at option-set time avoids
+      # the hazard.
+      type = types.strMatching "^[a-z_][a-z0-9_]*$";
       default = "blockscout";
       description = ''
         Name of the PostgreSQL database the Blockscout indexer and API
         connect to. Created on first service start via
-        `services.postgresql.ensureDatabases`. SQL-identifier regex
-        rejects whitespace, quotes, and other characters that could
-        inject into pg_hba / postStart contexts.
+        `services.postgresql.ensureDatabases`. Lowercase-only — see
+        the inline comment above this option for the case-folding
+        rationale that drives the regex.
       '';
     };
 
     username = mkOption {
-      type = types.strMatching "^[a-zA-Z_][a-zA-Z0-9_]*$";
+      # Same lowercase-only constraint as `databaseName` for the
+      # same SQL identifier case-folding reason — nixpkgs creates the
+      # role with an unquoted CREATE (folds to lowercase) but our
+      # wrapper later double-quotes the value in `ALTER ROLE`,
+      # making `Blockscout` ≠ `blockscout`.
+      type = types.strMatching "^[a-z_][a-z0-9_]*$";
       default = "blockscout";
       description = ''
         Name of the PostgreSQL role owning the Blockscout database.
@@ -275,7 +290,7 @@ in
     # ALTER ROLE doesn't apply, so the setup unit surfaces the
     # failure to systemd instead of swallowing it.
     systemd.services.postgresql-setup.script = lib.mkAfter ''
-      ${config.services.postgresql.package}/bin/psql -d postgres -v ON_ERROR_STOP=1 <<'EOF'
+      ${config.services.postgresql.package}/bin/psql --no-psqlrc -d postgres -v ON_ERROR_STOP=1 <<'EOF'
       \set pw `cat ${lib.escapeShellArg cfg.passwordFile} | tr -d '\n'`
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
       EOF

@@ -194,12 +194,23 @@ let
     export ACCOUNT_DATABASE_URL="$DATABASE_URL"
     unset db_password_raw db_password_enc
 
-    # RELEASE_COOKIE: if the operator provided `cookieFile`, systemd
-    # ingested it into $CREDENTIALS_DIRECTORY/RELEASE_COOKIE via
-    # LoadCredential=. Otherwise we generate a random per-restart
-    # cookie inline. The latter is fine for single-node deployments
-    # where no external Erlang node ever connects — for clustering
-    # the operator MUST supply `cookieFile` so all nodes agree.
+    # RELEASE_COOKIE precedence (highest → lowest):
+    #   1. `cookieFile` (operator-supplied, non-null) — systemd
+    #      ingested it into $CREDENTIALS_DIRECTORY/RELEASE_COOKIE via
+    #      LoadCredential=. Always wins, even if `extraEnv` also sets
+    #      RELEASE_COOKIE; the file is the more deliberate of the two
+    #      paths and `cookieFile` is documented as authoritative.
+    #   2. Operator-supplied via `extraEnv.RELEASE_COOKIE` (or any
+    #      other path that reaches systemd `Environment=`). Honoured
+    #      via the `[ -z "''${RELEASE_COOKIE:-}" ]` check below — we
+    #      only generate a value when nothing is in the env yet. This
+    #      preserves the module-wide rule that `extraEnv` is the
+    #      operator's escape hatch.
+    #   3. Random per-restart fallback via `openssl rand -hex 24`.
+    #      Fine for single-node deployments where no external Erlang
+    #      node ever connects — for clustering the operator MUST
+    #      supply `cookieFile` (or set `extraEnv.RELEASE_COOKIE`) so
+    #      all nodes agree.
     #
     # `-hex 24` (48 hex chars) chosen over `-base64 24` because the
     # base64 alphabet includes `+`, `/`, and `=` which can interact
@@ -214,7 +225,11 @@ let
       if cfg.cookieFile != null then
         ''export RELEASE_COOKIE="$(cat "$CREDENTIALS_DIRECTORY/RELEASE_COOKIE")"''
       else
-        ''export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -hex 24)"''
+        ''
+          if [ -z "''${RELEASE_COOKIE:-}" ]; then
+            export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -hex 24)"
+          fi
+        ''
     }
 
     ${concatMapStringsSep "\n    " (name: ''

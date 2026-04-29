@@ -325,8 +325,18 @@ pkgs.testers.nixosTest {
     #    check on the self-signed cert; the assertion is "TLS
     #    terminates and the proxy_pass reaches the right upstream".
     # ---------------------------------------------------------------
+    # `--resolve <hostname>:443:127.0.0.1` pins DNS resolution to
+    # loopback while letting the URL itself carry the hostname — that
+    # way TLS SNI carries `${hostName}` (matching the certificate's
+    # CN/SAN and the nginx server-block selection key) AND the HTTP
+    # `Host:` header lines up automatically. Setting `Host:` manually
+    # against an IP-literal URL the way an earlier draft did would
+    # leave SNI as `127.0.0.1`, which nginx server-block selection
+    # doesn't match against — the request would land on whatever
+    # nginx considers the default TLS vhost and inadvertently exercise
+    # the wrong configuration.
     proxied_health = machine.succeed(
-        "curl -fsSk -H 'Host: ${hostName}' https://127.0.0.1/api/health/liveness"
+        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/api/health/liveness"
     )
     # nginx /api/health/liveness and direct backend
     # /api/health/liveness must agree — proxy_pass should be
@@ -342,14 +352,14 @@ pkgs.testers.nixosTest {
     )
 
     proxied_root = machine.succeed(
-        "curl -fsSk -H 'Host: ${hostName}' https://127.0.0.1/"
+        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/"
     )
     assert "envs.js" in proxied_root, (
         "nginx / does not reverse-proxy frontend correctly"
     )
 
     proxied_envsjs = machine.succeed(
-        "curl -fsSk -H 'Host: ${hostName}' https://127.0.0.1/assets/envs.js"
+        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/assets/envs.js"
     )
     assert proxied_envsjs == envsjs, (
         "envs.js bytes differ between direct frontend and through nginx — "

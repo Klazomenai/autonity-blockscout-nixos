@@ -32,10 +32,24 @@
 #     several places (CapabilityBoundingSet shape, SystemCallFilter
 #     style, AF_NETLINK presence). The check enforces the *shipped*
 #     values; nixpkgs' upstream choices are nixpkgs' problem.
-#   - The check covers `serviceConfig` keys only. ExecStart paths,
-#     Environment values, LoadCredential entries, etc. are validated
-#     by the per-module assertions (option-set time) and by the
-#     full-stack VM test (upcoming).
+#   - The expected-shape table covers SECURITY-RELEVANT
+#     `serviceConfig` keys: defense-in-depth flags
+#     (CapabilityBoundingSet, ProtectSystem, RestrictAddressFamilies,
+#     SystemCallFilter, …), DynamicUser, MemoryDenyWriteExecute, etc.
+#     Application-level `serviceConfig` keys that don't have a
+#     security shape — `ExecStart`, `WorkingDirectory`, `Restart`,
+#     `RestartSec`, `LoadCredential`, `StateDirectory`,
+#     `RuntimeDirectory`, `*Mode`, `Environment` (or any non-merged
+#     systemd directive that's just operational config) — are
+#     deliberately NOT in the expected table. Those are validated by
+#     the per-module `config.assertions` (option-set time) and by
+#     the full-stack VM integration test (behavioural validation).
+#     Adding them here would muddle the spike's purpose: it's a
+#     hardening-shape guard, not a "every key on the unit must be
+#     enumerated" structural check. (See the missing-key validation
+#     in `diffUnit`: it only fails when an EXPECTED key is missing,
+#     never when an UNEXPECTED key is present, so non-listed keys
+#     pass through silently — by design.)
 {
   pkgs,
   nixpkgs,
