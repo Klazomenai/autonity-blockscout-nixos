@@ -272,12 +272,16 @@ pkgs.testers.nixosTest {
     assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
 
     # ---------------------------------------------------------------
-    # 4. Backend ↔ Autonity loopback RPC.
+    # 4. Backend ↔ Autonity loopback RPC. `wait_until_succeeds` not
+    #    `succeed` — `wait_for_open_port(8545)` only proves the
+    #    listener is bound, not that the JSON-RPC handler goroutines
+    #    are answering yet. On slow/contended hosts that gap is real.
     # ---------------------------------------------------------------
-    rpc = machine.succeed(
+    rpc = machine.wait_until_succeeds(
         "curl -fsS http://127.0.0.1:8545 "
         "-H 'Content-Type: application/json' "
-        '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' '
+        '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' ',
+        timeout=120,
     )
     assert '"result"' in rpc, f"eth_chainId missing result field: {rpc!r}"
 
@@ -304,9 +308,16 @@ pkgs.testers.nixosTest {
     )
 
     # ---------------------------------------------------------------
-    # 6. Frontend SSR + bind-mounted envs.js.
+    # 6. Frontend SSR + bind-mounted envs.js. `wait_until_succeeds`
+    #    not `succeed` — Next.js binds 3000 well before the SSR worker
+    #    is warm; the first request can return 502/500 while the
+    #    route is being compiled. On constrained CI runners that
+    #    warm-up window can be tens of seconds.
     # ---------------------------------------------------------------
-    envsjs = machine.succeed("curl -fsS http://127.0.0.1:3000/assets/envs.js")
+    envsjs = machine.wait_until_succeeds(
+        "curl -fsS http://127.0.0.1:3000/assets/envs.js",
+        timeout=120,
+    )
     assert "window.__envs" in envsjs, (
         f"envs.js does not contain window.__envs assignment: {envsjs!r}"
     )
@@ -314,7 +325,10 @@ pkgs.testers.nixosTest {
         f"envs.js missing expected NEXT_PUBLIC_* keys: {envsjs!r}"
     )
 
-    homepage = machine.succeed("curl -fsS http://127.0.0.1:3000/")
+    homepage = machine.wait_until_succeeds(
+        "curl -fsS http://127.0.0.1:3000/",
+        timeout=120,
+    )
     assert "envs.js" in homepage, (
         "frontend HTML does not reference envs.js — "
         "the bind-mount overlay would have nothing to load against"
@@ -335,8 +349,15 @@ pkgs.testers.nixosTest {
     # doesn't match against — the request would land on whatever
     # nginx considers the default TLS vhost and inadvertently exercise
     # the wrong configuration.
-    proxied_health = machine.succeed(
-        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/api/health/liveness"
+    # First HTTPS round-trip uses `wait_until_succeeds` because
+    # `wait_for_open_port(443)` only proves the listener is bound,
+    # not that nginx has finished loading the vhost config and the
+    # `proxy_pass` upstreams (frontend / backend) have completed
+    # their own warmup. Subsequent curls in this section reuse
+    # `succeed` — by then the proxy path is confirmed up.
+    proxied_health = machine.wait_until_succeeds(
+        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/api/health/liveness",
+        timeout=120,
     )
     # nginx /api/health/liveness and direct backend
     # /api/health/liveness must agree — proxy_pass should be
