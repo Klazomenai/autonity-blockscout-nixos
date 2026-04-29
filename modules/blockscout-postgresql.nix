@@ -105,12 +105,17 @@ in
       example = "/run/secrets/blockscout/db_password";
       description = ''
         Absolute path to a file containing the password for the
-        `username` role. The wrapper's postStart script `ALTER ROLE`s
-        the role with this password as part of postgres unit
-        activation, so the `blockscout-backend` module can connect
-        via TCP loopback with the matching password (the backend
-        module's `databasePasswordFile` should point at the same
-        file).
+        `username` role. The wrapper appends an `ALTER ROLE … WITH
+        PASSWORD …` step to `systemd.services.postgresql-setup.script`
+        (NOT `postgresql.service.postStart` — nixpkgs runs
+        `ensureUsers` / `ensureDatabases` inside the separate
+        `postgresql-setup.service` one-shot unit, which is also where
+        this password change has to land or the role won't exist
+        yet). The password is therefore applied during the
+        `postgresql-setup.service` run, before
+        `blockscout-backend.service` starts and connects via TCP
+        loopback with the matching password (the backend module's
+        `databasePasswordFile` should point at the same file).
 
         MUST be an absolute path NOT under `/nix/store/` — the file's
         contents land in postgres's role table (write path runs as the
@@ -200,9 +205,11 @@ in
     # `generateUserSetupScript` block that creates the role, so the
     # role is guaranteed to exist when our hook fires.
     #
-    # The setup unit runs as `User=postgres` with
-    # `path = [ cfg.finalPackage ]`, so `psql` resolves on PATH; we
-    # use an explicit path anyway for clarity.
+    # The setup unit runs as `User=postgres` with the upstream
+    # PostgreSQL package on its `path`, so `psql` resolves on PATH;
+    # we use an explicit path (`config.services.postgresql.package`)
+    # anyway for clarity, since this wrapper has no `cfg.finalPackage`
+    # surface of its own.
     #
     # Password handling — three constraints:
     #

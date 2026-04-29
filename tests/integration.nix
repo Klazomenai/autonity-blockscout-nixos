@@ -177,6 +177,8 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
+    import re
+
     machine.start()
 
     # ---------------------------------------------------------------
@@ -330,11 +332,15 @@ pkgs.testers.nixosTest {
 
     # ---------------------------------------------------------------
     # 9. HTTP → HTTPS redirect via forceSSL.
+    #    Accept any 3xx status — nginx ships 301 today, but `forceSSL`
+    #    is documented to issue 30x and a future nixpkgs/nginx change
+    #    to 307/308 would still satisfy the intent of "redirect
+    #    happened" without us needing to chase the exact code.
     # ---------------------------------------------------------------
     redirect_status = machine.succeed(
         "curl -sSI -H 'Host: ${hostName}' http://127.0.0.1/ | head -1"
     ).strip()
-    assert "301" in redirect_status or "302" in redirect_status, (
+    assert re.search(r"^HTTP/\S+\s+3\d\d\b", redirect_status), (
         f"forceSSL HTTP→HTTPS redirect missing: {redirect_status!r}"
     )
   '';

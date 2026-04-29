@@ -9,10 +9,15 @@
 #     wrapper's `listen_addresses = "localhost"` default). Auth is
 #     password-based via the standard nixpkgs pg_hba.conf
 #     `host all all 127.0.0.1/32 scram-sha-256` rule; the role's
-#     password is set by the wrapper's postStart from
-#     `services.blockscout-postgresql.passwordFile`, and the matching
-#     `databasePasswordFile` here drives `LoadCredential=` ingestion +
-#     percent-encoded URL composition in the ExecStart wrapper.
+#     password is set by `blockscout-postgresql` during the
+#     `postgresql-setup.service` one-shot unit (it appends `ALTER
+#     ROLE … WITH PASSWORD …` to
+#     `systemd.services.postgresql-setup.script`, NOT to
+#     `postgresql.service.postStart` — nixpkgs creates the role
+#     inside the setup unit, so that's where the password change has
+#     to land), and the matching `databasePasswordFile` here drives
+#     `LoadCredential=` ingestion + percent-encoded URL composition in
+#     the ExecStart wrapper.
 #     UNIX-socket connections were attempted in earlier drafts but
 #     are NOT supported: Blockscout's
 #     `Explorer.Repo.ConfigHelper.extract_parameters/1` requires a
@@ -89,14 +94,17 @@ let
   # predicates rather than hard-coding it.
   #
   # `localhost` covers IPv4 and IPv6 loopback via /etc/hosts;
-  # `127.0.0.1` and `::1` are the literal loopback addresses. The DNS
-  # regex on `databaseHost` / `redisHost` doesn't accept anything else
-  # loopback-equivalent (e.g. `0.0.0.0`-bound listeners are rejected),
-  # so this set is exhaustive against the option type.
+  # `127.0.0.1` is the IPv4 literal. The host regex on
+  # `databaseHost` / `redisHost` is `^[a-zA-Z0-9.-]+$` — it forbids
+  # the `:` character so IPv6 literals such as `::1` cannot be
+  # configured against this option type, and including them in this
+  # set would be unreachable defensive code. Widening the regex to
+  # accept `[`/`]`-bracketed IPv6 literals would also require
+  # changing the DATABASE_URL composition path; leave that for a
+  # later IPv6-support pass if a real deployment needs it.
   loopbackHosts = [
     "localhost"
     "127.0.0.1"
-    "::1"
   ];
   postgresLocal = lib.elem cfg.databaseHost loopbackHosts;
   redisLocal = lib.elem cfg.redisHost loopbackHosts;
@@ -457,14 +465,22 @@ in
 
     redisHost = mkOption {
       type = types.str;
-      default = "localhost";
+      default = "127.0.0.1";
       description = ''
         Hostname (or IP) the backend connects to for Redis. Defaults
-        to `localhost`, matching the `blockscout-redis` wrapper's
-        `bind = "127.0.0.1"` default. Blockscout's Redix client
-        rejects `unix://` URIs (only accepts `redis://`, `valkey://`,
-        `rediss://`), so TCP is the only supported transport. Set
-        this to a remote hostname only if running an external Redis.
+        to the IPv4 literal `127.0.0.1` to match exactly what
+        `services.blockscout-redis.bind` resolves to (the wrapper
+        binds IPv4 loopback only). Using the literal address rather
+        than the `localhost` name avoids a class of failures where
+        glibc / nss-resolve returns the IPv6 `::1` address first on
+        dual-stack systems — Redis isn't listening there, so the
+        connect would fail until glibc retried the IPv4 fallback
+        (and on systems that don't retry, it would never succeed).
+
+        Blockscout's Redix client rejects `unix://` URIs (only
+        accepts `redis://`, `valkey://`, `rediss://`), so TCP is the
+        only supported transport. Override to a remote hostname only
+        if pointing at an external Redis.
       '';
     };
 
@@ -582,12 +598,18 @@ in
       type = types.bool;
       default = true;
       description = ''
-        Run `Explorer.Release.migrate()` in the ExecStart wrapper
-        before starting the server. Idempotent — running against an
-        already-migrated database is a no-op. Disable only if
-        migrations are orchestrated externally (e.g. a separate admin
-        tool) or if the migration step needs different error
+        Run `Explorer.ReleaseTasks.migrate([])` in the ExecStart
+        wrapper before starting the server. Idempotent — running
+        against an already-migrated database is a no-op. Disable only
+        if migrations are orchestrated externally (e.g. a separate
+        admin tool) or if the migration step needs different error
         handling than "fail the whole unit on migration error".
+
+        Note: older Blockscout docs / issues sometimes refer to
+        `Explorer.Release.migrate()` (no `-Tasks` suffix). That's a
+        different module from a different era; this fork's release
+        helper is `Explorer.ReleaseTasks.migrate/1` at
+        `apps/explorer/lib/release_tasks.ex`.
       '';
     };
 
@@ -757,14 +779,18 @@ in
       # embedding. ACCOUNT_DATABASE_URL likewise.
       environment = {
         ACCOUNT_REDIS_URL = "redis://${cfg.redisHost}:${toString cfg.redisPort}";
-        # ECTO_USE_SSL is checked by Blockscout's runtime.exs / config_helper
-        # and defaults to "true" — but our local postgres
+        # ECTO_USE_SSL is checked by Blockscout's runtime.exs /
+        # config_helper and defaults to "true". Our local postgres
         # (`blockscout-postgresql` wrapper) doesn't ship SSL certs and
-        # listens plaintext on localhost only. Forcing this off for
-        # the loopback connection avoids `Postgrex.Error: ssl not
-        # available` at startup. Operators connecting to an external
-        # SSL-enabled Postgres can override via `extraEnv`.
-        ECTO_USE_SSL = "false";
+        # listens plaintext on loopback only, so SSL must be off for
+        # local-loopback configs to avoid `Postgrex.Error: ssl not
+        # available` at startup. Remote Postgres deployments very
+        # commonly DO require SSL (cloud-managed RDS / Cloud SQL /
+        # Aurora all reject plaintext by default), so for non-loopback
+        # `databaseHost` we leave SSL on by default — gating on the
+        # same `postgresLocal` predicate that drives unit ordering.
+        # Either side of the predicate is overridable via `extraEnv`.
+        ECTO_USE_SSL = if postgresLocal then "false" else "true";
         ETHEREUM_JSONRPC_VARIANT = "geth";
         ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
         ETHEREUM_JSONRPC_WS_URL = cfg.ethereumRpc.wsUrl;
