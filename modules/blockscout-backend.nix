@@ -183,8 +183,20 @@ let
       while [ $i -lt $len ]; do
         c=''${db_password_raw:$i:1}
         case "$c" in
+          # RFC 3986 unreserved characters pass through verbatim.
           [a-zA-Z0-9._~-]) out="$out$c" ;;
-          *) out="$out$(printf '%%%02X' "'$c")" ;;
+          # Everything else is percent-encoded byte-by-byte. Use
+          # `od -An -tx1` to get the literal byte hex — bash's
+          # `printf '%X' "'$c"` (the character-constant trick) is
+          # broken for several characters: a single quote (`'`)
+          # collapses the surrounding quotes and yields 0; some
+          # multi-byte sequences also misbehave. `od` operates on the
+          # actual bytes the variable substitution produced and works
+          # uniformly for every byte from 0x00 to 0xFF.
+          *)
+            hex=$(printf '%s' "$c" | od -An -tx1 | tr -d ' \n')
+            out="$out%$hex"
+            ;;
         esac
         i=$((i + 1))
       done
@@ -402,13 +414,21 @@ in
       type = types.str;
       example = "/run/secrets/blockscout/db_password";
       description = ''
+        REQUIRED whenever `services.blockscout-backend.enable = true`.
         Absolute path to a file containing the password for the
-        `databaseUser` PostgreSQL role. Ingested via
-        `LoadCredential=DATABASE_PASSWORD:<path>`; the ExecStart
-        wrapper reads the value, percent-encodes it for safe URL
-        embedding, and assembles `DATABASE_URL` at exec time. The
-        password value never appears in the systemd unit file or the
-        Nix store.
+        `databaseUser` PostgreSQL role. The option is `types.str`
+        with no default — module evaluation fails fast if the
+        operator forgets to set it. Same shape and rationale as
+        `services.blockscout-postgresql.passwordFile` on the
+        wrapping module: there's no coherent passwordless mode for
+        Blockscout's TCP-Postgrex client, so making the option
+        optional would just produce an unsupported half-state.
+
+        Ingested via `LoadCredential=DATABASE_PASSWORD:<path>`; the
+        ExecStart wrapper reads the value, percent-encodes it for
+        safe URL embedding, and assembles `DATABASE_URL` at exec
+        time. The password value never appears in the systemd unit
+        file or the Nix store.
 
         The matching `services.blockscout-postgresql.passwordFile`
         should point at the SAME file so the role's password (set
