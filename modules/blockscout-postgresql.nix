@@ -160,11 +160,19 @@ in
         loopback with the matching password (the backend module's
         `databasePasswordFile` should point at the same file).
 
-        MUST be an absolute path NOT under `/nix/store/` — the file's
-        contents land in postgres's role table (write path runs as the
-        `postgres` system user reading the path), but the source path
-        itself must stay out of the world-readable Nix store. Enforced
-        via `config.assertions` at option-set time.
+        MUST be an absolute path whose literal prefix is NOT
+        `/nix/store/`. The check is a literal-prefix comparison at
+        option-set time — it catches Nix-path literals like
+        `./secret` (which would auto-copy into the store) and any
+        hand-written `/nix/store/...` paths. It does NOT enforce a
+        strict "bytes are off-store" guarantee: a path under `/etc/`
+        materialised via `environment.etc` resolves to a symlink
+        whose target is in the store and still passes the check.
+        Operators sourcing from sops-nix / agenix into a tmpfs path
+        (`/run/secrets/...`) get the full off-store guarantee;
+        `environment.etc`-based fixtures (the integration test)
+        accept the symlink-resolved store residency as a determinism
+        trade-off.
 
         Real deployments source this from sops-nix / agenix into a
         tmpfs path (`/run/secrets/...`) decrypted at activation. For
@@ -200,7 +208,7 @@ in
     assertions = [
       {
         assertion = lib.hasPrefix "/" cfg.passwordFile && !lib.hasPrefix "/nix/store/" cfg.passwordFile;
-        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` realised via `environment.etc` symlink into the store still pass; the assertion catches the obvious mistakes (Nix-path literals, hand-written `/nix/store/...` paths) but does not enforce a strict bytes-off-store guarantee. Operators sourcing from sops-nix / agenix into a tmpfs path get the full off-store guarantee.)";
       }
     ];
 

@@ -259,7 +259,7 @@ let
       # not what this fork ships.
       ${cfg.package}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
     ''}
-    ${optionalString (cfg.extraPostMigrate != "") ''
+    ${optionalString (cfg.extraPostMigrate != "" || cfg.extraPostMigrateFile != null) ''
       # Operator-supplied post-migration SQL. Runs after
       # `Explorer.ReleaseTasks.migrate([])` (so any tables / columns
       # the SQL touches must already exist by then), and BEFORE
@@ -275,7 +275,16 @@ let
       # wrapper's secret-handling contract). Re-read from
       # $CREDENTIALS_DIRECTORY because $db_password_raw was unset
       # above to limit the in-memory exposure window.
-      echo "blockscout-backend: applying services.blockscout-backend.extraPostMigrate SQL" >&2
+      #
+      # The SQL file path comes either from `pkgs.writeText` (if
+      # `extraPostMigrate` is set — the SQL is then store-resident
+      # and world-readable, suitable only for non-secret SQL) or
+      # from `$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL`
+      # populated by `LoadCredential=` (if `extraPostMigrateFile` is
+      # set — the source path stays off-store and the file is
+      # readable only by the unit's user). Mutually exclusive at
+      # `config.assertions` time.
+      echo "blockscout-backend: applying services.blockscout-backend.extraPostMigrate{,File} SQL" >&2
       PGPASSWORD="$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")" \
         ${pkgs.postgresql}/bin/psql \
         --host="${cfg.databaseHost}" \
@@ -284,7 +293,12 @@ let
         --dbname="${cfg.databaseName}" \
         --no-psqlrc \
         -v ON_ERROR_STOP=1 \
-        -f ${pkgs.writeText "blockscout-extra-post-migrate.sql" cfg.extraPostMigrate}
+        -f ${
+          if cfg.extraPostMigrate != "" then
+            "${pkgs.writeText "blockscout-extra-post-migrate.sql" cfg.extraPostMigrate}"
+          else
+            ''"$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL"''
+        }
     ''}
     exec ${cfg.package}/bin/blockscout start
   '';
@@ -669,13 +683,20 @@ in
           to short-circuit one such broken migrator without altering
           production-deployment defaults).
 
+        WARNING: this string is rendered into `pkgs.writeText` →
+        a world-readable file in `/nix/store/`. **MUST NOT contain
+        sensitive values** — passwords, API keys, anything an
+        attacker reading the store could exploit. For SQL that has
+        to carry secrets, use `extraPostMigrateFile` instead, which
+        ingests via `LoadCredential=` from an off-store path.
+
         WARNING: SQL run here can silently bypass data-fix
         migrations. The wrapper's ExecStart logs a stderr line
         (`blockscout-backend: applying
-        services.blockscout-backend.extraPostMigrate SQL`) every
-        time the block fires so the bypass is visible in journalctl.
-        Restrict to known-and-named migrations, document each
-        statement's reason in the value, and revisit on every
+        services.blockscout-backend.extraPostMigrate{,File} SQL`)
+        every time the block fires so the bypass is visible in
+        journalctl. Restrict to known-and-named migrations, document
+        each statement's reason in the value, and revisit on every
         Blockscout version bump — once the upstream bug is fixed,
         leaving the row pinned at "completed" forever permanently
         skips the real migration once Blockscout adds a working one.
@@ -684,6 +705,46 @@ in
         `databaseUser`, `databaseName`, and the value at
         `databasePasswordFile` (read via the same `LoadCredential=
         DATABASE_PASSWORD` ingestion the runtime URL uses).
+
+        Mutually exclusive with `extraPostMigrateFile` — set one or
+        the other, not both. Asserted at option-set time.
+      '';
+    };
+
+    extraPostMigrateFile = mkOption {
+      # Same Nix-store-leak rationale as `secretKeyBaseFile` and
+      # friends: `types.str` (not `types.path`) so a Nix-path literal
+      # like `./post-migrate.sql` doesn't auto-copy into the store.
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/blockscout/post_migrate.sql";
+      description = ''
+        Off-store alternative to `extraPostMigrate`. Absolute path
+        to a file containing post-migration SQL; ingested via systemd
+        `LoadCredential=EXTRA_POST_MIGRATE_SQL=<path>` and read by
+        the ExecStart wrapper from
+        `$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL`. The source
+        path stays out of `/nix/store/`, and the credential file is
+        readable only by the unit's user (default systemd
+        permissions on `$CREDENTIALS_DIRECTORY`).
+
+        Use this when the SQL must contain sensitive values
+        (e.g. seeding an admin row with a token); for non-secret
+        SQL `extraPostMigrate` is simpler. Mutually exclusive with
+        `extraPostMigrate` — set one or the other, not both.
+        Asserted at option-set time.
+
+        MUST be an absolute path NOT under `/nix/store/` (when
+        non-null) — same secrets contract as the other path-based
+        options. Note the limitation: the assertion checks the
+        literal path prefix at evaluation time, so a
+        `/etc/`-mounted path that resolves via symlink into
+        `/nix/store/` (as `environment.etc` does) passes the check
+        even though its bytes ARE in the store. Operators sourcing
+        from sops-nix / agenix into a tmpfs path get the full
+        guarantee; the integration-test fixture uses
+        `environment.etc` and accepts the symlink-resolved store
+        residency as a determinism trade-off.
       '';
     };
 
@@ -776,12 +837,21 @@ in
     #      $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe chars
     #      would leak into those paths.
     #   2. Every secret path option (secretKeyBaseFile and each
-    #      secretEnvFiles.<name>.path) is absolute and NOT under
-    #      /nix/store/. The store is world-readable; letting a secret
-    #      path resolve there (e.g. via a Nix-path literal like
-    #      `./secret`) would silently defeat this module's secrets
-    #      contract. Assertions give a clearer error than a type check
-    #      because the message can name the exact offending option.
+    #      secretEnvFiles.<name>.path) is absolute and has a literal
+    #      prefix that is NOT `/nix/store/`. NOTE: this is a
+    #      LITERAL-PREFIX check at evaluation time. A path like
+    #      `/etc/test-secrets/skb`, which `environment.etc` realises
+    #      via a symlink whose TARGET is in `/nix/store/`, passes the
+    #      check even though the bytes do live in the store. The
+    #      assertion's intent is to catch the obvious mistakes (a
+    #      Nix-path literal like `./secret` that auto-copies to the
+    #      store, or a hand-written `/nix/store/...` path), not to
+    #      enforce a strict "bytes are off-store" guarantee. Operators
+    #      sourcing from sops-nix / agenix into a tmpfs (`/run/...`)
+    #      get the full off-store guarantee — `environment.etc`-based
+    #      fixtures (the integration test) accept the symlink-resolved
+    #      store residency as a determinism trade-off.
+    #   3. extraPostMigrate vs extraPostMigrateFile: at most one set.
     assertions =
       (mapAttrsToList (name: _: {
         assertion = builtins.match envVarNameRegex name != null;
@@ -791,23 +861,35 @@ in
         {
           assertion =
             lib.hasPrefix "/" cfg.secretKeyBaseFile && !lib.hasPrefix "/nix/store/" cfg.secretKeyBaseFile;
-          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` that resolve via symlink into the store still pass; see the option's docstring.)";
         }
         {
           assertion =
             lib.hasPrefix "/" cfg.databasePasswordFile && !lib.hasPrefix "/nix/store/" cfg.databasePasswordFile;
-          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path NOT under /nix/store/. Same Nix-store-leak rationale as secretKeyBaseFile.";
+          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
         }
         {
           assertion =
             cfg.cookieFile == null
             || (lib.hasPrefix "/" cfg.cookieFile && !lib.hasPrefix "/nix/store/" cfg.cookieFile);
-          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path NOT under /nix/store/. Same Nix-store-leak rationale as secretKeyBaseFile.";
+          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        }
+        {
+          assertion =
+            cfg.extraPostMigrateFile == null
+            || (
+              lib.hasPrefix "/" cfg.extraPostMigrateFile && !lib.hasPrefix "/nix/store/" cfg.extraPostMigrateFile
+            );
+          message = "services.blockscout-backend.extraPostMigrateFile (`${toString cfg.extraPostMigrateFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        }
+        {
+          assertion = !(cfg.extraPostMigrate != "" && cfg.extraPostMigrateFile != null);
+          message = "services.blockscout-backend.extraPostMigrate and services.blockscout-backend.extraPostMigrateFile are mutually exclusive. Set one or the other, not both.";
         }
       ]
       ++ mapAttrsToList (name: entry: {
         assertion = lib.hasPrefix "/" entry.path && !lib.hasPrefix "/nix/store/" entry.path;
-        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
       }) cfg.secretEnvFiles;
 
     # No `services.postgresql.authentication` injection: connection
@@ -939,6 +1021,7 @@ in
           "DATABASE_PASSWORD:${cfg.databasePasswordFile}"
         ]
         ++ optional (cfg.cookieFile != null) "RELEASE_COOKIE:${cfg.cookieFile}"
+        ++ optional (cfg.extraPostMigrateFile != null) "EXTRA_POST_MIGRATE_SQL:${cfg.extraPostMigrateFile}"
         ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;
 
         # BEAM JIT needs writable + executable memory pages — opt out
