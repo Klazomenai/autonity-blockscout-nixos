@@ -32,10 +32,24 @@
 #     several places (CapabilityBoundingSet shape, SystemCallFilter
 #     style, AF_NETLINK presence). The check enforces the *shipped*
 #     values; nixpkgs' upstream choices are nixpkgs' problem.
-#   - The check covers `serviceConfig` keys only. ExecStart paths,
-#     Environment values, LoadCredential entries, etc. are validated
-#     by the per-module assertions (option-set time) and by the
-#     full-stack VM test (upcoming).
+#   - The expected-shape table covers SECURITY-RELEVANT
+#     `serviceConfig` keys: defense-in-depth flags
+#     (CapabilityBoundingSet, ProtectSystem, RestrictAddressFamilies,
+#     SystemCallFilter, …), DynamicUser, MemoryDenyWriteExecute, etc.
+#     Application-level `serviceConfig` keys that don't have a
+#     security shape — `ExecStart`, `WorkingDirectory`, `Restart`,
+#     `RestartSec`, `LoadCredential`, `StateDirectory`,
+#     `RuntimeDirectory`, `*Mode`, `Environment` (or any non-merged
+#     systemd directive that's just operational config) — are
+#     deliberately NOT in the expected table. Those are validated by
+#     the per-module `config.assertions` (option-set time) and by
+#     the full-stack VM integration test (behavioural validation).
+#     Adding them here would muddle the spike's purpose: it's a
+#     hardening-shape guard, not a "every key on the unit must be
+#     enumerated" structural check. (See the missing-key validation
+#     in `diffUnit`: it only fails when an EXPECTED key is missing,
+#     never when an UNEXPECTED key is present, so non-listed keys
+#     pass through silently — by design.)
 {
   pkgs,
   nixpkgs,
@@ -77,11 +91,15 @@ let
         # opportunistically on nixpkgs major bumps to match.
         system.stateVersion = "24.05";
         services.autonity.enable = true;
-        services.blockscout-postgresql.enable = true;
+        services.blockscout-postgresql = {
+          enable = true;
+          passwordFile = "/run/secrets/db_password";
+        };
         services.blockscout-redis.enable = true;
         services.blockscout-backend = {
           enable = true;
           secretKeyBaseFile = "/run/secrets/skb";
+          databasePasswordFile = "/run/secrets/db_password";
         };
         services.blockscout-frontend.enable = true;
         services.blockscout-nginx = {
@@ -220,11 +238,14 @@ let
       UMask = "0077";
     };
 
-    # Blockscout backend — Elixir/BEAM JIT (MDWX off), depends on
-    # cross-service UNIX sockets via SupplementaryGroups so PrivateUsers
-    # MUST be false (host GID remapping inside a user namespace would
-    # break socket access). No AF_NETLINK (backend doesn't enumerate
-    # interfaces).
+    # Blockscout backend — Elixir/BEAM JIT (MDWX off). Talks to
+    # PostgreSQL and Redis over TCP-localhost (no UNIX sockets, so
+    # no SupplementaryGroups) — earlier drafts pinned PrivateUsers
+    # to false because socket access required host GIDs, but with
+    # both data-plane services on TCP the constraint goes away.
+    # PrivateUsers is now left at the systemd default (false)
+    # rather than set explicitly, so it isn't in the expected slice.
+    # No AF_NETLINK (backend doesn't enumerate interfaces).
     blockscout-backend = {
       CapabilityBoundingSet = [ "" ];
       DynamicUser = true;
@@ -234,7 +255,6 @@ let
       PrivateDevices = true;
       PrivateMounts = true;
       PrivateTmp = true;
-      PrivateUsers = false;
       ProcSubset = "pid";
       ProtectClock = true;
       ProtectControlGroups = true;

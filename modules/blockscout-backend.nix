@@ -4,23 +4,41 @@
 # blockscout-redis.nix finally comes together.
 #
 # Cross-service contract:
-#   - PostgreSQL (default: local UNIX socket): connects via
-#     /run/postgresql/.s.PGSQL.5432, joining the `postgres` group via
-#     SupplementaryGroups for socket filesystem access. Authentication:
-#     local `trust` scoped to the specific role+database via
-#     services.postgresql.authentication (mkBefore) — socket access is
-#     the auth boundary on a single-machine deployment; see the
-#     `databaseAuthRationale` comment below.
-#     If `databaseHost` is set to a TCP hostname, the module detects
-#     this (no leading `/`) and skips ALL local-PG assumptions: no
-#     `postgresql.service` dependency, no `postgres` SupplementaryGroup,
-#     no pg_hba.conf injection. `configurePostgresAuth` lets operators
-#     override the pg_hba-injection heuristic when the deployment shape
-#     is unusual.
-#   - Redis: connects via UNIX socket /run/redis-<name>/redis.sock
-#     (joining the `redis-<name>` group via SupplementaryGroups). Redis
-#     has no authentication configured; socket access is the auth
-#     boundary.
+#   - PostgreSQL: TCP-localhost connection on `databaseHost:databasePort`
+#     (default `localhost:5432`, matching the `blockscout-postgresql`
+#     wrapper's `listen_addresses = "localhost"` default). Auth is
+#     password-based via the standard nixpkgs pg_hba.conf
+#     `host all all 127.0.0.1/32 scram-sha-256` rule; the role's
+#     password is set by `blockscout-postgresql` during the
+#     `postgresql-setup.service` one-shot unit (it appends `ALTER
+#     ROLE … WITH PASSWORD …` to
+#     `systemd.services.postgresql-setup.script`, NOT to
+#     `postgresql.service.postStart` — nixpkgs creates the role
+#     inside the setup unit, so that's where the password change has
+#     to land), and the matching `databasePasswordFile` here drives
+#     `LoadCredential=` ingestion + percent-encoded URL composition in
+#     the ExecStart wrapper.
+#     UNIX-socket connections were attempted in earlier drafts but
+#     are NOT supported: Blockscout's
+#     `Explorer.Repo.ConfigHelper.extract_parameters/1` requires a
+#     `user:pass@host:port/db` URL form and Postgrex parses URL
+#     host/port for the actual TCP connect, ignoring libpq's
+#     `?host=` query parameter for socket overrides.
+#   - Redis: TCP-localhost connection on `redisHost:redisPort`
+#     (default `127.0.0.1:6379`, matching the `blockscout-redis`
+#     wrapper's `bind = "127.0.0.1"` default byte-for-byte). The
+#     IPv4 literal is preferred over the `localhost` name because
+#     the wrapper binds IPv4 loopback only, and dual-stack glibc /
+#     nss-resolve setups can return `::1` first for `localhost`.
+#     Blockscout's Redix
+#     client uses `Redix.URI.to_start_options/1` which only accepts
+#     `redis://`, `valkey://`, and `rediss://` URL schemes — UNIX
+#     sockets via `unix:///path` URIs are rejected at startup with
+#     `ArgumentError`, the same shape as the Postgrex limitation
+#     above (and an earlier draft of this module attempted UNIX
+#     sockets here too before that fact surfaced). No authentication
+#     is configured on the loopback Redis instance; loopback binding
+#     is the auth boundary.
 #   - Autonity: connects via loopback TCP to 127.0.0.1:8545 (http),
 #     8546 (ws); the Autonity module binds loopback-only on those
 #     ports by default.
@@ -70,24 +88,30 @@ let
   # gives a clearer error message pointing at the exact offending key.
   envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
 
-  # Derived fact: whether `databaseHost` points at a UNIX socket
-  # directory (absolute path starting with `/`). Used as the single
-  # source of truth for "is the PostgreSQL we talk to running locally
-  # and reachable by socket?" — gates four places consistently:
-  #   1. `services.postgresql.authentication` pg_hba injection
-  #      (operator can still override via `configurePostgresAuth`)
-  #   2. `systemd.services.blockscout-backend.after` dependency on
-  #      `postgresql.service`
-  #   3. …`requires` on `postgresql.service`
-  #   4. `SupplementaryGroups = [ "postgres" ]` — only needed for
-  #      UNIX-socket filesystem access; harmless for TCP but
-  #      references a group that doesn't exist without local PG
+  # Loopback-host predicates. When `databaseHost` / `redisHost` point
+  # at a loopback name, the corresponding upstream data-plane unit
+  # lives on this same host and the backend SHOULD `Requires=`/
+  # `After=` it. When they point at a remote hostname there is no
+  # local unit for systemd to order against, and an unconditional
+  # ordering would fail unit start the moment the operator disables
+  # the local wrapper. So we gate the unit ordering on these
+  # predicates rather than hard-coding it.
   #
-  # TCP hosts (remote PG) → all four are skipped, so the module can
-  # be pointed at a remote PostgreSQL without dragging in a local
-  # `postgresql.service` dependency or a non-existent `postgres`
-  # group.
-  postgresLocal = lib.hasPrefix "/" cfg.databaseHost;
+  # `localhost` covers IPv4 and IPv6 loopback via /etc/hosts;
+  # `127.0.0.1` is the IPv4 literal. The host regex on
+  # `databaseHost` / `redisHost` is `^[a-zA-Z0-9.-]+$` — it forbids
+  # the `:` character so IPv6 literals such as `::1` cannot be
+  # configured against this option type, and including them in this
+  # set would be unreachable defensive code. Widening the regex to
+  # accept `[`/`]`-bracketed IPv6 literals would also require
+  # changing the DATABASE_URL composition path; leave that for a
+  # later IPv6-support pass if a real deployment needs it.
+  loopbackHosts = [
+    "localhost"
+    "127.0.0.1"
+  ];
+  postgresLocal = lib.elem cfg.databaseHost loopbackHosts;
+  redisLocal = lib.elem cfg.redisHost loopbackHosts;
 
   # Bash wrapper that exports each LoadCredential-sourced secret into
   # the process environment, optionally runs the migration, then execs
@@ -104,6 +128,29 @@ let
   startScript = pkgs.writeShellScript "blockscout-start" ''
     set -eu
 
+    # Defence-in-depth: anchor CWD at the release root before any
+    # work. systemd's `WorkingDirectory=` directive on the unit is
+    # the canonical mechanism (and is set in serviceConfig below),
+    # but adding the cd here too guards against any intermediate
+    # process layer that might silently override CWD. Required
+    # because `config/runtime.exs` line 1732 uses CWD-relative
+    # `Code.require_file` to load `config/runtime/<env>.exs` —
+    # crashes the release at Config.Reader stage if CWD isn't the
+    # release root.
+    cd "${cfg.package}"
+
+    # HOME points at the StateDirectory. BEAM's `Mix.start/2` calls
+    # `Mix.Local.append_archives/0` → `Mix.path_for(:archives)` →
+    # `Path.expand("~/.mix/...")` → `System.user_home!/0`. With
+    # `DynamicUser=true` + `ProtectHome=true`, the dynamic user has
+    # no /home/<user> entry and System.user_home!/0 raises
+    # `RuntimeError: could not find the user home`. The
+    # StateDirectory ($STATE_DIRECTORY = /var/lib/private/<name>
+    # under DynamicUser) is writable by the unit's user and
+    # persisted across restarts, so it's the right HOME for
+    # Mix.Local's archive directory.
+    export HOME="$STATE_DIRECTORY"
+
     # $(cat …) captures the credential file's bytes verbatim. Bash
     # variable assignment does not re-expand `$` / backticks in the
     # value, so secrets containing shell metacharacters are preserved
@@ -111,11 +158,147 @@ let
     # value with no trailing content beyond an optional final newline
     # (bash command substitution strips trailing newlines).
     export SECRET_KEY_BASE="$(cat "$CREDENTIALS_DIRECTORY/SECRET_KEY_BASE")"
+
+    # DATABASE_URL composition with URL-encoded password. The
+    # password is read from $CREDENTIALS_DIRECTORY (populated by
+    # LoadCredential=DATABASE_PASSWORD via cfg.databasePasswordFile),
+    # then percent-encoded byte-by-byte so that any of `: @ / ? # %`
+    # in the password value doesn't break the URL parser. Composed
+    # at exec time (not via systemd's Environment= directives) so the
+    # password value never lands in the unit file or Nix store —
+    # same secret-handling contract as SECRET_KEY_BASE above.
+    #
+    # Blockscout's Ecto layer (`Explorer.Repo.ConfigHelper.
+    # extract_parameters/1`) requires URL form
+    # `user:pass@host:port/db` and parses `host:port` for the actual
+    # TCP connect — libpq's `?host=` query parameter for UNIX-socket
+    # overrides is NOT honoured. So `databaseHost` is always treated
+    # as a TCP host (loopback or remote), never as a socket path.
+    db_password_raw=$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")
+    db_password_enc=$(
+      LC_ALL=C
+      out=""
+      i=0
+      len=''${#db_password_raw}
+      while [ $i -lt $len ]; do
+        c=''${db_password_raw:$i:1}
+        case "$c" in
+          # RFC 3986 unreserved characters pass through verbatim.
+          [a-zA-Z0-9._~-]) out="$out$c" ;;
+          # Everything else is percent-encoded byte-by-byte. Use
+          # `od -An -tx1` to get the literal byte hex — bash's
+          # `printf '%X' "'$c"` (the character-constant trick) is
+          # broken for several characters: a single quote (`'`)
+          # collapses the surrounding quotes and yields 0; some
+          # multi-byte sequences also misbehave. `od` operates on the
+          # actual bytes the variable substitution produced and works
+          # uniformly for every byte from 0x00 to 0xFF.
+          *)
+            hex=$(printf '%s' "$c" | od -An -tx1 | tr -d ' \n')
+            out="$out%$hex"
+            ;;
+        esac
+        i=$((i + 1))
+      done
+      printf '%s' "$out"
+    )
+    export DATABASE_URL="postgres://${cfg.databaseUser}:''${db_password_enc}@${cfg.databaseHost}:${toString cfg.databasePort}/${cfg.databaseName}"
+    export ACCOUNT_DATABASE_URL="$DATABASE_URL"
+    unset db_password_raw db_password_enc
+
+    # RELEASE_COOKIE precedence (highest → lowest):
+    #   1. `cookieFile` (operator-supplied, non-null) — systemd
+    #      ingested it into $CREDENTIALS_DIRECTORY/RELEASE_COOKIE via
+    #      LoadCredential=. Always wins, even if `extraEnv` also sets
+    #      RELEASE_COOKIE; the file is the more deliberate of the two
+    #      paths and `cookieFile` is documented as authoritative.
+    #   2. Operator-supplied via `extraEnv.RELEASE_COOKIE` (or any
+    #      other path that reaches systemd `Environment=`). Honoured
+    #      via the `[ -z "''${RELEASE_COOKIE:-}" ]` check below — we
+    #      only generate a value when nothing is in the env yet. This
+    #      preserves the module-wide rule that `extraEnv` is the
+    #      operator's escape hatch.
+    #   3. Random per-restart fallback via `openssl rand -hex 24`.
+    #      Fine for single-node deployments where no external Erlang
+    #      node ever connects — for clustering the operator MUST
+    #      supply `cookieFile` (or set `extraEnv.RELEASE_COOKIE`) so
+    #      all nodes agree.
+    #
+    # `-hex 24` (48 hex chars) chosen over `-base64 24` because the
+    # base64 alphabet includes `+`, `/`, and `=` which can interact
+    # poorly with the elixir release wrapper's argument-quoting
+    # under specific systemd-environment conditions: an earlier
+    # base64 cookie would reach `beam.smp` with the leading `-` of
+    # `-setcookie` somehow dropped, leaving the cookie value as a
+    # positional flag (`unknown flag -<base64-value>` panic). Hex
+    # encoding sidesteps that entirely — `[0-9a-f]` survives any
+    # shell / wrapper arg-parsing path.
+    ${
+      if cfg.cookieFile != null then
+        ''export RELEASE_COOKIE="$(cat "$CREDENTIALS_DIRECTORY/RELEASE_COOKIE")"''
+      else
+        ''
+          if [ -z "''${RELEASE_COOKIE:-}" ]; then
+            export RELEASE_COOKIE="$(${pkgs.openssl}/bin/openssl rand -hex 24)"
+          fi
+        ''
+    }
+
     ${concatMapStringsSep "\n    " (name: ''
       export ${name}="$(cat "$CREDENTIALS_DIRECTORY/${name}")"
     '') (lib.attrNames cfg.secretEnvFiles)}
     ${optionalString cfg.autoMigrate ''
-      ${cfg.package}/bin/blockscout eval 'Explorer.Release.migrate()'
+      # Module name is `Explorer.ReleaseTasks`, NOT `Explorer.Release`
+      # — the fork ships the standard upstream-Blockscout
+      # release-tasks helper at apps/explorer/lib/release_tasks.ex,
+      # which `defmodule`s as `Explorer.ReleaseTasks`. The function is
+      # `migrate/1` taking an unused `_argv` argument; `[]` is the
+      # canonical "no argv" placeholder. Older Blockscout docs/issues
+      # sometimes reference `Explorer.Release` (no -Tasks suffix);
+      # that's a different module name from a different era and is
+      # not what this fork ships.
+      ${cfg.package}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
+    ''}
+    ${optionalString (cfg.extraPostMigrate != "" || cfg.extraPostMigrateFile != null) ''
+      # Operator-supplied post-migration SQL. Runs after
+      # `Explorer.ReleaseTasks.migrate([])` (so any tables / columns
+      # the SQL touches must already exist by then), and BEFORE
+      # `${cfg.package}/bin/blockscout start` (so the BEAM supervisor
+      # tree sees the resulting state when it boots).
+      #
+      # Logged at unit start so operators can see in journalctl that
+      # a workaround / fixture was applied — bypassing migrations is
+      # too easy to silently sneak past a maintenance review
+      # otherwise.
+      #
+      # PGPASSWORD is exported via env (not argv — matches the
+      # wrapper's secret-handling contract). Re-read from
+      # $CREDENTIALS_DIRECTORY because $db_password_raw was unset
+      # above to limit the in-memory exposure window.
+      #
+      # The SQL file path comes either from `pkgs.writeText` (if
+      # `extraPostMigrate` is set — the SQL is then store-resident
+      # and world-readable, suitable only for non-secret SQL) or
+      # from `$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL`
+      # populated by `LoadCredential=` (if `extraPostMigrateFile` is
+      # set — the source path stays off-store and the file is
+      # readable only by the unit's user). Mutually exclusive at
+      # `config.assertions` time.
+      echo "blockscout-backend: applying services.blockscout-backend.extraPostMigrate{,File} SQL" >&2
+      PGPASSWORD="$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")" \
+        ${pkgs.postgresql}/bin/psql \
+        --host="${cfg.databaseHost}" \
+        --port="${toString cfg.databasePort}" \
+        --username="${cfg.databaseUser}" \
+        --dbname="${cfg.databaseName}" \
+        --no-psqlrc \
+        -v ON_ERROR_STOP=1 \
+        -f ${
+          if cfg.extraPostMigrate != "" then
+            "${pkgs.writeText "blockscout-extra-post-migrate.sql" cfg.extraPostMigrate}"
+          else
+            ''"$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL"''
+        }
     ''}
     exec ${cfg.package}/bin/blockscout start
   '';
@@ -153,36 +336,123 @@ in
       '';
     };
 
-    databaseHost = mkOption {
-      type = types.str;
-      default = "/run/postgresql";
+    cookieFile = mkOption {
+      # Same `types.str` rationale as `secretKeyBaseFile`.
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/blockscout/release_cookie";
       description = ''
-        PostgreSQL `host=` value for the libpq connection string.
-        Supports either:
+        Absolute path to a file containing the BEAM release cookie —
+        used as a shared-secret token authenticating distributed
+        Erlang nodes to each other. Ingested via systemd
+        `LoadCredential=RELEASE_COOKIE=<path>`; the ExecStart wrapper
+        reads from `$CREDENTIALS_DIRECTORY/RELEASE_COOKIE`, never
+        from this source path.
 
-        - an absolute path to a Unix-domain socket directory
-          containing `.s.PGSQL.<port>` (for example
-          `"/run/postgresql"`, the standard nixpkgs location used by
-          the `blockscout-postgresql` wrapper); or
-        - a TCP hostname or address (for example `"localhost"` or a
-          remote PostgreSQL host).
+        nixpkgs' `mixRelease` deliberately deletes `releases/COOKIE`
+        from the build output by default (`removeCookie = true`),
+        treating cookies as secret. The release startup wrapper
+        (`bin/.blockscout-wrapped`) falls back to
+        `cat releases/COOKIE` when `RELEASE_COOKIE` env is unset —
+        which produces a `cat: …/releases/COOKIE: No such file or
+        directory` error and a permanent restart loop. So the
+        operator (or this module) MUST provide `RELEASE_COOKIE`
+        somehow.
 
-        When this is a socket directory, the connection uses the local
-        PostgreSQL Unix socket, the systemd unit gains an `after` /
-        `requires` dependency on `postgresql.service`,
-        `SupplementaryGroups` includes `"postgres"` for socket access,
-        and `services.postgresql.authentication` gets a `local
-        <db> <user> trust` rule (gated on `configurePostgresAuth`).
+        When this option is `null` (default), the module generates a
+        random per-restart cookie inline in the ExecStart wrapper via
+        `openssl rand -hex 24` (48 hex characters). The cookie lives
+        only in the running BEAM process's environment — it is NOT
+        persisted anywhere on disk. A new value is rolled on every
+        restart of `blockscout-backend.service`; this is fine for
+        single-node deployments where no external Erlang node ever
+        connects to the BEAM distribution port.
 
-        When this is a TCP hostname/address, the connection uses TCP
-        and none of the local-PG assumptions apply: no local
-        `postgresql.service` dependency, no `postgres`
-        SupplementaryGroup, no pg_hba injection. The operator is
-        responsible for ensuring the target PostgreSQL is reachable
-        and configured to authenticate `${cfg.databaseUser}` on
-        `${cfg.databaseName}` however they prefer (password,
-        certificate, SCRAM, etc.) — see `secretEnvFiles` for wiring
-        a `PGPASSWORD` or similar.
+        Hex (not base64) is deliberate: an earlier draft used
+        `openssl rand -base64 24`, which produces values containing
+        `+` / `/` / `=`. Under specific systemd-environment / release-
+        wrapper argument-quoting paths, a leading `-` byte in the
+        cookie or the `=` padding byte caused `beam.smp` to mis-parse
+        `-setcookie <value>` and panic with `unknown flag …`. Hex
+        digits round-trip cleanly through every shell / wrapper layer.
+
+        For multi-node BEAM clustering, set `cookieFile` to a path
+        sourced from sops-nix / agenix, with the same value across
+        every node in the cluster.
+
+        MUST be an absolute path NOT under `/nix/store/` (when
+        non-null). Enforced via `config.assertions` at option-set
+        time, same as `secretKeyBaseFile`.
+      '';
+    };
+
+    databaseHost = mkOption {
+      # Hostname-or-IPv4 shape — Blockscout's Ecto layer requires a
+      # TCP-style URL `user:pass@host:port/db`, so this MUST resolve
+      # to a TCP target; UNIX-socket paths are not supported. Local
+      # postgres (the default `blockscout-postgresql` wrapper) listens
+      # on `localhost`. Remote postgres uses the operator's hostname
+      # or IP.
+      type = types.strMatching "^[a-zA-Z0-9.-]+$";
+      default = "localhost";
+      description = ''
+        TCP host for the PostgreSQL connection. The default
+        `"localhost"` matches what the `blockscout-postgresql`
+        wrapper listens on (`listen_addresses = "localhost"`).
+        Override when pointing at a remote database host.
+
+        UNIX-socket paths (e.g. `/run/postgresql`) are NOT supported.
+        Blockscout's `Explorer.Repo.ConfigHelper.extract_parameters/1`
+        parses the URL via a strict `user:pass@host:port/db` regex
+        and Postgrex resolves `host:port` for the actual TCP
+        connection without honouring libpq's `?host=` query parameter
+        for UNIX-socket overrides. The strMatching regex enforces
+        TCP-shape values at option-set time.
+      '';
+    };
+
+    databasePort = mkOption {
+      type = types.port;
+      default = 5432;
+      description = ''
+        TCP port for the PostgreSQL connection. Default matches
+        `services.blockscout-postgresql.port`'s default. Override
+        both sides if the wrapper's port is changed.
+      '';
+    };
+
+    databasePasswordFile = mkOption {
+      # types.str (not types.path) — same Nix-store-leak rationale as
+      # `secretKeyBaseFile`. Absolute-not-under-/nix/store/ enforced
+      # via `config.assertions`.
+      type = types.str;
+      example = "/run/secrets/blockscout/db_password";
+      description = ''
+        REQUIRED whenever `services.blockscout-backend.enable = true`.
+        Absolute path to a file containing the password for the
+        `databaseUser` PostgreSQL role. The option is `types.str`
+        with no default — module evaluation fails fast if the
+        operator forgets to set it. Same shape and rationale as
+        `services.blockscout-postgresql.passwordFile` on the
+        wrapping module: there's no coherent passwordless mode for
+        Blockscout's TCP-Postgrex client, so making the option
+        optional would just produce an unsupported half-state.
+
+        Ingested via `LoadCredential=DATABASE_PASSWORD:<path>`; the
+        ExecStart wrapper reads the value, percent-encodes it for
+        safe URL embedding, and assembles `DATABASE_URL` at exec
+        time. The password value never appears in the systemd unit
+        file or the Nix store.
+
+        The matching `services.blockscout-postgresql.passwordFile`
+        should point at the SAME file so the role's password (set
+        by the postgres wrapper's append to
+        `systemd.services.postgresql-setup.script`) and the backend's
+        connection password agree.
+
+        MUST be an absolute path NOT under `/nix/store/` — the
+        module's secrets contract is that values never appear in the
+        world-readable Nix store. Enforced via `config.assertions`.
       '';
     };
 
@@ -222,11 +492,48 @@ in
       default = "blockscout";
       description = ''
         Name of the `services.blockscout-redis.serverName` this
-        backend talks to. Drives both the group the backend joins via
-        `SupplementaryGroups = [ "redis-<name>" ]` and the socket
-        path it connects to (`/run/redis-<name>/redis.sock`). Must
-        match `services.blockscout-redis.serverName` (enforced on
-        both sides via the same `types.strMatching` regex).
+        backend talks to. Drives the systemd unit name
+        (`redis-<name>.service`) that the backend orders against.
+        Must match `services.blockscout-redis.serverName` (enforced
+        on both sides via the same `types.strMatching` regex).
+      '';
+    };
+
+    redisHost = mkOption {
+      # Same hostname-or-IPv4 regex shape as `databaseHost`. Both
+      # backends ultimately compose URLs (`redis://host:port`,
+      # `postgres://user:pass@host:port/db`) where `:` is a parser-
+      # significant separator, so accepting `:` in the host segment
+      # would conflict with bare-host URL parsing. IPv6-literal
+      # support is a future widening that would change both the
+      # regex AND the URL composition path on each side.
+      type = types.strMatching "^[a-zA-Z0-9.-]+$";
+      default = "127.0.0.1";
+      description = ''
+        Hostname (or IP) the backend connects to for Redis. Defaults
+        to the IPv4 literal `127.0.0.1` to match exactly what
+        `services.blockscout-redis.bind` resolves to (the wrapper
+        binds IPv4 loopback only). Using the literal address rather
+        than the `localhost` name avoids a class of failures where
+        glibc / nss-resolve returns the IPv6 `::1` address first on
+        dual-stack systems — Redis isn't listening there, so the
+        connect would fail until glibc retried the IPv4 fallback
+        (and on systems that don't retry, it would never succeed).
+
+        Blockscout's Redix client rejects `unix://` URIs (only
+        accepts `redis://`, `valkey://`, `rediss://`), so TCP is the
+        only supported transport. Override to a remote hostname only
+        if pointing at an external Redis.
+      '';
+    };
+
+    redisPort = mkOption {
+      type = types.port;
+      default = 6379;
+      description = ''
+        TCP port the backend uses to reach Redis. Defaults to 6379;
+        override here AND on `services.blockscout-redis.port` if
+        moved.
       '';
     };
 
@@ -334,39 +641,110 @@ in
       type = types.bool;
       default = true;
       description = ''
-        Run `Explorer.Release.migrate()` in the ExecStart wrapper
-        before starting the server. Idempotent — running against an
-        already-migrated database is a no-op. Disable only if
-        migrations are orchestrated externally (e.g. a separate admin
-        tool) or if the migration step needs different error
+        Run `Explorer.ReleaseTasks.migrate([])` in the ExecStart
+        wrapper before starting the server. Idempotent — running
+        against an already-migrated database is a no-op. Disable only
+        if migrations are orchestrated externally (e.g. a separate
+        admin tool) or if the migration step needs different error
         handling than "fail the whole unit on migration error".
+
+        Note: older Blockscout docs / issues sometimes refer to
+        `Explorer.Release.migrate()` (no `-Tasks` suffix). That's a
+        different module from a different era; this fork's release
+        helper is `Explorer.ReleaseTasks.migrate/1` at
+        `apps/explorer/lib/release_tasks.ex`.
       '';
     };
 
-    configurePostgresAuth = mkOption {
-      type = types.nullOr types.bool;
-      default = null;
+    extraPostMigrate = mkOption {
+      type = types.lines;
+      default = "";
+      example = lib.literalExpression ''
+        '''
+          INSERT INTO migrations_status
+            (migration_name, status, inserted_at, updated_at)
+          VALUES ('some_migration_name', 'completed', now(), now())
+          ON CONFLICT (migration_name)
+            DO UPDATE SET status = 'completed', updated_at = now();
+        '''
+      '';
       description = ''
-        Whether this module should prepend a
-        `local ${"\${databaseName}"} ${"\${databaseUser}"} trust` rule to
-        `services.postgresql.authentication`.
+        SQL block run by `psql` against the configured database
+        AFTER `Explorer.ReleaseTasks.migrate([])` (so any tables /
+        columns the SQL touches must exist by then) and BEFORE the
+        BEAM supervisor tree starts. Empty by default — operators
+        opt in explicitly.
 
-        - `null` (default): auto-detect from `databaseHost` — inject
-          the rule only when `databaseHost` is an absolute path (a
-          UNIX socket directory, which is where the rule applies).
-        - `true`: always inject (useful if the operator configures
-          PostgreSQL themselves but still wants this module's pg_hba
-          management).
-        - `false`: never inject — the operator will configure
-          `services.postgresql.authentication` themselves. Appropriate
-          when `databaseHost` is a TCP host (remote PostgreSQL) or
-          when the operator wants password auth instead of local
-          `trust`.
+        Use cases include (but are not limited to):
+        - Pre-seeding rows into `migrations_status` to skip a known-
+          broken upstream Blockscout filling-migration that would
+          otherwise crash-loop in the supervisor tree.
+        - Test-only fixtures (the integration check uses this option
+          to short-circuit one such broken migrator without altering
+          production-deployment defaults).
 
-        The auto-detect default avoids a historical bug where the
-        module unconditionally modified the local PostgreSQL's
-        pg_hba.conf even when `databaseHost` pointed at a TCP
-        hostname, weakening an unrelated local PG instance.
+        WARNING: this string is rendered into `pkgs.writeText` →
+        a world-readable file in `/nix/store/`. **MUST NOT contain
+        sensitive values** — passwords, API keys, anything an
+        attacker reading the store could exploit. For SQL that has
+        to carry secrets, use `extraPostMigrateFile` instead, which
+        ingests via `LoadCredential=` from an off-store path.
+
+        WARNING: SQL run here can silently bypass data-fix
+        migrations. The wrapper's ExecStart logs a stderr line
+        (`blockscout-backend: applying
+        services.blockscout-backend.extraPostMigrate{,File} SQL`)
+        every time the block fires so the bypass is visible in
+        journalctl. Restrict to known-and-named migrations, document
+        each statement's reason in the value, and revisit on every
+        Blockscout version bump — once the upstream bug is fixed,
+        leaving the row pinned at "completed" forever permanently
+        skips the real migration once Blockscout adds a working one.
+
+        Connection uses `databaseHost`, `databasePort`,
+        `databaseUser`, `databaseName`, and the value at
+        `databasePasswordFile` (read via the same `LoadCredential=
+        DATABASE_PASSWORD` ingestion the runtime URL uses).
+
+        Mutually exclusive with `extraPostMigrateFile` — set one or
+        the other, not both. Asserted at option-set time.
+      '';
+    };
+
+    extraPostMigrateFile = mkOption {
+      # Same Nix-store-leak rationale as `secretKeyBaseFile` and
+      # friends: `types.str` (not `types.path`) so a Nix-path literal
+      # like `./post-migrate.sql` doesn't auto-copy into the store.
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/blockscout/post_migrate.sql";
+      description = ''
+        Off-store alternative to `extraPostMigrate`. Absolute path
+        to a file containing post-migration SQL; ingested via systemd
+        `LoadCredential=EXTRA_POST_MIGRATE_SQL=<path>` and read by
+        the ExecStart wrapper from
+        `$CREDENTIALS_DIRECTORY/EXTRA_POST_MIGRATE_SQL`. The source
+        path stays out of `/nix/store/`, and the credential file is
+        readable only by the unit's user (default systemd
+        permissions on `$CREDENTIALS_DIRECTORY`).
+
+        Use this when the SQL must contain sensitive values
+        (e.g. seeding an admin row with a token); for non-secret
+        SQL `extraPostMigrate` is simpler. Mutually exclusive with
+        `extraPostMigrate` — set one or the other, not both.
+        Asserted at option-set time.
+
+        MUST be an absolute path NOT under `/nix/store/` (when
+        non-null) — same secrets contract as the other path-based
+        options. Note the limitation: the assertion checks the
+        literal path prefix at evaluation time, so a
+        `/etc/`-mounted path that resolves via symlink into
+        `/nix/store/` (as `environment.etc` does) passes the check
+        even though its bytes ARE in the store. Operators sourcing
+        from sops-nix / agenix into a tmpfs path get the full
+        guarantee; the integration-test fixture uses
+        `environment.etc` and accepts the symlink-resolved store
+        residency as a determinism trade-off.
       '';
     };
 
@@ -459,12 +837,21 @@ in
     #      $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe chars
     #      would leak into those paths.
     #   2. Every secret path option (secretKeyBaseFile and each
-    #      secretEnvFiles.<name>.path) is absolute and NOT under
-    #      /nix/store/. The store is world-readable; letting a secret
-    #      path resolve there (e.g. via a Nix-path literal like
-    #      `./secret`) would silently defeat this module's secrets
-    #      contract. Assertions give a clearer error than a type check
-    #      because the message can name the exact offending option.
+    #      secretEnvFiles.<name>.path) is absolute and has a literal
+    #      prefix that is NOT `/nix/store/`. NOTE: this is a
+    #      LITERAL-PREFIX check at evaluation time. A path like
+    #      `/etc/test-secrets/skb`, which `environment.etc` realises
+    #      via a symlink whose TARGET is in `/nix/store/`, passes the
+    #      check even though the bytes do live in the store. The
+    #      assertion's intent is to catch the obvious mistakes (a
+    #      Nix-path literal like `./secret` that auto-copies to the
+    #      store, or a hand-written `/nix/store/...` path), not to
+    #      enforce a strict "bytes are off-store" guarantee. Operators
+    #      sourcing from sops-nix / agenix into a tmpfs (`/run/...`)
+    #      get the full off-store guarantee — `environment.etc`-based
+    #      fixtures (the integration test) accept the symlink-resolved
+    #      store residency as a determinism trade-off.
+    #   3. extraPostMigrate vs extraPostMigrateFile: at most one set.
     assertions =
       (mapAttrsToList (name: _: {
         assertion = builtins.match envVarNameRegex name != null;
@@ -474,63 +861,64 @@ in
         {
           assertion =
             lib.hasPrefix "/" cfg.secretKeyBaseFile && !lib.hasPrefix "/nix/store/" cfg.secretKeyBaseFile;
-          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` that resolve via symlink into the store still pass; see the option's docstring.)";
+        }
+        {
+          assertion =
+            lib.hasPrefix "/" cfg.databasePasswordFile && !lib.hasPrefix "/nix/store/" cfg.databasePasswordFile;
+          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        }
+        {
+          assertion =
+            cfg.cookieFile == null
+            || (lib.hasPrefix "/" cfg.cookieFile && !lib.hasPrefix "/nix/store/" cfg.cookieFile);
+          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        }
+        {
+          assertion =
+            cfg.extraPostMigrateFile == null
+            || (
+              lib.hasPrefix "/" cfg.extraPostMigrateFile && !lib.hasPrefix "/nix/store/" cfg.extraPostMigrateFile
+            );
+          message = "services.blockscout-backend.extraPostMigrateFile (`${toString cfg.extraPostMigrateFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        }
+        {
+          assertion = !(cfg.extraPostMigrate != "" && cfg.extraPostMigrateFile != null);
+          message = "services.blockscout-backend.extraPostMigrate and services.blockscout-backend.extraPostMigrateFile are mutually exclusive. Set one or the other, not both.";
         }
       ]
       ++ mapAttrsToList (name: entry: {
         assertion = lib.hasPrefix "/" entry.path && !lib.hasPrefix "/nix/store/" entry.path;
-        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path NOT under /nix/store/. Storing secrets in the world-readable Nix store defeats the module's secrets contract.";
+        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
       }) cfg.secretEnvFiles;
 
-    # Local-socket `trust` authentication scoped to the specific role+
-    # database — only injected when `configurePostgresAuth` resolves
-    # to true. Default auto-detect gates on `databaseHost` being an
-    # absolute path (UNIX socket directory): if the operator has
-    # pointed `databaseHost` at a TCP host, the `local` pg_hba rule
-    # would apply to an unrelated local PostgreSQL and could silently
-    # weaken its auth posture. Explicit override via
-    # `configurePostgresAuth = true/false` when the heuristic is
-    # wrong for the deployment.
-    #
-    # Rationale (databaseAuthRationale) when the rule IS installed:
-    #   - Socket filesystem access is already gated by the `postgres`
-    #     group. Only services joining that group via
-    #     SupplementaryGroups can reach /run/postgresql/.s.PGSQL.5432
-    #     at all — in this stack, that's blockscout-backend and
-    #     nothing else.
-    #   - Once the socket is reached, the role scope limits access to
-    #     the blockscout database + role.
-    #   - Password-based auth would add a layer, but the password
-    #     would have to be readable to the same process that already
-    #     has socket access — same blast radius.
-    #   - mkBefore puts this entry ahead of nixpkgs' default
-    #     `local all all peer`, so the scoped `trust` rule matches
-    #     first and the broader `peer` rule is never reached for this
-    #     role+database combination.
-    # Operators needing stronger auth can override
-    # services.postgresql.authentication themselves and add a
-    # password-sync mechanism; see the `username` description on
-    # services.blockscout-postgresql for the two realistic paths.
-    services.postgresql.authentication =
-      let
-        effective = if cfg.configurePostgresAuth != null then cfg.configurePostgresAuth else postgresLocal;
-      in
-      mkIf effective (mkBefore ''
-        local ${cfg.databaseName} ${cfg.databaseUser} trust
-      '');
+    # No `services.postgresql.authentication` injection: connection
+    # is TCP-localhost (or remote TCP), authenticated by password
+    # against nixpkgs' default pg_hba.conf `host all all 127.0.0.1/32
+    # scram-sha-256` rule. The matching role password is set by
+    # `blockscout-postgresql` via an appended step in
+    # `systemd.services.postgresql-setup.script` from the same
+    # `passwordFile`, and read on this side via LoadCredential into
+    # the ExecStart wrapper which percent-encodes it for safe
+    # embedding into the DATABASE_URL.
 
     systemd.services.blockscout-backend = {
       description = "Blockscout Elixir/Phoenix backend (API + indexer)";
+      # Local data-plane unit ordering is conditional on
+      # `databaseHost` / `redisHost` actually being loopback. With
+      # remote-host configs the corresponding `postgresql.service` /
+      # `redis-<name>.service` may not even exist on this host, so an
+      # unconditional ordering would fail unit start with a
+      # "missing required unit" error.
       after = [
         "network-online.target"
-        "redis-${cfg.redisServerName}.service"
       ]
-      ++ optional postgresLocal "postgresql.service";
+      ++ optional postgresLocal "postgresql.service"
+      ++ optional redisLocal "redis-${cfg.redisServerName}.service";
       wants = [ "network-online.target" ];
-      requires = [
-        "redis-${cfg.redisServerName}.service"
-      ]
-      ++ optional postgresLocal "postgresql.service";
+      requires =
+        optional postgresLocal "postgresql.service"
+        ++ optional redisLocal "redis-${cfg.redisServerName}.service";
       wantedBy = [ "multi-user.target" ];
 
       # Static (non-secret) env — systemd emits these as `Environment=`
@@ -539,10 +927,27 @@ in
       # to the process's env. Operator-supplied `extraEnv` is merged on
       # top; a collision on a key Nix defined here is resolved by the
       # usual attrset `//` semantics (operator wins).
+      #
+      # DATABASE_URL deliberately NOT in this static-env block —
+      # the password value would otherwise land in the unit file,
+      # which is world-readable in the Nix store. Composed instead
+      # at exec time in `startScript` (top `let`) using the
+      # LoadCredential-sourced password percent-encoded for safe URL
+      # embedding. ACCOUNT_DATABASE_URL likewise.
       environment = {
-        DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
-        ACCOUNT_DATABASE_URL = "postgres://${cfg.databaseUser}@/${cfg.databaseName}?host=${cfg.databaseHost}";
-        ACCOUNT_REDIS_URL = "unix:///run/redis-${cfg.redisServerName}/redis.sock";
+        ACCOUNT_REDIS_URL = "redis://${cfg.redisHost}:${toString cfg.redisPort}";
+        # ECTO_USE_SSL is checked by Blockscout's runtime.exs /
+        # config_helper and defaults to "true". Our local postgres
+        # (`blockscout-postgresql` wrapper) doesn't ship SSL certs and
+        # listens plaintext on loopback only, so SSL must be off for
+        # local-loopback configs to avoid `Postgrex.Error: ssl not
+        # available` at startup. Remote Postgres deployments very
+        # commonly DO require SSL (cloud-managed RDS / Cloud SQL /
+        # Aurora all reject plaintext by default), so for non-loopback
+        # `databaseHost` we leave SSL on by default — gating on the
+        # same `postgresLocal` predicate that drives unit ordering.
+        # Either side of the predicate is overridable via `extraEnv`.
+        ECTO_USE_SSL = if postgresLocal then "false" else "true";
         ETHEREUM_JSONRPC_VARIANT = "geth";
         ETHEREUM_JSONRPC_HTTP_URL = cfg.ethereumRpc.httpUrl;
         ETHEREUM_JSONRPC_WS_URL = cfg.ethereumRpc.wsUrl;
@@ -569,25 +974,40 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
+        # Working directory MUST be the release root. Blockscout's
+        # `config/runtime.exs` calls
+        #   Code.require_file("#{config_env()}.exs", "config/runtime")
+        # which resolves the directory argument relative to the current
+        # working directory, NOT relative to the release root or
+        # `__DIR__`. Without this setting, systemd defaults the unit's
+        # CWD to `/` (under DynamicUser + ProtectSystem=strict), the
+        # `Code.require_file` call resolves to `/config/runtime/prod.exs`,
+        # the file doesn't exist on the host filesystem, and the
+        # release crashes at boot with:
+        #   ERROR! Config provider Config.Reader failed with:
+        #     ** (Code.LoadError) could not load /config/runtime/prod.exs.
+        # The standard `bin/blockscout` script generated by `mix
+        # release` does `cd "$RELEASE_ROOT"` before exec'ing the BEAM
+        # — but our hardened ExecStart wrapper exec's the release
+        # binary directly, bypassing that cd. Setting WorkingDirectory
+        # here is the canonical fix; the `cd` at the top of
+        # `startScript` (in the top `let`) is defence-in-depth in
+        # case any intermediate process layer ever overrides CWD.
+        WorkingDirectory = "${cfg.package}";
+
         DynamicUser = true;
         StateDirectory = "blockscout-backend";
         StateDirectoryMode = "0700";
         RuntimeDirectory = "blockscout-backend";
         RuntimeDirectoryMode = "0700";
 
-        # Cross-service UNIX socket access. `postgres` and
-        # `redis-<name>` groups are auto-created by the respective
-        # upstream modules; joining them here grants filesystem
-        # access to /run/postgresql/.s.PGSQL.5432 and
-        # /run/redis-<name>/redis.sock respectively.
-        #
-        # `postgres` is only added when `databaseHost` points at a
-        # UNIX socket (`postgresLocal`); for TCP remote PG we skip
-        # the group since it may not exist on the host at all.
-        SupplementaryGroups = [
-          "redis-${cfg.redisServerName}"
-        ]
-        ++ optional postgresLocal "postgres";
+        # No SupplementaryGroups — both PostgreSQL and Redis are
+        # reached over TCP-localhost rather than UNIX sockets, so the
+        # backend has no need to join host system groups for socket
+        # filesystem access. PostgreSQL pivoted because the Ecto/
+        # Postgrex layer doesn't honour libpq's `?host=` for sockets;
+        # Redis pivoted because Redix's URI parser rejects the
+        # `unix://` scheme outright.
 
         # Secret ingestion. systemd reads each source file as root at
         # unit-start time and exposes the contents via
@@ -598,7 +1018,10 @@ in
         # without any name translation.
         LoadCredential = [
           "SECRET_KEY_BASE:${cfg.secretKeyBaseFile}"
+          "DATABASE_PASSWORD:${cfg.databasePasswordFile}"
         ]
+        ++ optional (cfg.cookieFile != null) "RELEASE_COOKIE:${cfg.cookieFile}"
+        ++ optional (cfg.extraPostMigrateFile != null) "EXTRA_POST_MIGRATE_SQL:${cfg.extraPostMigrateFile}"
         ++ mapAttrsToList (name: entry: "${name}:${entry.path}") cfg.secretEnvFiles;
 
         # BEAM JIT needs writable + executable memory pages — opt out
@@ -607,17 +1030,14 @@ in
         # keep the default `true`.
         MemoryDenyWriteExecute = false;
 
-        # `PrivateUsers = false` is load-bearing, not a missing
-        # hardening option. The service relies on `SupplementaryGroups`
-        # to reach the PostgreSQL and Redis UNIX sockets; those
-        # sockets are group-owned by `postgres` and `redis-<name>`
-        # respectively at the HOST UID/GID level. `PrivateUsers = true`
-        # would put the service in a user namespace where host GIDs
-        # are remapped (typically to `nobody`), making the kernel's
-        # permission check on the sockets fail with EACCES. Leave
-        # explicitly false with this comment so future hardening
-        # sweeps do not mistakenly re-enable it.
-        PrivateUsers = false;
+        # PrivateUsers left at its systemd default (false): both
+        # PostgreSQL and Redis are now reached over TCP-localhost,
+        # not UNIX sockets, so a user-namespace GID remap would no
+        # longer break socket access. Setting `PrivateUsers = true`
+        # explicitly is *probably* safe today but unverified against
+        # the BEAM scheduler / Mix release loader; leave at the
+        # systemd default until a separate hardening pass evaluates
+        # it on a real workload.
 
         # Rest of the defense-in-depth baseline per the
         # nix-modules-hardening skill matrix.
