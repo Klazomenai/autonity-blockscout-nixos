@@ -79,6 +79,28 @@ let
   # gives a clearer error message pointing at the exact offending key.
   envVarNameRegex = "^[A-Z_][A-Z0-9_]*$";
 
+  # Loopback-host predicates. When `databaseHost` / `redisHost` point
+  # at a loopback name, the corresponding upstream data-plane unit
+  # lives on this same host and the backend SHOULD `Requires=`/
+  # `After=` it. When they point at a remote hostname there is no
+  # local unit for systemd to order against, and an unconditional
+  # ordering would fail unit start the moment the operator disables
+  # the local wrapper. So we gate the unit ordering on these
+  # predicates rather than hard-coding it.
+  #
+  # `localhost` covers IPv4 and IPv6 loopback via /etc/hosts;
+  # `127.0.0.1` and `::1` are the literal loopback addresses. The DNS
+  # regex on `databaseHost` / `redisHost` doesn't accept anything else
+  # loopback-equivalent (e.g. `0.0.0.0`-bound listeners are rejected),
+  # so this set is exhaustive against the option type.
+  loopbackHosts = [
+    "localhost"
+    "127.0.0.1"
+    "::1"
+  ];
+  postgresLocal = lib.elem cfg.databaseHost loopbackHosts;
+  redisLocal = lib.elem cfg.redisHost loopbackHosts;
+
   # Bash wrapper that exports each LoadCredential-sourced secret into
   # the process environment, optionally runs the migration, then execs
   # the main server. Static env vars are provided by systemd's
@@ -302,11 +324,21 @@ in
         somehow.
 
         When this option is `null` (default), the module generates a
-        random per-deployment cookie at unit-start time via an
-        `ExecStartPre+` hook (32 bytes of openssl rand, base64-encoded)
-        written to `$RUNTIME_DIRECTORY/cookie`. This is sufficient
-        for single-node deployments where no external Erlang node
-        ever connects.
+        random per-restart cookie inline in the ExecStart wrapper via
+        `openssl rand -hex 24` (48 hex characters). The cookie lives
+        only in the running BEAM process's environment — it is NOT
+        persisted anywhere on disk. A new value is rolled on every
+        restart of `blockscout-backend.service`; this is fine for
+        single-node deployments where no external Erlang node ever
+        connects to the BEAM distribution port.
+
+        Hex (not base64) is deliberate: an earlier draft used
+        `openssl rand -base64 24`, which produces values containing
+        `+` / `/` / `=`. Under specific systemd-environment / release-
+        wrapper argument-quoting paths, a leading `-` byte in the
+        cookie or the `=` padding byte caused `beam.smp` to mis-parse
+        `-setcookie <value>` and panic with `unknown flag …`. Hex
+        digits round-trip cleanly through every shell / wrapper layer.
 
         For multi-node BEAM clustering, set `cookieFile` to a path
         sourced from sops-nix / agenix, with the same value across
@@ -370,7 +402,8 @@ in
 
         The matching `services.blockscout-postgresql.passwordFile`
         should point at the SAME file so the role's password (set
-        by the postgres wrapper's postStart hook) and the backend's
+        by the postgres wrapper's append to
+        `systemd.services.postgresql-setup.script`) and the backend's
         connection password agree.
 
         MUST be an absolute path NOT under `/nix/store/` — the
@@ -692,21 +725,21 @@ in
 
     systemd.services.blockscout-backend = {
       description = "Blockscout Elixir/Phoenix backend (API + indexer)";
-      # `postgresql.service` is unconditional: TCP-localhost is the
-      # only supported postgres connection mode (see `databaseHost`
-      # docstring). Operators pointing `databaseHost` at a remote
-      # postgres should override `requires` / `after` to drop the
-      # local-postgres dependency.
+      # Local data-plane unit ordering is conditional on
+      # `databaseHost` / `redisHost` actually being loopback. With
+      # remote-host configs the corresponding `postgresql.service` /
+      # `redis-<name>.service` may not even exist on this host, so an
+      # unconditional ordering would fail unit start with a
+      # "missing required unit" error.
       after = [
         "network-online.target"
-        "postgresql.service"
-        "redis-${cfg.redisServerName}.service"
-      ];
+      ]
+      ++ optional postgresLocal "postgresql.service"
+      ++ optional redisLocal "redis-${cfg.redisServerName}.service";
       wants = [ "network-online.target" ];
-      requires = [
-        "postgresql.service"
-        "redis-${cfg.redisServerName}.service"
-      ];
+      requires =
+        optional postgresLocal "postgresql.service"
+        ++ optional redisLocal "redis-${cfg.redisServerName}.service";
       wantedBy = [ "multi-user.target" ];
 
       # Static (non-secret) env — systemd emits these as `Environment=`

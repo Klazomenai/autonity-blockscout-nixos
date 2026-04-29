@@ -25,12 +25,20 @@
 #   needs — no `peer`-auth complexity, no DynamicUser-vs-fixed-username
 #   mismatch.
 #
-#   `passwordFile` (NEW): when set, a postStart script ALTERs the role
-#   to set its password from the file's contents. The
-#   `blockscout-backend` module sets the matching `databasePasswordFile`
-#   to the same file via `LoadCredential=`. Both options expect an
-#   absolute path NOT under `/nix/store/` (enforced via
-#   `config.assertions`).
+#   `passwordFile` (NEW): when set, this wrapper appends an `ALTER
+#   ROLE … WITH PASSWORD …` statement to
+#   `systemd.services.postgresql-setup.script` (NOT
+#   `postgresql.service.postStart`). nixpkgs runs `ensureUsers` and
+#   `ensureDatabases` inside the separate `postgresql-setup.service`
+#   one-shot unit, so attaching to `postStart` would fire BEFORE the
+#   role exists and ALTER ROLE would fail with `role "blockscout"
+#   does not exist`. `mkAfter` orders the appended SQL after the
+#   `generateUserSetupScript` block that creates the role.
+#
+#   The `blockscout-backend` module sets the matching
+#   `databasePasswordFile` to the same file via `LoadCredential=`.
+#   Both options expect an absolute path NOT under `/nix/store/`
+#   (enforced via `config.assertions`).
 #
 # Hardening of `postgresql.service` itself is inherited from the
 # upstream nixpkgs module (static `postgres` UID for on-disk
@@ -229,7 +237,7 @@ in
     # failure to systemd instead of swallowing it.
     systemd.services.postgresql-setup.script = lib.mkAfter ''
       ${config.services.postgresql.package}/bin/psql -d postgres -v ON_ERROR_STOP=1 <<'EOF'
-      \set pw `cat ${cfg.passwordFile} | tr -d '\n'`
+      \set pw `cat '${cfg.passwordFile}' | tr -d '\n'`
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
       EOF
     '';
