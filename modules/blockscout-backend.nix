@@ -197,6 +197,50 @@ let
       # that's a different module name from a different era and is
       # not what this fork ships.
       ${cfg.package}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
+
+      # Workaround for upstream Blockscout regression: PR
+      # blockscout/blockscout#14099 (commit b16530084) removed the
+      # `block_hash` field from `Explorer.Chain.InternalTransaction`
+      # but did NOT update the
+      # `Explorer.Migrator.ReindexDuplicatedInternalTransactions`
+      # migrator's query, which still does
+      # `select: it.block_hash, group_by: [it.block_hash, ...]`
+      # (apps/explorer/lib/explorer/migrator/
+      # reindex_duplicated_internal_transactions.ex:65). At BEAM
+      # startup the migrator GenServer enters a tight crash loop
+      # (Ecto.QueryError, ~100×/second) which saturates CPU on
+      # constrained runners — fine on a fast host but starves the
+      # frontend's Next.js SSR thread on slow CI runners (TCG
+      # software emulation, no nested KVM), causing the integration
+      # check to wedge on the first SSR request and time out.
+      #
+      # The migrator inherits from `Explorer.Migrator.FillingMigration`,
+      # which exits cleanly on init when `MigrationStatus.fetch/1`
+      # returns `%{status: "completed"}`
+      # (filling_migration.ex:217-227). There is no env var or
+      # runtime config to skip the migrator (its `enabled: true` is
+      # compile-time-only in apps/explorer/config/config.exs:138),
+      # so we mark it complete by inserting a row into
+      # `migrations_status` here. Idempotent on conflict.
+      #
+      # MUST run AFTER `migrate([])` because Ecto migrations create
+      # the `migrations_status` table; runs BEFORE
+      # `${cfg.package}/bin/blockscout start` so the supervisor sees
+      # the completion row when it boots the migrator child.
+      #
+      # PGPASSWORD is exported to psql via env so the password isn't
+      # in argv (matches the wrapper's secret-handling contract).
+      # Re-read from $CREDENTIALS_DIRECTORY because $db_password_raw
+      # was unset above to limit the in-memory exposure window.
+      PGPASSWORD="$(cat "$CREDENTIALS_DIRECTORY/DATABASE_PASSWORD")" \
+        ${pkgs.postgresql}/bin/psql \
+        --host="${cfg.databaseHost}" \
+        --port="${toString cfg.databasePort}" \
+        --username="${cfg.databaseUser}" \
+        --dbname="${cfg.databaseName}" \
+        --no-psqlrc \
+        -v ON_ERROR_STOP=1 \
+        -c "INSERT INTO migrations_status (migration_name, status, inserted_at, updated_at) VALUES ('reindex_duplicated_internal_transactions', 'completed', now(), now()) ON CONFLICT (migration_name) DO UPDATE SET status = 'completed', updated_at = now();"
     ''}
     exec ${cfg.package}/bin/blockscout start
   '';
