@@ -121,9 +121,12 @@ pkgs.testers.nixosTest {
       #
       # `${...}` antiquotes the Nix value once at activation-time so
       # the fixture bytes go straight to disk via `printf '%s'`
-      # without further interpretation. `set -eu` already by
-      # NixOS's activation script harness; mode 0600 + 0700 dir
-      # match the secrets-handling shape sops-nix uses.
+      # without further interpretation. The `system.activationScripts`
+      # harness chains entries via `set -e` at script-render time,
+      # but does NOT set `-u` — DO NOT rely on undefined-variable
+      # checking in the body. Mode bits are encoded per-file below
+      # (skb 0400 root, db_password 0440 postgres) — see the inline
+      # comments in the script body for the per-consumer rationale.
       system.activationScripts.test-secrets = ''
         # Directory mode 0755: needs to be traversable by every unit
         # that reads a secret here, which is at minimum root

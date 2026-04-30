@@ -86,17 +86,40 @@ let
 
   # Runtime secret-path check — second layer of the secrets contract
   # on top of the option-set-time `lib.hasPrefix "/nix/store/"`
-  # assertion. Resolves `passwordFile` via `realpath -e` and fails
-  # the unit if the resolved target is under `/nix/store/` (catches
-  # `/etc/`-mounted symlinks whose targets ARE in the store —
-  # `environment.etc` is the most common producer of those, and the
-  # literal-prefix assertion can't see through the symlink).
+  # assertion. Three things checked, in order:
+  #
+  #   1. `realpath -e` (strict): path exists, parents traversable.
+  #      Fails on missing components or unreadable parent dirs.
+  #   2. Resolved target is NOT under `/nix/store/`. Catches
+  #      `/etc/`-mounted symlinks whose targets ARE in the store —
+  #      `environment.etc` is the most common producer of those,
+  #      and the eval-time literal-prefix assertion can't see
+  #      through the symlink.
+  #   3. The file is readable AS THE `postgres` USER (the user the
+  #      `postgresql-setup.service` ALTER ROLE script runs as).
+  #      This catches a real failure mode that surfaced on PR #27
+  #      round 1: a runtime check that only verifies root-level
+  #      readability passes when `passwordFile` is mode 0400 root-
+  #      owned, but the later `\set pw `cat …`` in the setup
+  #      script (running as User=postgres) can't `cat` the file.
+  #      Without explicit fail-hard handling the bash pipeline's
+  #      exit status comes from the trailing `tr` (which succeeds on
+  #      empty input), so psql captures `""` and silently runs
+  #      `ALTER ROLE … WITH PASSWORD ''` — clearing the password
+  #      entirely and breaking auth. Catching the unreadable-by-
+  #      postgres case here, before psql is even invoked, fails
+  #      the unit with a clear error pointing at the offending
+  #      option AND the resolved path. Defense-in-depth: the ALTER
+  #      ROLE block below ALSO no longer relies on the broken
+  #      pipeline-status form; see the comments there.
   #
   # Wired as `ExecStartPre=+<path>` on `postgresql-setup.service` so
-  # the check runs as root regardless of `User=`. The setup unit
-  # itself runs as `User=postgres` per nixpkgs default, but the
-  # check needs to traverse `/run/secrets/`-style paths that are
-  # often locked to root only — hence the `+` privilege escalation.
+  # the check runs as root regardless of `User=`. Step 3 uses
+  # `runuser -u postgres -- test -r` to drop privileges for that
+  # specific test; everything else stays at root so it can
+  # `realpath -e` paths inside `/run/secrets/`-style root-only
+  # tmpfs directories that sops-nix / agenix typically lock down to
+  # mode 0700 root.
   checkPasswordPathScript = pkgs.writeShellScript "blockscout-postgresql-check-password-path" ''
     set -u
 
@@ -113,6 +136,12 @@ let
         exit 1
         ;;
     esac
+    if ! ${pkgs.util-linux}/bin/runuser -u postgres -- ${pkgs.coreutils}/bin/test -r "$resolved"; then
+      echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' (resolved to '$resolved') is not readable as user 'postgres'." >&2
+      echo "       The postgresql-setup.service ALTER ROLE step runs as User=postgres and \`cat\`s this file — it must own or have group-read on the file." >&2
+      echo "       Typical sops-nix shape: \`sops.secrets.<name>.owner = \"postgres\"\` with mode 0400 OR group-readable mode 0440 with the postgres user in the group." >&2
+      exit 1
+    fi
     exit 0
   '';
 in
@@ -342,7 +371,29 @@ in
     # `-v ON_ERROR_STOP=1` makes psql fail with non-zero exit if the
     # ALTER ROLE doesn't apply, so the setup unit surfaces the
     # failure to systemd instead of swallowing it.
+    #
+    # Preflight cat + non-empty check, BEFORE psql runs. The
+    # `\set pw `cat … | tr -d '\n'`` form below relies on psql's
+    # shell to run the pipeline, but psql does not propagate the
+    # cat exit status — and even if it did, the trailing `tr`
+    # always succeeds (zero exit on empty input), so a `cat`
+    # failure would silently capture `""` and ALTER ROLE would
+    # quietly clear the password (`28P01 invalid_password` on the
+    # next connect, which surfaces miles away from the real cause).
+    # Doing the cat ourselves first, with the postgresql-setup
+    # script's harness `set -e` propagating the exit, fails the
+    # unit at the right step with a useful error. The `-s` test
+    # ALSO catches empty-file fixtures (the runtime check has no
+    # length opinion — only the read-as-postgres check). Belt-and-
+    # braces with `checkPasswordPathScript`'s ExecStartPre+ check;
+    # both layers ship together so the silent-clearing path is
+    # closed even if a future change loses one of them.
     systemd.services.postgresql-setup.script = lib.mkAfter ''
+      ${pkgs.coreutils}/bin/cat ${lib.escapeShellArg cfg.passwordFile} > /dev/null
+      [ -s ${lib.escapeShellArg cfg.passwordFile} ] || {
+        echo "ERROR: services.blockscout-postgresql.passwordFile (${cfg.passwordFile}) is empty. ALTER ROLE would silently clear the role's password." >&2
+        exit 1
+      }
       ${config.services.postgresql.package}/bin/psql --no-psqlrc -d postgres -v ON_ERROR_STOP=1 <<'EOF'
       \set pw `cat ${lib.escapeShellArg cfg.passwordFile} | tr -d '\n'`
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
