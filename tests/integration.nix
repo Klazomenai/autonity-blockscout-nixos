@@ -119,9 +119,18 @@ pkgs.testers.nixosTest {
       # that shape with `system.activationScripts` writing
       # plaintext into `/run/test-secrets/`.
       #
-      # `${...}` antiquotes the Nix value once at activation-time so
-      # the fixture bytes go straight to disk via `printf '%s'`
-      # without further interpretation. The `system.activationScripts`
+      # `${...}` antiquotes the Nix value once at derivation-build
+      # time, baking the literal bytes into the activation script
+      # itself (which lives in `/nix/store/`). Activation then just
+      # runs that pre-built script, which `printf '%s'`s the
+      # already-substituted bytes onto the tmpfs without any
+      # further interpretation. NOTE: this means the test-fixture
+      # bytes ARE in the store as part of the script body — fine
+      # for an ephemeral VM-test fixture, but a reminder that
+      # `system.activationScripts` is NOT a way to keep secrets out
+      # of the store. Production deployments source via sops-nix /
+      # agenix, which decrypt at activation time from store-resident
+      # ciphertext into a tmpfs path. The `system.activationScripts`
       # harness chains entries via `set -e` at script-render time,
       # but does NOT set `-u` — DO NOT rely on undefined-variable
       # checking in the body. Mode bits are encoded per-file below

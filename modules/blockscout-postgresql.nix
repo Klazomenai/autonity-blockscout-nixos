@@ -238,7 +238,7 @@ in
           That catches the symlink-into-store case the eval-time
           check can't see — most commonly an `/etc/...` path
           materialised via `environment.etc`, where the
-          consumer-visible path is `/etc/<name>` but the bytes IS
+          consumer-visible path is `/etc/<name>` but the bytes ARE
           a store-resident symlink target.
 
         Operators sourcing from sops-nix / agenix into a tmpfs path
