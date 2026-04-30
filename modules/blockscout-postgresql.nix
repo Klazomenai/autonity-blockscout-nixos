@@ -67,7 +67,12 @@
 # `RestrictAddressFamilies`, `SystemCallFilter`, etc.) — this wrapper
 # only adds the Blockscout-specific surface on top. Re-applying or
 # weakening that hardening is deliberately avoided.
-{ config, lib, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.services.blockscout-postgresql;
@@ -78,6 +83,67 @@ let
     mkDefault
     types
     ;
+
+  # Runtime secret-path check — second layer of the secrets contract
+  # on top of the option-set-time `lib.hasPrefix "/nix/store/"`
+  # assertion. Three things checked, in order:
+  #
+  #   1. `realpath -e` (strict): path exists, parents traversable.
+  #      Fails on missing components or unreadable parent dirs.
+  #   2. Resolved target is NOT under `/nix/store/`. Catches
+  #      `/etc/`-mounted symlinks whose targets ARE in the store —
+  #      `environment.etc` is the most common producer of those,
+  #      and the eval-time literal-prefix assertion can't see
+  #      through the symlink.
+  #   3. The file is readable AS THE `postgres` USER (the user the
+  #      `postgresql-setup.service` ALTER ROLE script runs as).
+  #      This catches a real failure mode that surfaced on PR #27
+  #      round 1: a runtime check that only verifies root-level
+  #      readability passes when `passwordFile` is mode 0400 root-
+  #      owned, but the later `\set pw `cat …`` in the setup
+  #      script (running as User=postgres) can't `cat` the file.
+  #      Without explicit fail-hard handling the bash pipeline's
+  #      exit status comes from the trailing `tr` (which succeeds on
+  #      empty input), so psql captures `""` and silently runs
+  #      `ALTER ROLE … WITH PASSWORD ''` — clearing the password
+  #      entirely and breaking auth. Catching the unreadable-by-
+  #      postgres case here, before psql is even invoked, fails
+  #      the unit with a clear error pointing at the offending
+  #      option AND the resolved path. Defense-in-depth: the ALTER
+  #      ROLE block below ALSO no longer relies on the broken
+  #      pipeline-status form; see the comments there.
+  #
+  # Wired as `ExecStartPre=+<path>` on `postgresql-setup.service` so
+  # the check runs as root regardless of `User=`. Step 3 uses
+  # `runuser -u postgres -- test -r` to drop privileges for that
+  # specific test; everything else stays at root so it can
+  # `realpath -e` paths inside `/run/secrets/`-style root-only
+  # tmpfs directories that sops-nix / agenix typically lock down to
+  # mode 0700 root.
+  checkPasswordPathScript = pkgs.writeShellScript "blockscout-postgresql-check-password-path" ''
+    set -u
+
+    path=${lib.escapeShellArg cfg.passwordFile}
+    if ! resolved=$(${pkgs.coreutils}/bin/realpath -e -- "$path" 2>/dev/null); then
+      echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' — does not exist, or has an unreadable parent directory at unit-start time. The setup unit cannot proceed without the password." >&2
+      exit 1
+    fi
+    case "$resolved" in
+      /nix/store/*)
+        echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' resolves to '$resolved' which is under /nix/store/." >&2
+        echo "       Secrets in the world-readable Nix store defeat the module's secrets contract." >&2
+        echo "       Source from sops-nix / agenix into a tmpfs path (e.g. /run/secrets/...) instead." >&2
+        exit 1
+        ;;
+    esac
+    if ! ${pkgs.util-linux}/bin/runuser -u postgres -- ${pkgs.coreutils}/bin/test -r "$resolved"; then
+      echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' (resolved to '$resolved') is not readable as user 'postgres'." >&2
+      echo "       The postgresql-setup.service ALTER ROLE step runs as User=postgres and \`cat\`s this file — it must own or have group-read on the file." >&2
+      echo "       Typical sops-nix shape: \`sops.secrets.<name>.owner = \"postgres\"\` with mode 0400 OR group-readable mode 0440 with the postgres user in the group." >&2
+      exit 1
+    fi
+    exit 0
+  '';
 in
 {
   options.services.blockscout-postgresql = {
@@ -161,18 +227,26 @@ in
         `databasePasswordFile` should point at the same file).
 
         MUST be an absolute path whose literal prefix is NOT
-        `/nix/store/`. The check is a literal-prefix comparison at
-        option-set time — it catches Nix-path literals like
-        `./secret` (which would auto-copy into the store) and any
-        hand-written `/nix/store/...` paths. It does NOT enforce a
-        strict "bytes are off-store" guarantee: a path under `/etc/`
-        materialised via `environment.etc` resolves to a symlink
-        whose target is in the store and still passes the check.
+        `/nix/store/`. Two-layer enforcement:
+
+        - Eval-time `lib.hasPrefix` rejects Nix-path literals (e.g.
+          `./secret` that would auto-copy into the store) and any
+          hand-written `/nix/store/...` paths.
+        - Runtime `ExecStartPre=+` on `postgresql-setup.service`
+          (which the wrapper installs) `realpath -e`s the path and
+          rejects any whose resolved target is under `/nix/store/`.
+          That catches the symlink-into-store case the eval-time
+          check can't see — most commonly an `/etc/...` path
+          materialised via `environment.etc`, where the
+          consumer-visible path is `/etc/<name>` but the bytes ARE
+          a store-resident symlink target.
+
         Operators sourcing from sops-nix / agenix into a tmpfs path
-        (`/run/secrets/...`) get the full off-store guarantee;
-        `environment.etc`-based fixtures (the integration test)
-        accept the symlink-resolved store residency as a determinism
-        trade-off.
+        (`/run/secrets/...`) satisfy both checks; the integration
+        test imitates that shape via a `/run/test-secrets/`
+        activation script (the older `environment.etc`-based form
+        passed eval but is rejected by the runtime check, by
+        design).
 
         Real deployments source this from sops-nix / agenix into a
         tmpfs path (`/run/secrets/...`) decrypted at activation. For
@@ -208,7 +282,7 @@ in
     assertions = [
       {
         assertion = lib.hasPrefix "/" cfg.passwordFile && !lib.hasPrefix "/nix/store/" cfg.passwordFile;
-        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` realised via `environment.etc` symlink into the store still pass; the assertion catches the obvious mistakes (Nix-path literals, hand-written `/nix/store/...` paths) but does not enforce a strict bytes-off-store guarantee. Operators sourcing from sops-nix / agenix into a tmpfs path get the full off-store guarantee.)";
+        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. This is the eval-time half of the secrets contract; the runtime ExecStartPre on `postgresql-setup.service` ALSO rejects paths whose `realpath -e` resolves into the store (catching `/etc/`-mounted symlinks that `environment.etc` produces, which the eval-time check can't see).";
       }
     ];
 
@@ -297,11 +371,44 @@ in
     # `-v ON_ERROR_STOP=1` makes psql fail with non-zero exit if the
     # ALTER ROLE doesn't apply, so the setup unit surfaces the
     # failure to systemd instead of swallowing it.
+    #
+    # Preflight cat + non-empty check, BEFORE psql runs. The
+    # `\set pw `cat … | tr -d '\n'`` form below relies on psql's
+    # shell to run the pipeline, but psql does not propagate the
+    # cat exit status — and even if it did, the trailing `tr`
+    # always succeeds (zero exit on empty input), so a `cat`
+    # failure would silently capture `""` and ALTER ROLE would
+    # quietly clear the password (`28P01 invalid_password` on the
+    # next connect, which surfaces miles away from the real cause).
+    # Doing the cat ourselves first, with the postgresql-setup
+    # script's harness `set -e` propagating the exit, fails the
+    # unit at the right step with a useful error. The `-s` test
+    # ALSO catches empty-file fixtures (the runtime check has no
+    # length opinion — only the read-as-postgres check). Belt-and-
+    # braces with `checkPasswordPathScript`'s ExecStartPre+ check;
+    # both layers ship together so the silent-clearing path is
+    # closed even if a future change loses one of them.
     systemd.services.postgresql-setup.script = lib.mkAfter ''
+      ${pkgs.coreutils}/bin/cat ${lib.escapeShellArg cfg.passwordFile} > /dev/null
+      [ -s ${lib.escapeShellArg cfg.passwordFile} ] || {
+        echo "ERROR: services.blockscout-postgresql.passwordFile (${cfg.passwordFile}) is empty. ALTER ROLE would silently clear the role's password." >&2
+        exit 1
+      }
       ${config.services.postgresql.package}/bin/psql --no-psqlrc -d postgres -v ON_ERROR_STOP=1 <<'EOF'
       \set pw `cat ${lib.escapeShellArg cfg.passwordFile} | tr -d '\n'`
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
       EOF
     '';
+
+    # Runtime secret-path check fired at unit start, before the
+    # appended ALTER ROLE block above runs. The leading `+` makes
+    # systemd run this as root regardless of the unit's `User=`
+    # (`postgres` per nixpkgs default), so the check can traverse
+    # root-only `/run/secrets/`-style tmpfs directories. Failure
+    # here exits the setup unit non-zero before the ALTER ROLE
+    # would attempt to read a store-resident password.
+    systemd.services.postgresql-setup.serviceConfig.ExecStartPre = [
+      "+${checkPasswordPathScript}"
+    ];
   };
 }
