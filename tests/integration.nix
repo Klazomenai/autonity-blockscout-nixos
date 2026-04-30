@@ -51,20 +51,15 @@ let
           -addext "subjectAltName=DNS:${hostName}"
       '';
 
-  # Test secret: a fixed 32-byte (64 hex chars) string standing in for Phoenix's
-  # `secret_key_base`. Real deployments source this from sops-nix /
-  # agenix. This is test-only: the fixture is materialised via
-  # `environment.etc."test-secrets/skb"`, which makes `/etc/test-
-  # secrets/skb` a symlink to a Nix-store path holding the content
-  # — so the underlying value IS in `/nix/store/` (world-readable),
-  # making this mechanism unsuitable for real secrets. The
-  # `secretKeyBaseFile` assertion only checks the literal path string
-  # (`/etc/test-secrets/skb`), not symlink targets, so eval passes and
-  # the systemd `LoadCredential=` reads the value via the symlink at
-  # runtime. The whole point of this fixture is determinism, not
-  # secrecy — for real deployments use sops-nix / agenix where the
-  # plaintext is decrypted into a tmpfs path that is genuinely
-  # outside `/nix/store/`.
+  # Test secret: a fixed 32-byte (64 hex chars) string standing in
+  # for Phoenix's `secret_key_base`. Real deployments source this
+  # from sops-nix / agenix. The fixture is materialised at system-
+  # activation time onto a `/run/test-secrets/` tmpfs (see the
+  # `system.activationScripts.test-secrets` block below), which
+  # imitates the sops-nix / agenix shape (`/run/secrets/` tmpfs)
+  # closely enough that the runtime secret-path check (#25) accepts
+  # it. The whole point of this fixture is determinism, not secrecy
+  # — for real deployments use sops-nix / agenix.
   testSecretKeyBase = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 in
 pkgs.testers.nixosTest {
@@ -106,27 +101,59 @@ pkgs.testers.nixosTest {
       # for the test, never deployed.
       system.stateVersion = "24.05";
 
-      # Test secret materialised at activation time. This satisfies
-      # the `secretKeyBaseFile` not-in-store assertion only because
-      # that assertion checks the absolute `/etc/<name>` path string;
-      # the content provided via `environment.etc.<name>.text` still
-      # lives in the Nix store (NixOS realises `/etc/<name>` as a
-      # symlink into `/nix/store/`) and is NOT suitable for real
-      # secret handling. The full rationale + the
-      # use-sops-nix-or-agenix-instead pointer is at the
-      # `testSecretKeyBase` definition above.
-      environment.etc."test-secrets/skb".text = testSecretKeyBase;
-      # Test database password fixture. Same `environment.etc`
-      # caveat as the secretKeyBaseFile fixture above (content
-      # actually lives in /nix/store/, not for real secrets — see
-      # testSecretKeyBase docstring). The password is set on the
-      # postgres role by an appended step the `blockscout-postgresql`
-      # wrapper attaches to `systemd.services.postgresql-setup.script`,
-      # and read back into DATABASE_URL by the backend's ExecStart
-      # wrapper via LoadCredential. Both sides MUST point at the same
-      # path for the role's password and the backend's connection
-      # password to agree.
-      environment.etc."test-secrets/db_password".text = "test-password-not-for-production";
+      # Test secrets materialised on a /run tmpfs at system
+      # activation time. `/run` is a real filesystem (tmpfs), not a
+      # symlink farm, so paths like `/run/test-secrets/skb`
+      # resolve to themselves under `realpath -e` and pass the
+      # runtime secret-path check (#25) which fails any path that
+      # `realpath -e`s to under `/nix/store/`.
+      #
+      # Earlier drafts of this fixture used `environment.etc.<name>
+      # .text = …` for determinism. That works against the
+      # eval-time literal-prefix assertion (the consumer-visible
+      # path `/etc/test-secrets/<name>` is not literally under
+      # /nix/store/), but `/etc/<name>` is a symlink into the store,
+      # so the runtime check correctly rejects it. Production
+      # deployments must source secrets from sops-nix / agenix into
+      # a tmpfs (`/run/secrets/...`); the test fixture imitates
+      # that shape with `system.activationScripts` writing
+      # plaintext into `/run/test-secrets/`.
+      #
+      # `${...}` antiquotes the Nix value once at activation-time so
+      # the fixture bytes go straight to disk via `printf '%s'`
+      # without further interpretation. `set -eu` already by
+      # NixOS's activation script harness; mode 0600 + 0700 dir
+      # match the secrets-handling shape sops-nix uses.
+      system.activationScripts.test-secrets = ''
+        # Directory mode 0755: needs to be traversable by every unit
+        # that reads a secret here, which is at minimum root
+        # (systemd LoadCredential before dropping to DynamicUser) and
+        # `postgres` (the postgresql-setup script's `cat` inside the
+        # ALTER ROLE psql heredoc). File-level perms enforce
+        # confidentiality.
+        ${pkgs.coreutils}/bin/install -d -m 0755 /run/test-secrets
+
+        # secretKeyBaseFile: only consumed by the backend via systemd
+        # LoadCredential, which runs as root before dropping to
+        # DynamicUser. Owner=root, mode 0400 matches sops-nix's
+        # default shape for a secret consumed by a single unit.
+        ${pkgs.coreutils}/bin/install -m 0400 -o root -g root /dev/null /run/test-secrets/skb
+        printf '%s' ${lib.escapeShellArg testSecretKeyBase} > /run/test-secrets/skb
+
+        # db_password: TWO consumers with different read paths:
+        #   1. postgresql-setup.service runs as User=postgres and
+        #      `cat`s the file from inside a psql heredoc.
+        #   2. blockscout-backend.service ingests via LoadCredential
+        #      (root reads before drop to DynamicUser).
+        # Owner=postgres, mode 0440 satisfies both — the `postgres`
+        # owner satisfies the User=postgres reader, and root reads
+        # ANY file regardless of ownership for the LoadCredential
+        # path. This matches the canonical sops-nix idiom of
+        # `secrets.<name>.owner = "postgres"` for a postgres
+        # password.
+        ${pkgs.coreutils}/bin/install -m 0440 -o postgres -g postgres /dev/null /run/test-secrets/db_password
+        printf '%s' 'test-password-not-for-production' > /run/test-secrets/db_password
+      '';
 
       services.autonity = {
         enable = true;
@@ -152,7 +179,7 @@ pkgs.testers.nixosTest {
 
       services.blockscout-postgresql = {
         enable = true;
-        passwordFile = "/etc/test-secrets/db_password";
+        passwordFile = "/run/test-secrets/db_password";
       };
       # Test-only timeout slack for slow QEMU hosts. nixpkgs' default
       # `TimeoutSec = 120` is fine for production deployments where
@@ -165,8 +192,8 @@ pkgs.testers.nixosTest {
 
       services.blockscout-backend = {
         enable = true;
-        secretKeyBaseFile = "/etc/test-secrets/skb";
-        databasePasswordFile = "/etc/test-secrets/db_password";
+        secretKeyBaseFile = "/run/test-secrets/skb";
+        databasePasswordFile = "/run/test-secrets/db_password";
 
         # Test-only fixture: short-circuit the upstream Blockscout
         # `Explorer.Migrator.ReindexDuplicatedInternalTransactions`

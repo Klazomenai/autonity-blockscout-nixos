@@ -67,7 +67,12 @@
 # `RestrictAddressFamilies`, `SystemCallFilter`, etc.) — this wrapper
 # only adds the Blockscout-specific surface on top. Re-applying or
 # weakening that hardening is deliberately avoided.
-{ config, lib, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.services.blockscout-postgresql;
@@ -78,6 +83,38 @@ let
     mkDefault
     types
     ;
+
+  # Runtime secret-path check — second layer of the secrets contract
+  # on top of the option-set-time `lib.hasPrefix "/nix/store/"`
+  # assertion. Resolves `passwordFile` via `realpath -e` and fails
+  # the unit if the resolved target is under `/nix/store/` (catches
+  # `/etc/`-mounted symlinks whose targets ARE in the store —
+  # `environment.etc` is the most common producer of those, and the
+  # literal-prefix assertion can't see through the symlink).
+  #
+  # Wired as `ExecStartPre=+<path>` on `postgresql-setup.service` so
+  # the check runs as root regardless of `User=`. The setup unit
+  # itself runs as `User=postgres` per nixpkgs default, but the
+  # check needs to traverse `/run/secrets/`-style paths that are
+  # often locked to root only — hence the `+` privilege escalation.
+  checkPasswordPathScript = pkgs.writeShellScript "blockscout-postgresql-check-password-path" ''
+    set -u
+
+    path=${lib.escapeShellArg cfg.passwordFile}
+    if ! resolved=$(${pkgs.coreutils}/bin/realpath -e -- "$path" 2>/dev/null); then
+      echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' — does not exist, or has an unreadable parent directory at unit-start time. The setup unit cannot proceed without the password." >&2
+      exit 1
+    fi
+    case "$resolved" in
+      /nix/store/*)
+        echo "ERROR: services.blockscout-postgresql.passwordFile = '$path' resolves to '$resolved' which is under /nix/store/." >&2
+        echo "       Secrets in the world-readable Nix store defeat the module's secrets contract." >&2
+        echo "       Source from sops-nix / agenix into a tmpfs path (e.g. /run/secrets/...) instead." >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+  '';
 in
 {
   options.services.blockscout-postgresql = {
@@ -161,18 +198,26 @@ in
         `databasePasswordFile` should point at the same file).
 
         MUST be an absolute path whose literal prefix is NOT
-        `/nix/store/`. The check is a literal-prefix comparison at
-        option-set time — it catches Nix-path literals like
-        `./secret` (which would auto-copy into the store) and any
-        hand-written `/nix/store/...` paths. It does NOT enforce a
-        strict "bytes are off-store" guarantee: a path under `/etc/`
-        materialised via `environment.etc` resolves to a symlink
-        whose target is in the store and still passes the check.
+        `/nix/store/`. Two-layer enforcement:
+
+        - Eval-time `lib.hasPrefix` rejects Nix-path literals (e.g.
+          `./secret` that would auto-copy into the store) and any
+          hand-written `/nix/store/...` paths.
+        - Runtime `ExecStartPre=+` on `postgresql-setup.service`
+          (which the wrapper installs) `realpath -e`s the path and
+          rejects any whose resolved target is under `/nix/store/`.
+          That catches the symlink-into-store case the eval-time
+          check can't see — most commonly an `/etc/...` path
+          materialised via `environment.etc`, where the
+          consumer-visible path is `/etc/<name>` but the bytes IS
+          a store-resident symlink target.
+
         Operators sourcing from sops-nix / agenix into a tmpfs path
-        (`/run/secrets/...`) get the full off-store guarantee;
-        `environment.etc`-based fixtures (the integration test)
-        accept the symlink-resolved store residency as a determinism
-        trade-off.
+        (`/run/secrets/...`) satisfy both checks; the integration
+        test imitates that shape via a `/run/test-secrets/`
+        activation script (the older `environment.etc`-based form
+        passed eval but is rejected by the runtime check, by
+        design).
 
         Real deployments source this from sops-nix / agenix into a
         tmpfs path (`/run/secrets/...`) decrypted at activation. For
@@ -208,7 +253,7 @@ in
     assertions = [
       {
         assertion = lib.hasPrefix "/" cfg.passwordFile && !lib.hasPrefix "/nix/store/" cfg.passwordFile;
-        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` realised via `environment.etc` symlink into the store still pass; the assertion catches the obvious mistakes (Nix-path literals, hand-written `/nix/store/...` paths) but does not enforce a strict bytes-off-store guarantee. Operators sourcing from sops-nix / agenix into a tmpfs path get the full off-store guarantee.)";
+        message = "services.blockscout-postgresql.passwordFile (`${cfg.passwordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. This is the eval-time half of the secrets contract; the runtime ExecStartPre on `postgresql-setup.service` ALSO rejects paths whose `realpath -e` resolves into the store (catching `/etc/`-mounted symlinks that `environment.etc` produces, which the eval-time check can't see).";
       }
     ];
 
@@ -303,5 +348,16 @@ in
       ALTER ROLE "${cfg.username}" WITH PASSWORD :'pw';
       EOF
     '';
+
+    # Runtime secret-path check fired at unit start, before the
+    # appended ALTER ROLE block above runs. The leading `+` makes
+    # systemd run this as root regardless of the unit's `User=`
+    # (`postgres` per nixpkgs default), so the check can traverse
+    # root-only `/run/secrets/`-style tmpfs directories. Failure
+    # here exits the setup unit non-zero before the ALTER ROLE
+    # would attempt to read a store-resident password.
+    systemd.services.postgresql-setup.serviceConfig.ExecStartPre = [
+      "+${checkPasswordPathScript}"
+    ];
   };
 }

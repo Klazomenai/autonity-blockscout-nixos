@@ -113,6 +113,70 @@ let
   postgresLocal = lib.elem cfg.databaseHost loopbackHosts;
   redisLocal = lib.elem cfg.redisHost loopbackHosts;
 
+  # Runtime secret-path check. Wired into the unit as
+  # `ExecStartPre=+<path>` (the leading `+` runs the command as
+  # root, regardless of `User=`/`DynamicUser=`, which is needed
+  # because `realpath -e` of an operator-supplied secret path may
+  # require traversing root-only directories like a `/run/secrets/`
+  # tmpfs that sops-nix / agenix mode 0700-locked-down).
+  #
+  # For each configured secret path the script:
+  #   1. Resolves it via `realpath -e` (strict — fails if any
+  #      component is missing or unreadable).
+  #   2. Greps the resolved target for `/nix/store/` prefix.
+  #   3. If matched, emits an error naming the offending option AND
+  #      the resolved path, and exits non-zero — fails the unit.
+  #
+  # Why this is the second layer on top of the option-set-time
+  # `lib.hasPrefix "/nix/store/"` assertion: `lib.hasPrefix` only
+  # checks the literal path prefix, which catches Nix-path literals
+  # (`./secret` auto-copying to the store) and hand-written
+  # `/nix/store/...` paths but NOT a path under `/etc/` realised via
+  # `environment.etc` whose target IS in the store. The runtime
+  # check resolves symlinks and catches that case too. Both layers
+  # ship together: the eval-time check fails fast on the obvious
+  # mistakes, the runtime check catches the symlink-into-store gap.
+  #
+  # Nullable options (cookieFile, extraPostMigrateFile) skip when
+  # null; secretEnvFiles iterates over its entries; mandatory
+  # options (secretKeyBaseFile, databasePasswordFile) always check.
+  checkSecretPathsScript = pkgs.writeShellScript "blockscout-backend-check-secret-paths" ''
+    set -u
+    fail=0
+
+    check() {
+      local name="$1" path="$2"
+      local resolved
+      if ! resolved=$(${pkgs.coreutils}/bin/realpath -e -- "$path" 2>/dev/null); then
+        echo "ERROR: services.blockscout-backend.''${name} = '$path' — does not exist, or has an unreadable parent directory at unit-start time. The unit cannot proceed without the secret." >&2
+        fail=1
+        return
+      fi
+      case "$resolved" in
+        /nix/store/*)
+          echo "ERROR: services.blockscout-backend.''${name} = '$path' resolves to '$resolved' which is under /nix/store/." >&2
+          echo "       Secrets in the world-readable Nix store defeat the module's secrets contract." >&2
+          echo "       Source from sops-nix / agenix into a tmpfs path (e.g. /run/secrets/...) instead." >&2
+          fail=1
+          ;;
+      esac
+    }
+
+    check secretKeyBaseFile ${lib.escapeShellArg cfg.secretKeyBaseFile}
+    check databasePasswordFile ${lib.escapeShellArg cfg.databasePasswordFile}
+    ${lib.optionalString (
+      cfg.cookieFile != null
+    ) "check cookieFile ${lib.escapeShellArg cfg.cookieFile}"}
+    ${lib.optionalString (
+      cfg.extraPostMigrateFile != null
+    ) "check extraPostMigrateFile ${lib.escapeShellArg cfg.extraPostMigrateFile}"}
+    ${lib.concatMapStringsSep "\n    " (
+      name: "check secretEnvFiles.${name}.path ${lib.escapeShellArg cfg.secretEnvFiles.${name}.path}"
+    ) (lib.attrNames cfg.secretEnvFiles)}
+
+    exit $fail
+  '';
+
   # Bash wrapper that exports each LoadCredential-sourced secret into
   # the process environment, optionally runs the migration, then execs
   # the main server. Static env vars are provided by systemd's
@@ -734,17 +798,17 @@ in
         `extraPostMigrate` — set one or the other, not both.
         Asserted at option-set time.
 
-        MUST be an absolute path NOT under `/nix/store/` (when
-        non-null) — same secrets contract as the other path-based
-        options. Note the limitation: the assertion checks the
-        literal path prefix at evaluation time, so a
-        `/etc/`-mounted path that resolves via symlink into
-        `/nix/store/` (as `environment.etc` does) passes the check
-        even though its bytes ARE in the store. Operators sourcing
-        from sops-nix / agenix into a tmpfs path get the full
-        guarantee; the integration-test fixture uses
-        `environment.etc` and accepts the symlink-resolved store
-        residency as a determinism trade-off.
+        MUST be an absolute path whose literal prefix is NOT
+        `/nix/store/` (when non-null) — same secrets contract as the
+        other path-based options. Two-layer enforcement:
+        eval-time `lib.hasPrefix` rejects Nix-path literals + hand-
+        written `/nix/store/...` paths; runtime `ExecStartPre=+`
+        rejects paths whose `realpath -e` resolves into the store
+        (catches `/etc/`-mounted symlinks that `environment.etc`
+        produces, which the eval-time check can't see). Operators
+        sourcing from sops-nix / agenix into a tmpfs path get both
+        checks satisfied; the integration test imitates that shape
+        via a `/run/test-secrets/` activation script.
       '';
     };
 
@@ -836,21 +900,20 @@ in
     #      is used verbatim as both the LoadCredential= name and the
     #      $CREDENTIALS_DIRECTORY/<NAME> filename, so unsafe chars
     #      would leak into those paths.
-    #   2. Every secret path option (secretKeyBaseFile and each
-    #      secretEnvFiles.<name>.path) is absolute and has a literal
-    #      prefix that is NOT `/nix/store/`. NOTE: this is a
-    #      LITERAL-PREFIX check at evaluation time. A path like
-    #      `/etc/test-secrets/skb`, which `environment.etc` realises
-    #      via a symlink whose TARGET is in `/nix/store/`, passes the
-    #      check even though the bytes do live in the store. The
-    #      assertion's intent is to catch the obvious mistakes (a
-    #      Nix-path literal like `./secret` that auto-copies to the
-    #      store, or a hand-written `/nix/store/...` path), not to
-    #      enforce a strict "bytes are off-store" guarantee. Operators
-    #      sourcing from sops-nix / agenix into a tmpfs (`/run/...`)
-    #      get the full off-store guarantee — `environment.etc`-based
-    #      fixtures (the integration test) accept the symlink-resolved
-    #      store residency as a determinism trade-off.
+    #   2. Every secret path option (secretKeyBaseFile et al.) is
+    #      absolute and has a literal prefix that is NOT
+    #      `/nix/store/`. This is the EVAL-TIME half of the secrets
+    #      contract — fast-fails on Nix-path literals (`./secret`
+    #      auto-copying to the store) and hand-written
+    #      `/nix/store/...` paths. The RUNTIME half is the
+    #      `ExecStartPre=+checkSecretPathsScript` declared on
+    #      `systemd.services.blockscout-backend.serviceConfig` (see
+    #      the top `let`): it `realpath -e`s each path and rejects
+    #      any whose resolved target is under `/nix/store/`,
+    #      catching the symlink-into-store case the eval-time check
+    #      can't see (an `/etc/...` path realised via
+    #      `environment.etc` is the most common producer). Both
+    #      layers ship together.
     #   3. extraPostMigrate vs extraPostMigrateFile: at most one set.
     assertions =
       (mapAttrsToList (name: _: {
@@ -861,18 +924,18 @@ in
         {
           assertion =
             lib.hasPrefix "/" cfg.secretKeyBaseFile && !lib.hasPrefix "/nix/store/" cfg.secretKeyBaseFile;
-          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — paths under `/etc/` that resolve via symlink into the store still pass; see the option's docstring.)";
+          message = "services.blockscout-backend.secretKeyBaseFile (`${cfg.secretKeyBaseFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. This is the eval-time half of the secrets contract; the runtime ExecStartPre also rejects paths whose `realpath -e` resolves into the store (catching `/etc/`-mounted symlinks).";
         }
         {
           assertion =
             lib.hasPrefix "/" cfg.databasePasswordFile && !lib.hasPrefix "/nix/store/" cfg.databasePasswordFile;
-          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+          message = "services.blockscout-backend.databasePasswordFile (`${cfg.databasePasswordFile}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Eval-time half of the contract; runtime ExecStartPre catches symlink-to-store too.)";
         }
         {
           assertion =
             cfg.cookieFile == null
             || (lib.hasPrefix "/" cfg.cookieFile && !lib.hasPrefix "/nix/store/" cfg.cookieFile);
-          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+          message = "services.blockscout-backend.cookieFile (`${toString cfg.cookieFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Eval-time half of the contract; runtime ExecStartPre catches symlink-to-store too.)";
         }
         {
           assertion =
@@ -880,7 +943,7 @@ in
             || (
               lib.hasPrefix "/" cfg.extraPostMigrateFile && !lib.hasPrefix "/nix/store/" cfg.extraPostMigrateFile
             );
-          message = "services.blockscout-backend.extraPostMigrateFile (`${toString cfg.extraPostMigrateFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+          message = "services.blockscout-backend.extraPostMigrateFile (`${toString cfg.extraPostMigrateFile}`) must be either null or an absolute path whose literal prefix is NOT `/nix/store/`. (Eval-time half of the contract; runtime ExecStartPre catches symlink-to-store too.)";
         }
         {
           assertion = !(cfg.extraPostMigrate != "" && cfg.extraPostMigrateFile != null);
@@ -889,7 +952,7 @@ in
       ]
       ++ mapAttrsToList (name: entry: {
         assertion = lib.hasPrefix "/" entry.path && !lib.hasPrefix "/nix/store/" entry.path;
-        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Literal-prefix check only — same caveat as secretKeyBaseFile.)";
+        message = "services.blockscout-backend.secretEnvFiles.${name}.path (`${entry.path}`) must be an absolute path whose literal prefix is NOT `/nix/store/`. (Eval-time half of the contract; runtime ExecStartPre catches symlink-to-store too.)";
       }) cfg.secretEnvFiles;
 
     # No `services.postgresql.authentication` injection: connection
@@ -964,6 +1027,17 @@ in
       // cfg.extraEnv;
 
       serviceConfig = {
+        # Runtime secret-path check — the second layer of the
+        # secrets contract on top of the option-set-time
+        # `lib.hasPrefix "/nix/store/"` assertion. The leading `+`
+        # runs the script as root regardless of `DynamicUser=`,
+        # because operator-supplied secret paths under
+        # `/run/secrets/` (sops-nix / agenix typical setup) are
+        # often locked to root-traversal-only and the dynamic user
+        # can't `realpath -e` them. See `checkSecretPathsScript` in
+        # the top `let` block for the implementation and rationale.
+        ExecStartPre = [ "+${checkSecretPathsScript}" ];
+
         # ExecStart is a small shell wrapper that reads credentials
         # from $CREDENTIALS_DIRECTORY (populated by LoadCredential=
         # below), optionally runs the migration, and execs the
