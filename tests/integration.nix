@@ -142,8 +142,9 @@ pkgs.testers.nixosTest {
         # below is never dialled); what we want to verify is that
         # the wrapper renders `static-nodes.json` into StateDirectory
         # at unit start with mode 0600 and JSON-serialised content.
-        # The pubkey is 64 zeros — syntactically valid enode URI but
-        # cryptographically meaningless.
+        # The enode node ID / pubkey field below is 128 hex `0`
+        # characters (the full uncompressed secp256k1 pubkey width)
+        # — syntactically valid, but cryptographically meaningless.
         staticNodes = [
           "enode://00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:30303"
         ];
@@ -233,6 +234,7 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
+    import json
     import re
 
     machine.start()
@@ -252,8 +254,11 @@ pkgs.testers.nixosTest {
     # 1a. `services.autonity.staticNodes` ExecStartPre side-effect.
     #     The fixture above sets a one-element list; this step
     #     asserts the wrapper rendered `static-nodes.json` into
-    #     StateDirectory with mode 0600 and that the JSON content
-    #     round-trips. With DynamicUser the file lives at
+    #     StateDirectory with mode 0600 and that the file parses as
+    #     a single-element JSON array of enode URIs. Parsing rather
+    #     than substring-matching catches malformed JSON, accidental
+    #     wrong list shape (e.g. nested), or a dropped/duplicated
+    #     element. With DynamicUser the file lives at
     #     `/var/lib/private/autonity/static-nodes.json` (root has
     #     full traversal regardless of permission bits), and the
     #     symlink at `/var/lib/autonity` points there.
@@ -263,9 +268,19 @@ pkgs.testers.nixosTest {
         "stat -c %a /var/lib/autonity/static-nodes.json"
     ).strip()
     assert mode == "600", f"static-nodes.json mode is {mode!r}, expected 600"
-    static_nodes = machine.succeed("cat /var/lib/autonity/static-nodes.json")
-    assert "enode://" in static_nodes, (
-        f"static-nodes.json does not contain an enode entry: {static_nodes!r}"
+    static_nodes_raw = machine.succeed("cat /var/lib/autonity/static-nodes.json")
+    static_nodes_json = json.loads(static_nodes_raw)
+    assert isinstance(static_nodes_json, list), (
+        f"static-nodes.json is not a JSON list: {static_nodes_raw!r}"
+    )
+    assert len(static_nodes_json) == 1, (
+        f"static-nodes.json has {len(static_nodes_json)} entries, expected 1: {static_nodes_json!r}"
+    )
+    assert (
+        isinstance(static_nodes_json[0], str)
+        and static_nodes_json[0].startswith("enode://")
+    ), (
+        f"static-nodes.json[0] is not an enode URI: {static_nodes_json!r}"
     )
 
     # ---------------------------------------------------------------

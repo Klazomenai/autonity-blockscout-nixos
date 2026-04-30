@@ -247,8 +247,8 @@ in
       type = types.nullOr (types.listOf types.str);
       default = null;
       example = [
-        "enode://abc123@1.2.3.4:30303"
-        "enode://def456@5.6.7.8:30303"
+        "enode://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@1.2.3.4:30303"
+        "enode://fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210@5.6.7.8:30303"
       ];
       description = ''
         Pinned peers that the node always tries to maintain a
@@ -259,16 +259,20 @@ in
         When non-null, the list is JSON-serialised at Nix evaluation
         time and written to `static-nodes.json` in the service's
         `StateDirectory` (`''${cfg.dataDir}/static-nodes.json`) at
-        unit start — this is the Geth-family file convention, used
-        by Autonity verbatim. Autonity does not expose a direct
-        `--staticnodes` CLI flag; the file is the only supported
-        input. The file is staged in the Nix store via
-        `pkgs.writeText` and copied into the StateDirectory by an
-        `ExecStartPre=` step (mode 0600, owned by the unit's dynamic
-        user), so the staged-in-store version is world-readable but
-        the in-state-dir version is not. The enode URIs are NOT
-        secrets — they're public node-identity hints — so the
-        store-resident staged copy carries no secrecy concern.
+        unit start — this is the legacy Geth-family file convention,
+        which Autonity still reads verbatim. Autonity does not
+        expose a direct `--staticnodes` CLI flag; this module uses
+        the `static-nodes.json` path rather than TOML-based config,
+        which upstream Geth-family nodes also support (Autonity logs
+        a deprecation warning recommending the TOML form, but reads
+        the JSON file regardless). The file is staged in the Nix
+        store via `pkgs.writeText` and copied into the StateDirectory
+        by an `ExecStartPre=` step (mode 0600, owned by the unit's
+        dynamic user), so the staged-in-store version is
+        world-readable but the in-state-dir version is not. The
+        enode URIs are NOT secrets — they're public node-identity
+        hints — so the store-resident staged copy carries no secrecy
+        concern.
 
         When `null` (default), no `ExecStartPre=` fires and no JSON
         file is written; Autonity reads no static-peers list and
