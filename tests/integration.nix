@@ -135,6 +135,19 @@ pkgs.testers.nixosTest {
         p2p.maxPeers = 0;
         p2p.openFirewall = false;
         extraArgs = [ "--nodiscover" ];
+
+        # Exercise the staticNodes ExecStartPre path. The list value
+        # itself is irrelevant for behaviour (the test runs with
+        # `--nodiscover --maxpeers=0`, so even the fake loopback peer
+        # below is never dialled); what we want to verify is that
+        # the wrapper renders `static-nodes.json` into StateDirectory
+        # at unit start with mode 0600 and JSON-serialised content.
+        # The enode node ID / pubkey field below is 128 hex `0`
+        # characters (the full uncompressed secp256k1 pubkey width)
+        # — syntactically valid, but cryptographically meaningless.
+        staticNodes = [
+          "enode://00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:30303"
+        ];
       };
 
       services.blockscout-postgresql = {
@@ -221,6 +234,7 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
+    import json
     import re
 
     machine.start()
@@ -235,6 +249,39 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("blockscout-backend.service")
     machine.wait_for_unit("blockscout-frontend.service")
     machine.wait_for_unit("nginx.service")
+
+    # ---------------------------------------------------------------
+    # 1a. `services.autonity.staticNodes` ExecStartPre side-effect.
+    #     The fixture above sets a one-element list; this step
+    #     asserts the wrapper rendered `static-nodes.json` into
+    #     StateDirectory with mode 0600 and that the file parses as
+    #     a single-element JSON array of enode URIs. Parsing rather
+    #     than substring-matching catches malformed JSON, accidental
+    #     wrong list shape (e.g. nested), or a dropped/duplicated
+    #     element. With DynamicUser the file lives at
+    #     `/var/lib/private/autonity/static-nodes.json` (root has
+    #     full traversal regardless of permission bits), and the
+    #     symlink at `/var/lib/autonity` points there.
+    # ---------------------------------------------------------------
+    machine.succeed("test -f /var/lib/autonity/static-nodes.json")
+    mode = machine.succeed(
+        "stat -c %a /var/lib/autonity/static-nodes.json"
+    ).strip()
+    assert mode == "600", f"static-nodes.json mode is {mode!r}, expected 600"
+    static_nodes_raw = machine.succeed("cat /var/lib/autonity/static-nodes.json")
+    static_nodes_json = json.loads(static_nodes_raw)
+    assert isinstance(static_nodes_json, list), (
+        f"static-nodes.json is not a JSON list: {static_nodes_raw!r}"
+    )
+    assert len(static_nodes_json) == 1, (
+        f"static-nodes.json has {len(static_nodes_json)} entries, expected 1: {static_nodes_json!r}"
+    )
+    assert (
+        isinstance(static_nodes_json[0], str)
+        and static_nodes_json[0].startswith("enode://")
+    ), (
+        f"static-nodes.json[0] is not an enode URI: {static_nodes_json!r}"
+    )
 
     # ---------------------------------------------------------------
     # 2. Loopback ports listening.

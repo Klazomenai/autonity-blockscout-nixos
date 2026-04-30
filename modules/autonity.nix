@@ -243,6 +243,43 @@ in
       '';
     };
 
+    staticNodes = mkOption {
+      type = types.nullOr (types.listOf types.str);
+      default = null;
+      example = [
+        "enode://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@1.2.3.4:30303"
+        "enode://fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210@5.6.7.8:30303"
+      ];
+      description = ''
+        Pinned peers that the node always tries to maintain a
+        connection to, in addition to peers acquired through
+        discovery. Useful when bootnodes are unavailable or when an
+        operator wants a guaranteed link between two specific nodes.
+
+        When non-null, the list is JSON-serialised at Nix evaluation
+        time and written to `static-nodes.json` in the service's
+        `StateDirectory` (`''${cfg.dataDir}/static-nodes.json`) at
+        unit start — this is the legacy Geth-family file convention,
+        which Autonity still reads verbatim. Autonity does not
+        expose a direct `--staticnodes` CLI flag; this module uses
+        the `static-nodes.json` path rather than TOML-based config,
+        which upstream Geth-family nodes also support (Autonity logs
+        a deprecation warning recommending the TOML form, but reads
+        the JSON file regardless). The file is staged in the Nix
+        store via `pkgs.writeText` and copied into the StateDirectory
+        by an `ExecStartPre=` step (mode 0600, owned by the unit's
+        dynamic user), so the staged-in-store version is
+        world-readable but the in-state-dir version is not. The
+        enode URIs are NOT secrets — they're public node-identity
+        hints — so the store-resident staged copy carries no secrecy
+        concern.
+
+        When `null` (default), no `ExecStartPre=` fires and no JSON
+        file is written; Autonity reads no static-peers list and
+        relies entirely on `bootnodes` + discovery.
+      '';
+    };
+
     metrics.enable = mkEnableOption "the Autonity Prometheus metrics endpoint";
 
     extraArgs = mkOption {
@@ -274,6 +311,25 @@ in
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/autonity ${args} ${lib.escapeShellArgs cfg.extraArgs}";
+
+        # Stage `static-nodes.json` into StateDirectory at unit start
+        # when `staticNodes` is non-null. The file is the legacy
+        # Geth-family mechanism for pinned peers used by this module;
+        # Autonity does not accept a `--staticnodes` CLI flag, while
+        # TOML config (`--config <file>`) is the preferred modern
+        # mechanism upstream and would supersede the file form if
+        # this module ever grows a TOML-config option. `install -m
+        # 0600` overwrites any existing file, ensuring rebuilds with
+        # a changed list always take effect on the next start (not
+        # just on first boot). When `staticNodes` is null, the list
+        # `lib.optional` below evaluates to `[]` and no ExecStartPre
+        # fires.
+        ExecStartPre = lib.optional (cfg.staticNodes != null) (
+          "${pkgs.coreutils}/bin/install -m 0600 -T "
+          + "${pkgs.writeText "static-nodes.json" (builtins.toJSON cfg.staticNodes)} "
+          + "\${STATE_DIRECTORY}/static-nodes.json"
+        );
+
         Restart = "on-failure";
         RestartSec = "5s";
 
