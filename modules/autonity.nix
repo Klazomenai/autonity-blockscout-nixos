@@ -313,14 +313,17 @@ in
         ExecStart = "${cfg.package}/bin/autonity ${args} ${lib.escapeShellArgs cfg.extraArgs}";
 
         # Stage `static-nodes.json` into StateDirectory at unit start
-        # when `staticNodes` is non-null. The file is the Geth-family
-        # convention for pinned peers — Autonity does not accept a
-        # `--staticnodes` CLI flag, so the on-disk file is the only
-        # supported input. `install -m 0600` overwrites any existing
-        # file, ensuring rebuilds with a changed list always take
-        # effect on the next start (not just on first boot). When
-        # `staticNodes` is null, the list `lib.optional` below
-        # evaluates to `[]` and no ExecStartPre fires.
+        # when `staticNodes` is non-null. The file is the legacy
+        # Geth-family mechanism for pinned peers used by this module;
+        # Autonity does not accept a `--staticnodes` CLI flag, while
+        # TOML config (`--config <file>`) is the preferred modern
+        # mechanism upstream and would supersede the file form if
+        # this module ever grows a TOML-config option. `install -m
+        # 0600` overwrites any existing file, ensuring rebuilds with
+        # a changed list always take effect on the next start (not
+        # just on first boot). When `staticNodes` is null, the list
+        # `lib.optional` below evaluates to `[]` and no ExecStartPre
+        # fires.
         ExecStartPre = lib.optional (cfg.staticNodes != null) (
           "${pkgs.coreutils}/bin/install -m 0600 -T "
           + "${pkgs.writeText "static-nodes.json" (builtins.toJSON cfg.staticNodes)} "
