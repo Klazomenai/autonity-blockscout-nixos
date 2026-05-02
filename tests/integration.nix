@@ -207,36 +207,60 @@ pkgs.testers.nixosTest {
         secretKeyBaseFile = "/run/test-secrets/skb";
         databasePasswordFile = "/run/test-secrets/db_password";
 
-        # Test-only fixture: short-circuit the upstream Blockscout
+        # Test-only fixture that stops the
         # `Explorer.Migrator.ReindexDuplicatedInternalTransactions`
-        # filling-migrator. Upstream PR blockscout/blockscout#14099
-        # (commit b16530084) removed the `block_hash` field from
-        # `Explorer.Chain.InternalTransaction` but did NOT update the
-        # migrator's query, which still does
-        # `select: it.block_hash, group_by: [it.block_hash, ...]`
-        # (apps/explorer/lib/explorer/migrator/
-        # reindex_duplicated_internal_transactions.ex:65). At BEAM
-        # startup the migrator GenServer enters a tight crash loop
-        # (Ecto.QueryError, ~100×/second) that's harmless on a fast
-        # KVM-accelerated host but saturates the BEAM scheduler on
-        # CI runners (TCG software emulation, no nested KVM, 2
-        # vCPUs) and starves the Next.js SSR thread, wedging step 6
-        # of this test indefinitely.
+        # GenServer from running in this VM by pre-marking its
+        # migration row as `completed` before the BEAM supervisor
+        # boots.
         #
-        # The migrator inherits from `Explorer.Migrator.FillingMigration`
-        # whose init callback exits cleanly when
-        # `MigrationStatus.fetch/1` returns `%{status: "completed"}`
-        # (filling_migration.ex:217-227). There's no env var or
-        # runtime config to skip it (`enabled: true` is compile-time
-        # only), so we INSERT the completion row pre-supervisor.
+        # What we observe in this VM's BEAM journal:
+        # - The migrator GenServer raises
+        #   `(Ecto.QueryError) field 'block_hash' in 'select' does
+        #   not exist in schema Explorer.Chain.InternalTransaction`
+        #   on every `:migrate_batch` tick.
+        # - The supervisor restarts it; stacktraces cluster at
+        #   sub-second cadence in the journal.
+        # - On slow runners (TCG software emulation, no nested KVM,
+        #   2 vCPUs) the rapid-restart cycle saturates the BEAM
+        #   scheduler enough that `wait_for_open_port(3000)`
+        #   wedges and step 6 of this test never completes.
         #
-        # Scoped to this fixture (NOT in the production module
-        # default) so deployments don't silently skip a real
-        # data-fix migration once upstream patches the bug. Tracking
-        # follow-up: file an issue against `klazomenai/blockscout`
-        # to patch the broken migrator at source via `prePatch`,
-        # which would let us drop this fixture and let production
-        # deployments inherit the fix automatically.
+        # Verified by reading the consuming fork's source tree
+        # (klazomenai/blockscout):
+        # - Migrator query at `apps/explorer/lib/explorer/migrator/
+        #   reindex_duplicated_internal_transactions.ex:65-71`
+        #   selects + group-bys `block_hash`.
+        # - `Explorer.Chain.InternalTransaction` schema
+        #   (`apps/explorer/lib/explorer/chain/
+        #   internal_transaction.ex:56-76`) declares no
+        #   `:block_hash` field.
+        # - The migrator inherits from
+        #   `Explorer.Migrator.FillingMigration` whose init
+        #   callback exits cleanly when `MigrationStatus.fetch/1`
+        #   returns `%{status: "completed"}`
+        #   (`filling_migration.ex:217-227`). There is no env var
+        #   or runtime config to skip the migrator —
+        #   `enabled: true` is compile-time-only at
+        #   `apps/explorer/config/config.exs:138`. The
+        #   `migrations_status` row insertion below is the
+        #   smallest mechanism we have for stopping the GenServer
+        #   from running.
+        #
+        # We do NOT know:
+        # - Whether the schema/migrator combination is intentional,
+        #   transitional, or unintended from upstream Blockscout's
+        #   perspective.
+        # - Whether upstream is aware, planning a fix, or has a
+        #   different code path in mind for this migrator.
+        #
+        # Scoped to this test fixture (NOT carried as a default in
+        # `services.blockscout-backend`) so production deployments
+        # are not silently affected by our local interpretation of
+        # this state. Tracking follow-up: `klazomenai/blockscout#9`
+        # — a `prePatch` on the fork's flake.nix that prevents the
+        # GenServer from being started at the supervisor level.
+        # When that lands and we bump the fork's flake input, this
+        # `extraPostMigrate` fixture can be removed.
         extraPostMigrate = ''
           INSERT INTO migrations_status
             (migration_name, status, inserted_at, updated_at)
