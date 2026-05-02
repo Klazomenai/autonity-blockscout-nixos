@@ -222,8 +222,9 @@ pkgs.testers.nixosTest {
         #   sub-second cadence in the journal.
         # - On slow runners (TCG software emulation, no nested KVM,
         #   2 vCPUs) the rapid-restart cycle saturates the BEAM
-        #   scheduler enough that `wait_for_open_port(3000)`
-        #   wedges and step 6 of this test never completes.
+        #   scheduler enough that step 6's first SSR request
+        #   (`wait_until_succeeds` on `curl … /assets/envs.js`)
+        #   never completes within its 120s timeout.
         #
         # Verified by reading the consuming fork's source tree
         # (klazomenai/blockscout):
