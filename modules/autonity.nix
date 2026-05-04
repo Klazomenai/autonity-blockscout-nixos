@@ -110,14 +110,21 @@ in
           testing. Emits `--dev`. **Test scope only — NOT a production
           deployment path.**
 
-        The `dev` value is intended for the local nixosTest harness +
-        `nix run .#e2e` smoke runs. It runs a single-validator Tendermint
-        chain at chain ID 65111111 with a 1-second block period. The
-        binary internally disables peer discovery and forces an
-        in-memory chain database (`cfg.DataDir = ""`); the chain DB is
-        therefore lost on every restart of the autonity unit. Module
-        options that imply on-disk persistence (`dataDir`,
-        `StateDirectory`-derived paths) become advisory under `dev`.
+        The `dev` value is intended for the local nixosTest harness
+        and any host-native sync smoke tests built on top of this
+        module. It runs a single-validator Tendermint chain at chain ID
+        65111111 with a 1-second block period.
+
+        Under `--dev` the binary internally disables peer discovery and
+        forces Autonity's *chain database* to be held in memory (i.e.
+        the chain state is non-persistent and is lost on every restart
+        of the autonity unit). Module-level paths (`dataDir`,
+        `StateDirectory`, `static-nodes.json`) remain functional for
+        their non-chain-DB roles — systemd still creates the state
+        directory, `static-nodes.json` is still read from there at
+        startup, and `--datadir` is still passed to the binary. Only
+        the on-disk chain DB itself becomes ephemeral.
+
         Production deployments must use `network = "mainnet"` or
         `network = "bakerloo"`.
       '';
