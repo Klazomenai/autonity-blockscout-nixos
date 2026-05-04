@@ -83,7 +83,12 @@ pkgs.testers.nixosTest {
   name = "autonity-blockscout-integration";
 
   nodes.machine =
-    { config, lib, options, ... }:
+    {
+      config,
+      lib,
+      options,
+      ...
+    }:
     {
       imports = [ flake.nixosModules.default ];
 
@@ -248,11 +253,9 @@ pkgs.testers.nixosTest {
         # re-bound to `chainId`. This pattern is robust against future
         # additions to the module's default attrset (new keys land
         # automatically; no need to re-edit the test).
-        publicEnv =
-          options.services.blockscout-frontend.publicEnv.default
-          // {
-            NEXT_PUBLIC_NETWORK_ID = toString chainId;
-          };
+        publicEnv = options.services.blockscout-frontend.publicEnv.default // {
+          NEXT_PUBLIC_NETWORK_ID = toString chainId;
+        };
       };
 
       services.blockscout-nginx = {
