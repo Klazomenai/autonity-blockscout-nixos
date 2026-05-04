@@ -33,11 +33,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1777293213,
-        "narHash": "sha256-cRHvlhJFAacbz1YjZWmKuIV32oCs7aFV7J4yw69Axa0=",
+        "lastModified": 1777726932,
+        "narHash": "sha256-PkIu1d4aKVJORkWui9d3KkW32kNLU/+xlAMTs/d6pAQ=",
         "owner": "klazomenai",
         "repo": "blockscout",
-        "rev": "e96896edc223819ae7842aa8fc9b9d867d1c803c",
+        "rev": "e95745133e6c964880b71c1fc841c0a852f79a84",
         "type": "github"
       },
       "original": {
