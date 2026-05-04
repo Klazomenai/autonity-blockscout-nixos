@@ -83,7 +83,7 @@ pkgs.testers.nixosTest {
   name = "autonity-blockscout-integration";
 
   nodes.machine =
-    { config, lib, ... }:
+    { config, lib, options, ... }:
     {
       imports = [ flake.nixosModules.default ];
 
@@ -237,10 +237,22 @@ pkgs.testers.nixosTest {
         enable = true;
         # Single-source-of-truth threading: frontend's
         # `NEXT_PUBLIC_NETWORK_ID` reads from the same let-bound
-        # `chainId`. The module's `publicEnv` default is "65000000"
-        # (string-typed); merging this single-key override keeps every
-        # other default in place and only re-binds the chain ID.
-        publicEnv.NEXT_PUBLIC_NETWORK_ID = toString chainId;
+        # `chainId`. The module's `publicEnv` default is a non-empty
+        # attrset of 14 keys; for `types.attrsOf` the merge semantics
+        # treat that default as a single definition that gets fully
+        # shadowed by any user-provided definition (rather than per-key
+        # merged). To preserve every other default while overriding
+        # only the chain ID, we explicitly read the default out of
+        # `options` and `//`-override the single key — producing one
+        # user definition that contains all 14 keys with the chain ID
+        # re-bound to `chainId`. This pattern is robust against future
+        # additions to the module's default attrset (new keys land
+        # automatically; no need to re-edit the test).
+        publicEnv =
+          options.services.blockscout-frontend.publicEnv.default
+          // {
+            NEXT_PUBLIC_NETWORK_ID = toString chainId;
+          };
       };
 
       services.blockscout-nginx = {
