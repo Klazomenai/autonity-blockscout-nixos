@@ -28,6 +28,17 @@ let
 
   # CLI flag attrset → shell string via lib.cli. Null values are dropped,
   # so flags only appear when an option is active.
+  #
+  # Under `network = "dev"`, `--dev` is documented as disabling peer
+  # discovery and the consensus P2P stack inside the binary, so emitting
+  # peer-related flags alongside it would render an internally
+  # contradictory argv ("disable peers" + "max 50 peers"). We therefore
+  # override `--maxpeers` to 0 and emit `--nodiscover` automatically
+  # whenever `network = "dev"`. This is argv-only enforcement: the
+  # option values `cfg.p2p.maxPeers` and `cfg.p2p.discovery` (if added
+  # later) still report their declared option-level defaults to anyone
+  # reading `config.services.autonity.p2p.*`.
+  isDev = cfg.network == "dev";
   argAttrs = {
     datadir = cfg.dataDir;
     syncmode = cfg.syncMode;
@@ -35,11 +46,13 @@ let
     cache = cfg.cache;
     ipcdisable = true;
     port = cfg.p2p.port;
-    maxpeers = cfg.p2p.maxPeers;
+    maxpeers = if isDev then 0 else cfg.p2p.maxPeers;
+    nodiscover = isDev;
     nat = if cfg.p2p.natExtIp != null then "extip:${cfg.p2p.natExtIp}" else null;
-    # MainNet is the upstream default (no flag); only Bakerloo testnet
-    # needs an explicit switch.
+    # MainNet is the upstream default (no flag); Bakerloo (testnet) and
+    # Dev (single-validator ephemeral chain) each have their own switch.
     bakerloo = cfg.network == "bakerloo";
+    dev = isDev;
 
     http = cfg.http.enable;
     "http.addr" = if cfg.http.enable then cfg.http.addr else null;
@@ -96,12 +109,36 @@ in
       type = types.enum [
         "mainnet"
         "bakerloo"
+        "dev"
       ];
       default = "mainnet";
       description = ''
-        Autonity network to join. MainNet is the upstream default (no
-        flag); selecting Bakerloo (testnet) passes `--bakerloo` to the
-        binary.
+        Autonity network to join.
+
+        - `mainnet` (default): production Autonity MainNet. No CLI flag
+          emitted; the binary defaults to MainNet.
+        - `bakerloo`: public testnet. Emits `--bakerloo`.
+        - `dev`: single-validator ephemeral chain for local end-to-end
+          testing. Emits `--dev`. **Test scope only — NOT a production
+          deployment path.**
+
+        The `dev` value is intended for the local nixosTest harness
+        and any host-native sync smoke tests built on top of this
+        module. It runs a single-validator Tendermint chain at chain ID
+        65111111 with a 1-second block period.
+
+        Under `--dev` the binary internally disables peer discovery and
+        forces Autonity's *chain database* to be held in memory (i.e.
+        the chain state is non-persistent and is lost on every restart
+        of the autonity unit). Module-level paths (`dataDir`,
+        `StateDirectory`, `static-nodes.json`) remain functional for
+        their non-chain-DB roles — systemd still creates the state
+        directory, `static-nodes.json` is still read from there at
+        startup, and `--datadir` is still passed to the binary. Only
+        the on-disk chain DB itself becomes ephemeral.
+
+        Production deployments must use `network = "mainnet"` or
+        `network = "bakerloo"`.
       '';
     };
 
