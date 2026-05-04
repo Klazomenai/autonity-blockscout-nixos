@@ -243,16 +243,31 @@ pkgs.testers.nixosTest {
         # Single-source-of-truth threading: frontend's
         # `NEXT_PUBLIC_NETWORK_ID` reads from the same let-bound
         # `chainId`. The module's `publicEnv` default is a non-empty
-        # attrset of 14 keys; for `types.attrsOf` the merge semantics
-        # treat that default as a single definition that gets fully
-        # shadowed by any user-provided definition (rather than per-key
-        # merged). To preserve every other default while overriding
-        # only the chain ID, we explicitly read the default out of
-        # `options` and `//`-override the single key — producing one
-        # user definition that contains all 14 keys with the chain ID
-        # re-bound to `chainId`. This pattern is robust against future
-        # additions to the module's default attrset (new keys land
-        # automatically; no need to re-edit the test).
+        # attrset of 13 keys (3 API + 7 network + 3 app); empirically
+        # — verified against CI run 25331628915 on this PR's first
+        # push — for `types.attrsOf` with a non-empty default, that
+        # default is a single definition that gets fully shadowed by
+        # any user-provided definition rather than per-key merged. The
+        # earlier `publicEnv.NEXT_PUBLIC_NETWORK_ID = toString chainId;`
+        # form left envs.js with only that one key and the existing
+        # `NEXT_PUBLIC_NETWORK_NAME in envsjs` assertion failed.
+        #
+        # To preserve every other default while overriding only the
+        # chain ID, we read the default out of `options` and
+        # `//`-override the single key, producing one user definition
+        # that contains all 13 keys with the chain ID re-bound. The
+        # pattern is robust against future additions to the module's
+        # default (new keys land automatically; no re-edit needed).
+        #
+        # Caveat: this single user-side definition takes priority over
+        # any sibling-module definitions of `publicEnv.<key>` that get
+        # imported alongside this fixture. Acceptable in this VM test
+        # because no sibling module contributes; if that ever changes
+        # we'd need to switch to a stack of `mkMerge` definitions.
+        # (The current alternative — leaving `publicEnv` unset and
+        # letting the default cover everything — would prevent us from
+        # parameterising the chain ID by `let`-bound `chainId`, which
+        # is the whole point of #33.)
         publicEnv = options.services.blockscout-frontend.publicEnv.default // {
           NEXT_PUBLIC_NETWORK_ID = toString chainId;
         };
@@ -361,6 +376,22 @@ pkgs.testers.nixosTest {
         "systemctl show -p SupplementaryGroups --value blockscout-backend.service"
     ).strip()
     assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
+
+    # `services.blockscout-backend.chain.id` (set in the fixture from
+    # the `chainId` let-binding) must propagate into the unit's
+    # `Environment=` block as `CHAIN_ID=<int>`. Without this assertion
+    # a regression in the backend module's `chain.id -> CHAIN_ID`
+    # plumbing would leave the test green: the eth_chainId / envs.js
+    # assertions only exercise the autonity binary and frontend overlay,
+    # which are upstream of the backend's env wiring. `systemctl show
+    # -p Environment` returns all Environment directives joined on a
+    # single line, so substring containment is the right check.
+    backend_env = machine.succeed(
+        "systemctl show -p Environment --value blockscout-backend.service"
+    ).strip()
+    assert "CHAIN_ID=${toString chainId}" in backend_env, (
+        f"backend CHAIN_ID env missing or mismatched: {backend_env!r}"
+    )
 
     # ---------------------------------------------------------------
     # 4. Backend ↔ Autonity loopback RPC. `wait_until_succeeds` not
