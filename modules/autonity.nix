@@ -28,6 +28,17 @@ let
 
   # CLI flag attrset → shell string via lib.cli. Null values are dropped,
   # so flags only appear when an option is active.
+  #
+  # Under `network = "dev"`, `--dev` is documented as disabling peer
+  # discovery and the consensus P2P stack inside the binary, so emitting
+  # peer-related flags alongside it would render an internally
+  # contradictory argv ("disable peers" + "max 50 peers"). We therefore
+  # override `--maxpeers` to 0 and emit `--nodiscover` automatically
+  # whenever `network = "dev"`. This is argv-only enforcement: the
+  # option values `cfg.p2p.maxPeers` and `cfg.p2p.discovery` (if added
+  # later) still report their declared option-level defaults to anyone
+  # reading `config.services.autonity.p2p.*`.
+  isDev = cfg.network == "dev";
   argAttrs = {
     datadir = cfg.dataDir;
     syncmode = cfg.syncMode;
@@ -35,12 +46,13 @@ let
     cache = cfg.cache;
     ipcdisable = true;
     port = cfg.p2p.port;
-    maxpeers = cfg.p2p.maxPeers;
+    maxpeers = if isDev then 0 else cfg.p2p.maxPeers;
+    nodiscover = isDev;
     nat = if cfg.p2p.natExtIp != null then "extip:${cfg.p2p.natExtIp}" else null;
     # MainNet is the upstream default (no flag); Bakerloo (testnet) and
     # Dev (single-validator ephemeral chain) each have their own switch.
     bakerloo = cfg.network == "bakerloo";
-    dev = cfg.network == "dev";
+    dev = isDev;
 
     http = cfg.http.enable;
     "http.addr" = if cfg.http.enable then cfg.http.addr else null;
