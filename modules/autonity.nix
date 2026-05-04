@@ -37,9 +37,10 @@ let
     port = cfg.p2p.port;
     maxpeers = cfg.p2p.maxPeers;
     nat = if cfg.p2p.natExtIp != null then "extip:${cfg.p2p.natExtIp}" else null;
-    # MainNet is the upstream default (no flag); only Bakerloo testnet
-    # needs an explicit switch.
+    # MainNet is the upstream default (no flag); Bakerloo (testnet) and
+    # Dev (single-validator ephemeral chain) each have their own switch.
     bakerloo = cfg.network == "bakerloo";
+    dev = cfg.network == "dev";
 
     http = cfg.http.enable;
     "http.addr" = if cfg.http.enable then cfg.http.addr else null;
@@ -96,12 +97,29 @@ in
       type = types.enum [
         "mainnet"
         "bakerloo"
+        "dev"
       ];
       default = "mainnet";
       description = ''
-        Autonity network to join. MainNet is the upstream default (no
-        flag); selecting Bakerloo (testnet) passes `--bakerloo` to the
-        binary.
+        Autonity network to join.
+
+        - `mainnet` (default): production Autonity MainNet. No CLI flag
+          emitted; the binary defaults to MainNet.
+        - `bakerloo`: public testnet. Emits `--bakerloo`.
+        - `dev`: single-validator ephemeral chain for local end-to-end
+          testing. Emits `--dev`. **Test scope only — NOT a production
+          deployment path.**
+
+        The `dev` value is intended for the local nixosTest harness +
+        `nix run .#e2e` smoke runs. It runs a single-validator Tendermint
+        chain at chain ID 65111111 with a 1-second block period. The
+        binary internally disables peer discovery and forces an
+        in-memory chain database (`cfg.DataDir = ""`); the chain DB is
+        therefore lost on every restart of the autonity unit. Module
+        options that imply on-disk persistence (`dataDir`,
+        `StateDirectory`-derived paths) become advisory under `dev`.
+        Production deployments must use `network = "mainnet"` or
+        `network = "bakerloo"`.
       '';
     };
 
