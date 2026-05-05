@@ -277,8 +277,17 @@ pkgs.testers.nixosTest {
     # exactly 1, matching the dev chain's `MaxCommitteeSize=1`.
     # Validates the Autonity-native consensus RPC namespace is
     # functional, not just the geth-inherited eth_*.
+    #
+    # Method takes 1 parameter (block number or tag) per the autonity
+    # fork's `internal/web3ext/web3ext.go:771`. `"latest"` is the
+    # geth-family idiom for the current head; any specific block
+    # height (decimal int or `"0x"`-prefixed hex) would also work.
+    # The error from passing zero params is a tier-32000 "block number
+    # cannot be nil" returned at the API boundary, not a method-not-
+    # found 32601 — the method exists, it just won't default the
+    # block argument.
     # ---------------------------------------------------------------
-    committee = rpc_result("tendermint_getCommittee")
+    committee = rpc_result("tendermint_getCommittee", ["latest"])
     assert isinstance(committee, list), (
         f"tendermint_getCommittee did not return a list: {committee!r}"
     )
