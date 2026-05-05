@@ -44,8 +44,9 @@ let
   # `chainIdHex` is computed at Nix eval time via `lib.toHexString`
   # (which emits uppercase hex without a `0x` prefix). Geth-family
   # JSON-RPC returns lowercase hex, so we normalise via `lib.toLower`
-  # before prefixing. The literal hex string never appears anywhere
-  # in the source — `git grep` for `0x3dfd240` should find no hits.
+  # before prefixing. The hex form is never written by hand — the
+  # only authoring site for the chain ID is the integer `chainId`
+  # above; bumping it re-derives the hex automatically.
   chainId = 65000000;
   chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
 
