@@ -136,6 +136,20 @@
           inherit pkgs system;
           flake = self;
         };
+
+        # Behavioural full-stack VM SYNC test — same six-service stack
+        # as `integration`, but with Autonity in `--dev` mode driving
+        # real chain progression. Waits for the chain to produce >= 70
+        # blocks (one epoch crossed plus a 10-block buffer) AND for
+        # the Blockscout indexer to catch up to the same threshold.
+        # Adds ~70-180 s on top of `integration`'s 22-min cold baseline.
+        # Locked design lives in `~/.claude/plans/sharded-stargazing-
+        # puppy.md` §6.5; per-PR opt-out via CI policy is tracked in
+        # the M2.5 epic (#38).
+        checks.integration-sync = import ./tests/integration-sync.nix {
+          inherit pkgs system;
+          flake = self;
+        };
       }
     );
 }
