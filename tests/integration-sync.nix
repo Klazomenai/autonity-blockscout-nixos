@@ -309,21 +309,28 @@ pkgs.testers.nixosTest {
         time.sleep(2)
 
     # ---------------------------------------------------------------
-    # 4. Probe 3 (tendermint_getCommittee at "latest") — assert
-    # committee size is exactly 1, matching the dev chain's
-    # `MaxCommitteeSize=1`. Validates the Autonity-native consensus
-    # RPC namespace is functional, not just the geth-inherited eth_*.
+    # 4. Probe 3 (tendermint_getCommittee at "0x0") — assert committee
+    # size is exactly 1, matching the dev chain's `MaxCommitteeSize=1`.
+    # Validates the Autonity-native consensus RPC namespace is
+    # functional, not just the geth-inherited eth_*.
     #
-    # Method takes 1 parameter (block number or tag) per the autonity
-    # fork's `internal/web3ext/web3ext.go:771`. `"latest"` is the
-    # geth-family idiom for the current head and is reliable here
-    # because the chain is now well into epoch 1+ (we just waited for
-    # >=70 blocks; epoch period is 60). Earlier in the test, before
-    # chain progression, "latest" trips the API's epoch-range gate
-    # because the committee cache for the resolved height isn't
-    # populated yet.
+    # We query at genesis ("0x0"), not "latest". `BlockChain
+    # .EpochByHeight` (`core/blockchain_reader.go:43`) has a fast-path
+    # for `height == 0` returning the genesis epoch directly. For any
+    # other height it delegates to `HeaderChain.EpochByHeight`
+    # (`core/headerchain.go:558`), which trips `ErrOutOfEpochRange`
+    # ("the inserting height is out of epoch range") whenever the
+    # queried height exceeds the latest registered epoch header's
+    # `NextEpochBlock`. At block ~72 in dev mode the only registered
+    # epoch header is still genesis (NextEpochBlock=60), so 72 > 60
+    # trips the gate — passing "latest" or any non-zero height fails
+    # until enough epoch transitions have been committed for the
+    # cache to span the current head. Genesis committee on dev is the
+    # pre-bonded dev validator (`core/genesis.go DeveloperGenesis
+    # Block`), size 1 — semantically the same assertion target as
+    # querying at "latest" would have been if the API permitted it.
     # ---------------------------------------------------------------
-    committee = rpc_result("tendermint_getCommittee", ["latest"])
+    committee = rpc_result("tendermint_getCommittee", ["0x0"])
     assert isinstance(committee, list), (
         f"tendermint_getCommittee did not return a list: {committee!r}"
     )
