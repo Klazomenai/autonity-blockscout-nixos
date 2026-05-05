@@ -234,8 +234,8 @@ pkgs.testers.nixosTest {
             "id": 1,
         })
         out = machine.succeed(
-            f"curl -fsS http://127.0.0.1:8545 "
-            f"-H 'Content-Type: application/json' "
+            "curl -fsS http://127.0.0.1:8545 "
+            "-H 'Content-Type: application/json' "
             f"-d {repr(body)}"
         )
         return json.loads(out)
@@ -288,15 +288,15 @@ pkgs.testers.nixosTest {
         return int(rpc_result("eth_blockNumber"), 16)
 
     machine.wait_until_succeeds(
-        # Heredoc-via-shell because nixosTest's machine.* doesn't
-        # surface int returns. Wrap the python-int comparison via
-        # curl-jq-style; jq is in the base image.
-        f"test $(curl -fsS http://127.0.0.1:8545 "
-        f"-H 'Content-Type: application/json' "
-        f"""-d '{{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"id\":1}}' """
-        f"| ${pkgs.jq}/bin/jq -r '.result' "
-        f"| ${pkgs.coreutils}/bin/printf '%d' $(cat)) "
-        f"-ge ${toString blocksRequired}",
+        # `eth_blockNumber` returns hex-encoded uint (e.g. "0x46");
+        # `printf '%d'` decodes that to a decimal integer. The
+        # `"$(...)"` quoting captures jq's output so the printf
+        # argument is the entire hex string, not split by IFS.
+        "test $(printf '%d' \"$(curl -fsS http://127.0.0.1:8545 "
+        "-H 'Content-Type: application/json' "
+        '-d \'{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}\' '
+        "| ${pkgs.jq}/bin/jq -r '.result')\") "
+        "-ge ${toString blocksRequired}",
         timeout=300,
     )
     height_after = block_number()
@@ -317,7 +317,7 @@ pkgs.testers.nixosTest {
     state_after = rpc_result("aut_getCoreState")
     height_after_state = int(state_after.get("height", 0))
     assert height_after_state > height_before, (
-        f"aut_getCoreState height did not advance over 5s: "
+        "aut_getCoreState height did not advance over 5s: "
         f"before={height_before} after={height_after_state}"
     )
 
@@ -328,10 +328,10 @@ pkgs.testers.nixosTest {
     # empty, or vice versa.
     # ---------------------------------------------------------------
     machine.wait_until_succeeds(
-        f"test $(${pkgs.sudo}/bin/sudo -u postgres "
-        f"${pkgs.postgresql}/bin/psql -At -d blockscout "
-        f"-c 'SELECT count(*) FROM blocks') "
-        f"-ge ${toString blocksRequired}",
+        "test $(${pkgs.sudo}/bin/sudo -u postgres "
+        "${pkgs.postgresql}/bin/psql -At -d blockscout "
+        "-c 'SELECT count(*) FROM blocks') "
+        "-ge ${toString blocksRequired}",
         timeout=600,
     )
 
