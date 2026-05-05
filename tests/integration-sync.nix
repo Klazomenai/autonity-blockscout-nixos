@@ -125,13 +125,24 @@ pkgs.testers.nixosTest {
     {
       imports = [ flake.nixosModules.default ];
 
-      # Sync-stage VM is more memory-hungry than the static fixture:
-      # the indexer runs a real catchup pass + realtime fetcher AND
-      # the Tendermint engine produces blocks at 1/sec. 4 GiB is the
-      # observed floor; bumping to 5 GiB for the additional indexer
-      # working set under sustained block production.
+      # Sync-stage VM is more memory-hungry AND CPU-hungry than the
+      # static fixture: the indexer runs a real catchup pass +
+      # realtime fetcher AND the Tendermint engine produces blocks at
+      # 1/sec. 4 GiB is the observed floor for memory; bumped to
+      # 5 GiB for the additional indexer working set.
+      #
+      # 4 cores instead of 2: under TCG (software-emulated x86, no
+      # nested KVM on GitHub-Actions runners) Autonity's continuous
+      # block production saturates one core, and a single remaining
+      # core was not enough to bring up Blockscout's BEAM + Ecto
+      # migrations + Phoenix endpoint within the default 900 s
+      # `wait_for_open_port` timeout. Verified empirically against a
+      # local TCG run: with 2 cores the backend never bound port
+      # 4000 in 15 minutes (chain reached block 897 in that time);
+      # with 4 cores the backend warms up in line with the static
+      # `integration` test's experience.
       virtualisation.memorySize = 5120;
-      virtualisation.cores = 2;
+      virtualisation.cores = 4;
       virtualisation.diskSize = 4096;
 
       networking.extraHosts = ''
@@ -225,8 +236,14 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("nginx.service")
 
     machine.wait_for_open_port(8545)   # Autonity HTTP RPC
-    machine.wait_for_open_port(4000)   # Blockscout backend
-    machine.wait_for_open_port(3000)   # Blockscout frontend
+    # Backend + frontend take longer to bind their ports under the
+    # sync test than under `integration` because Autonity's continuous
+    # block production competes for scheduler time. Raised the
+    # timeout from the default 900 s (15 min) to 1800 s (30 min) for
+    # both, matching the empirical worst case observed under TCG.
+    # The 4-core VM helps but doesn't eliminate the contention.
+    machine.wait_for_open_port(4000, timeout=1800)  # Blockscout backend
+    machine.wait_for_open_port(3000, timeout=1800)  # Blockscout frontend
     machine.wait_for_open_port(443)    # nginx HTTPS
 
     # ---------------------------------------------------------------
@@ -359,11 +376,27 @@ pkgs.testers.nixosTest {
     # chain passed the threshold but then stalled (e.g. a consensus
     # livelock or scheduler starvation under TCG).
     # ---------------------------------------------------------------
+    # The Go CoreState struct (`consensus/tendermint/core/interfaces/
+    # state.go:36-79`) declares fields with capital-letter names and
+    # no explicit `json:"..."` tags, so encoding/json emits them
+    # verbatim: `"Height"`, not `"height"`. *big.Int marshals as a
+    # decimal numeric string (or as a JSON number depending on the
+    # marshaller). Try the canonical name first, then fall back —
+    # tolerate either casing in case future autonity versions add
+    # explicit json tags.
+    def core_height(state):
+        for key in ("Height", "height"):
+            if key in state:
+                return int(state[key])
+        raise AssertionError(
+            f"tendermint_getCoreState response missing height: {state!r}"
+        )
+
     state_before = rpc_result("tendermint_getCoreState")
-    height_before = int(state_before.get("height", 0))
+    height_before = core_height(state_before)
     machine.succeed("sleep 5")
     state_after = rpc_result("tendermint_getCoreState")
-    height_after_state = int(state_after.get("height", 0))
+    height_after_state = core_height(state_after)
     assert height_after_state > height_before, (
         "tendermint_getCoreState height did not advance over 5s: "
         f"before={height_before} after={height_after_state}"
@@ -430,15 +463,22 @@ pkgs.testers.nixosTest {
     )
 
     # ---------------------------------------------------------------
-    # 8. Probe 7 (/api/v2/health) — full chain-aware health check.
+    # 8. Probe 7 (/api/health) — full chain-aware health check.
     # Returns 200 once the indexer has at least one block recorded
-    # within `HEALTH_MONITOR_BLOCKS_PERIOD` (default 5 min, comfortably
-    # passes at 1 block/sec). The static `integration` test asserts
-    # this returns 400 (chain stuck at genesis); under sync the
-    # contract flips.
+    # within `Explorer.Chain.Health.Monitor.healthy_blocks_period`
+    # (default 5 min, comfortably passes at 1 block/sec); 500 when
+    # stale.
+    #
+    # The route is `/api/health`, NOT `/api/v2/health` — the `/health`
+    # scope is mounted at the `/api` level outside `/v2` (per
+    # `apps/block_scout_web/lib/block_scout_web/routers/api_router.ex`
+    # line 533). Hitting `/api/v2/health` lands on the V2
+    # FallbackController's `/*path` catch-all and returns 400 for
+    # unknown action — which is how the M2.5 design's earlier
+    # documentation was led astray.
     # ---------------------------------------------------------------
     machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/v2/health",
+        "curl -fsS http://127.0.0.1:4000/api/health",
         timeout=300,
     )
 
