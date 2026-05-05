@@ -32,6 +32,24 @@
 let
   hostName = "explorer.test";
 
+  # Single source of truth for the chain ID this VM exercises. With
+  # `services.autonity.network` at its default ("mainnet") the running
+  # binary returns chain ID 65000000 from `eth_chainId`, so this value
+  # must match. Future fixtures running against `network = "dev"` (#34)
+  # change the binary's compiled-in chain to 65111111 and re-bind this
+  # `let` to that value; everything downstream — backend `chain.id`,
+  # frontend `publicEnv.NEXT_PUBLIC_NETWORK_ID`, and the test
+  # assertion — re-evaluates from the same one place.
+  #
+  # `chainIdHex` is computed at Nix eval time via `lib.toHexString`
+  # (which emits uppercase hex without a `0x` prefix). Geth-family
+  # JSON-RPC returns lowercase hex, so we normalise via `lib.toLower`
+  # before prefixing. The hex form is never written by hand — the
+  # only authoring site for the chain ID is the integer `chainId`
+  # above; bumping it re-derives the hex automatically.
+  chainId = 65000000;
+  chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+
   # Self-signed cert generated at build time by `pkgs.runCommand`,
   # with the result stored in the Nix store. The test isn't validating
   # CA-trust or HTTPS chain-of-trust — it's validating that nginx
@@ -66,7 +84,12 @@ pkgs.testers.nixosTest {
   name = "autonity-blockscout-integration";
 
   nodes.machine =
-    { config, lib, ... }:
+    {
+      config,
+      lib,
+      options,
+      ...
+    }:
     {
       imports = [ flake.nixosModules.default ];
 
@@ -206,9 +229,50 @@ pkgs.testers.nixosTest {
         enable = true;
         secretKeyBaseFile = "/run/test-secrets/skb";
         databasePasswordFile = "/run/test-secrets/db_password";
+        # Single-source-of-truth threading: backend's `CHAIN_ID` env
+        # var reads from the let-bound `chainId` at the top of this
+        # file. The value happens to match this option's module-level
+        # default (65000000) — the explicit binding makes the variable's
+        # intent clear and prevents silent drift if either side is
+        # bumped independently in the future (e.g. `network = "dev"`
+        # under #34, which switches `chainId` to 65111111).
+        chain.id = chainId;
       };
 
-      services.blockscout-frontend.enable = true;
+      services.blockscout-frontend = {
+        enable = true;
+        # Single-source-of-truth threading: frontend's
+        # `NEXT_PUBLIC_NETWORK_ID` reads from the same let-bound
+        # `chainId`. The module's `publicEnv` default is a non-empty
+        # attrset of 13 keys (3 API + 7 network + 3 app); empirically
+        # — verified against CI run 25331628915 on this PR's first
+        # push — for `types.attrsOf` with a non-empty default, that
+        # default is a single definition that gets fully shadowed by
+        # any user-provided definition rather than per-key merged. The
+        # earlier `publicEnv.NEXT_PUBLIC_NETWORK_ID = toString chainId;`
+        # form left envs.js with only that one key and the existing
+        # `NEXT_PUBLIC_NETWORK_NAME in envsjs` assertion failed.
+        #
+        # To preserve every other default while overriding only the
+        # chain ID, we read the default out of `options` and
+        # `//`-override the single key, producing one user definition
+        # that contains all 13 keys with the chain ID re-bound. The
+        # pattern is robust against future additions to the module's
+        # default (new keys land automatically; no re-edit needed).
+        #
+        # Caveat: this single user-side definition takes priority over
+        # any sibling-module definitions of `publicEnv.<key>` that get
+        # imported alongside this fixture. Acceptable in this VM test
+        # because no sibling module contributes; if that ever changes
+        # we'd need to switch to a stack of `mkMerge` definitions.
+        # (The current alternative — leaving `publicEnv` unset and
+        # letting the default cover everything — would prevent us from
+        # parameterising the chain ID by `let`-bound `chainId`, which
+        # is the whole point of #33.)
+        publicEnv = options.services.blockscout-frontend.publicEnv.default // {
+          NEXT_PUBLIC_NETWORK_ID = toString chainId;
+        };
+      };
 
       services.blockscout-nginx = {
         enable = true;
@@ -314,6 +378,22 @@ pkgs.testers.nixosTest {
     ).strip()
     assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
 
+    # `services.blockscout-backend.chain.id` (set in the fixture from
+    # the `chainId` let-binding) must propagate into the unit's
+    # `Environment=` block as `CHAIN_ID=<int>`. Without this assertion
+    # a regression in the backend module's `chain.id -> CHAIN_ID`
+    # plumbing would leave the test green: the eth_chainId / envs.js
+    # assertions only exercise the autonity binary and frontend overlay,
+    # which are upstream of the backend's env wiring. `systemctl show
+    # -p Environment` returns all Environment directives joined on a
+    # single line, so substring containment is the right check.
+    backend_env = machine.succeed(
+        "systemctl show -p Environment --value blockscout-backend.service"
+    ).strip()
+    assert "CHAIN_ID=${toString chainId}" in backend_env, (
+        f"backend CHAIN_ID env missing or mismatched: {backend_env!r}"
+    )
+
     # ---------------------------------------------------------------
     # 4. Backend ↔ Autonity loopback RPC. `wait_until_succeeds` not
     #    `succeed` — `wait_for_open_port(8545)` only proves the
@@ -326,7 +406,16 @@ pkgs.testers.nixosTest {
         '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' ',
         timeout=120,
     )
-    assert '"result"' in rpc, f"eth_chainId missing result field: {rpc!r}"
+    # Tightened from a substring-only check ("\"result\"" in rpc) to
+    # exact-equality against the let-bound chainIdHex. The hex literal
+    # is computed at Nix eval time from the integer `chainId`, so any
+    # drift between Autonity's compiled-in chain ID and the test
+    # fixture's expectation surfaces here as a clear mismatch instead
+    # of silently passing.
+    rpc_json = json.loads(rpc)
+    assert rpc_json.get("result") == "${chainIdHex}", (
+        f"eth_chainId mismatch: expected ${chainIdHex}, got {rpc!r}"
+    )
 
     # ---------------------------------------------------------------
     # 5. Backend health endpoints.
@@ -366,6 +455,15 @@ pkgs.testers.nixosTest {
     )
     assert "NEXT_PUBLIC_NETWORK_NAME" in envsjs, (
         f"envs.js missing expected NEXT_PUBLIC_* keys: {envsjs!r}"
+    )
+    # Cross-check the chain-ID single-source-of-truth threading: the
+    # let-bound `chainId` (sourced as a Nix integer) must end up in the
+    # rendered envs.js as the JS string value of NEXT_PUBLIC_NETWORK_ID.
+    # This catches drift between backend `CHAIN_ID` and frontend's
+    # rendered envs.js — the failure mode that the threading was put
+    # in place to prevent.
+    assert '"${toString chainId}"' in envsjs, (
+        f"envs.js missing chain ID '${toString chainId}': {envsjs!r}"
     )
 
     homepage = machine.wait_until_succeeds(
