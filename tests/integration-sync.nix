@@ -43,7 +43,9 @@
 #     6. `GET /api/v2/main-page/indexing-status` returning
 #        `finished_indexing_blocks: true` OR
 #        `indexed_blocks_ratio >= 1.0`.
-#     7. `GET /api/v2/health` returning 200 once chain progresses.
+#     7. `GET /api/health` returning 200 once chain progresses.
+#        (Note: NOT `/api/v2/health` — that path lands on the V2
+#        FallbackController and returns 400 for unknown action.)
 #
 # Explicitly NOT in the local probe vocabulary: `eth_syncing`. Under
 # `--dev` the node IS the chain source — it returns `false`
@@ -425,12 +427,24 @@ pkgs.testers.nixosTest {
     # generated /etc/sudoers, so `sudo -u postgres` can fail even
     # when Postgres is healthy. `runuser` is part of util-linux,
     # always present, and doesn't depend on sudoers configuration.
+    #
+    # `last_psql_output` retains the last (rc, output) tuple from
+    # the call so the eventual timeout AssertionError can include
+    # what psql said. Without this, "relation does not exist"
+    # (expected during the migration window) and "auth failed" or
+    # "could not connect" (real bugs) all look identical to
+    # "indexer hasn't caught up yet" — until you hit the 600 s
+    # deadline and have nothing to debug from.
+    last_psql_output = ["", 0]
+
     def block_count_in_db():
         rc, out = machine.execute(
             "${pkgs.util-linux}/bin/runuser -u postgres -- "
             "${pkgs.postgresql}/bin/psql -At -d blockscout "
-            "-c 'SELECT count(*) FROM blocks'"
+            "-c 'SELECT count(*) FROM blocks' 2>&1"
         )
+        last_psql_output[0] = out
+        last_psql_output[1] = rc
         if rc != 0:
             return 0
         return int(out.strip())
@@ -443,7 +457,9 @@ pkgs.testers.nixosTest {
         if time.monotonic() > deadline:
             raise AssertionError(
                 f"indexer did not reach blocksRequired "
-                f"(${toString blocksRequired}) in 600 s: got {count}"
+                f"(${toString blocksRequired}) in 600 s: got {count}; "
+                f"last psql exit={last_psql_output[1]}, "
+                f"output={last_psql_output[0]!r}"
             )
         time.sleep(5)
 
