@@ -24,11 +24,18 @@
 #     2. `eth_chainId == chainIdHex`
 #
 #   Autonity-native (consensus liveness — richer signal):
-#     3. `aut_getCommittee` — assert committee size is exactly 1
-#        (single-validator dev chain).
-#     4. `aut_getCoreState` — assert `height` advances across two
-#        consecutive samples; proves the Tendermint engine itself is
-#        active, not just that an RPC handler responds.
+#     3. `tendermint_getCommittee` — assert committee size is exactly
+#        1 (single-validator dev chain).
+#     4. `tendermint_getCoreState` — assert `height` advances across
+#        two consecutive samples; proves the Tendermint engine itself
+#        is active, not just that an RPC handler responds.
+#
+#   The two consensus-liveness probes use the `tendermint_*` JSON-RPC
+#   namespace (registered at `internal/web3ext/web3ext.go` in the
+#   autonity fork as `tendermint_getCommittee` /
+#   `tendermint_getCoreState`); the default HTTP API set per
+#   `node/defaults.go` is `["net", "web3", "aut", "tendermint"]`, so
+#   the namespace is exposed without any `--http.api` override.
 #
 #   Blockscout (indexer ingestion):
 #     5. `psql -c "SELECT count(*) FROM blocks" >= blocksRequired`
@@ -266,17 +273,17 @@ pkgs.testers.nixosTest {
     )
 
     # ---------------------------------------------------------------
-    # 3. Probe 3 (aut_getCommittee) — assert committee size is exactly
-    # 1, matching the dev chain's `MaxCommitteeSize=1`. Validates the
-    # Autonity-native RPC namespace is functional, not just the
-    # geth-inherited eth_*.
+    # 3. Probe 3 (tendermint_getCommittee) — assert committee size is
+    # exactly 1, matching the dev chain's `MaxCommitteeSize=1`.
+    # Validates the Autonity-native consensus RPC namespace is
+    # functional, not just the geth-inherited eth_*.
     # ---------------------------------------------------------------
-    committee = rpc_result("aut_getCommittee")
+    committee = rpc_result("tendermint_getCommittee")
     assert isinstance(committee, list), (
-        f"aut_getCommittee did not return a list: {committee!r}"
+        f"tendermint_getCommittee did not return a list: {committee!r}"
     )
     assert len(committee) == 1, (
-        f"aut_getCommittee returned {len(committee)} members, "
+        f"tendermint_getCommittee returned {len(committee)} members, "
         f"expected 1 (single-validator dev chain): {committee!r}"
     )
 
@@ -308,19 +315,19 @@ pkgs.testers.nixosTest {
         time.sleep(2)
 
     # ---------------------------------------------------------------
-    # 5. Probe 4 (aut_getCoreState height advancing) — sample twice
-    # with a sleep between, assert the Tendermint engine is still
-    # producing. Defends against the failure mode where the chain
-    # passed the threshold but then stalled (e.g. a consensus livelock
-    # or scheduler starvation under TCG).
+    # 5. Probe 4 (tendermint_getCoreState height advancing) — sample
+    # twice with a sleep between, assert the Tendermint engine is
+    # still producing. Defends against the failure mode where the
+    # chain passed the threshold but then stalled (e.g. a consensus
+    # livelock or scheduler starvation under TCG).
     # ---------------------------------------------------------------
-    state_before = rpc_result("aut_getCoreState")
+    state_before = rpc_result("tendermint_getCoreState")
     height_before = int(state_before.get("height", 0))
     machine.succeed("sleep 5")
-    state_after = rpc_result("aut_getCoreState")
+    state_after = rpc_result("tendermint_getCoreState")
     height_after_state = int(state_after.get("height", 0))
     assert height_after_state > height_before, (
-        "aut_getCoreState height did not advance over 5s: "
+        "tendermint_getCoreState height did not advance over 5s: "
         f"before={height_before} after={height_after_state}"
     )
 
