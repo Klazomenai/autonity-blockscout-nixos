@@ -273,34 +273,19 @@ pkgs.testers.nixosTest {
     )
 
     # ---------------------------------------------------------------
-    # 3. Probe 3 (tendermint_getCommittee) — assert committee size is
-    # exactly 1, matching the dev chain's `MaxCommitteeSize=1`.
-    # Validates the Autonity-native consensus RPC namespace is
-    # functional, not just the geth-inherited eth_*.
-    #
-    # Method takes 1 parameter (block number or tag) per the autonity
-    # fork's `internal/web3ext/web3ext.go:771`. `"latest"` is the
-    # geth-family idiom for the current head; any specific block
-    # height (decimal int or `"0x"`-prefixed hex) would also work.
-    # The error from passing zero params is a tier-32000 "block number
-    # cannot be nil" returned at the API boundary, not a method-not-
-    # found 32601 — the method exists, it just won't default the
-    # block argument.
-    # ---------------------------------------------------------------
-    committee = rpc_result("tendermint_getCommittee", ["latest"])
-    assert isinstance(committee, list), (
-        f"tendermint_getCommittee did not return a list: {committee!r}"
-    )
-    assert len(committee) == 1, (
-        f"tendermint_getCommittee returned {len(committee)} members, "
-        f"expected 1 (single-validator dev chain): {committee!r}"
-    )
-
-    # ---------------------------------------------------------------
-    # 4. Probe 1 (eth_blockNumber >= blocksRequired) — wait for the
+    # 3. Probe 1 (eth_blockNumber >= blocksRequired) — wait for the
     # chain to actually produce blocks. Block period in dev is 1s
     # nominal; under TCG contention may degrade to 1.5-2s. Block-count
     # exit is robust to that drift; no wall-clock heuristic.
+    #
+    # This wait gates everything below it: probes 4 and 5 (consensus-
+    # state probes) target the live Tendermint engine and need the
+    # chain to be in a settled epoch state; probe 6 (psql block count)
+    # needs the indexer to have caught up. Querying any of those
+    # before the chain has progressed past startup transients trips
+    # `tendermint_getCommittee` with "the inserting height is out of
+    # epoch range" (committee cache not yet populated for the resolved
+    # block height when only blocks 0-1 exist).
     # ---------------------------------------------------------------
     def block_number():
         return int(rpc_result("eth_blockNumber"), 16)
@@ -322,6 +307,30 @@ pkgs.testers.nixosTest {
                 f"(${toString blocksRequired}) in 300 s: got {height}"
             )
         time.sleep(2)
+
+    # ---------------------------------------------------------------
+    # 4. Probe 3 (tendermint_getCommittee at "latest") — assert
+    # committee size is exactly 1, matching the dev chain's
+    # `MaxCommitteeSize=1`. Validates the Autonity-native consensus
+    # RPC namespace is functional, not just the geth-inherited eth_*.
+    #
+    # Method takes 1 parameter (block number or tag) per the autonity
+    # fork's `internal/web3ext/web3ext.go:771`. `"latest"` is the
+    # geth-family idiom for the current head and is reliable here
+    # because the chain is now well into epoch 1+ (we just waited for
+    # >=70 blocks; epoch period is 60). Earlier in the test, before
+    # chain progression, "latest" trips the API's epoch-range gate
+    # because the committee cache for the resolved height isn't
+    # populated yet.
+    # ---------------------------------------------------------------
+    committee = rpc_result("tendermint_getCommittee", ["latest"])
+    assert isinstance(committee, list), (
+        f"tendermint_getCommittee did not return a list: {committee!r}"
+    )
+    assert len(committee) == 1, (
+        f"tendermint_getCommittee returned {len(committee)} members, "
+        f"expected 1 (single-validator dev chain): {committee!r}"
+    )
 
     # ---------------------------------------------------------------
     # 5. Probe 4 (tendermint_getCoreState height advancing) — sample
@@ -347,15 +356,27 @@ pkgs.testers.nixosTest {
     # empty, or vice versa.
     # ---------------------------------------------------------------
     # Same Python-loop pattern as the eth_blockNumber wait above:
-    # query psql via machine.succeed, parse the result in Python,
+    # query psql via machine.execute, parse the result in Python,
     # poll until the indexer has caught up to blocksRequired.
+    #
+    # `machine.execute` (not `succeed`) so we can tolerate the
+    # startup window where Blockscout's Ecto migrations
+    # (`Explorer.ReleaseTasks.migrate([])` inside the backend's
+    # ExecStart wrapper) haven't yet created the `blocks` table.
+    # Until then psql returns a non-zero status with "relation
+    # \"blocks\" does not exist"; we treat that as count = 0 and
+    # let the wait loop keep polling instead of hard-failing.
+    # `wait_for_unit("blockscout-backend.service")` only proves the
+    # unit is active, not that migrations have completed.
     def block_count_in_db():
-        out = machine.succeed(
+        rc, out = machine.execute(
             "${pkgs.sudo}/bin/sudo -u postgres "
             "${pkgs.postgresql}/bin/psql -At -d blockscout "
             "-c 'SELECT count(*) FROM blocks'"
-        ).strip()
-        return int(out)
+        )
+        if rc != 0:
+            return 0
+        return int(out.strip())
 
     deadline = time.monotonic() + 600
     while True:
