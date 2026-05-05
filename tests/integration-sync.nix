@@ -330,13 +330,26 @@ pkgs.testers.nixosTest {
     # Block`), size 1 — semantically the same assertion target as
     # querying at "latest" would have been if the API permitted it.
     # ---------------------------------------------------------------
+    # `tendermint_getCommittee` returns a `*types.Committee` struct
+    # serialised as `{"members": [...], "epochBlock": "...", ...}` —
+    # NOT a bare member list. Verified empirically against CI run
+    # 25394719018: response shape was
+    #   {"members": [{"address": "0xa7dd...", "votingPower": "0x3e8",
+    #                 "consensusKey": "0x..."}]}
+    # The single-validator dev chain pre-bonds the validator with
+    # `BondedStake = 1000` (`core/genesis.go DeveloperGenesisBlock`),
+    # which serialises as `votingPower: "0x3e8"` (1000 in hex).
     committee = rpc_result("tendermint_getCommittee", ["0x0"])
-    assert isinstance(committee, list), (
-        f"tendermint_getCommittee did not return a list: {committee!r}"
+    assert isinstance(committee, dict) and "members" in committee, (
+        f"tendermint_getCommittee response shape unexpected: {committee!r}"
     )
-    assert len(committee) == 1, (
-        f"tendermint_getCommittee returned {len(committee)} members, "
-        f"expected 1 (single-validator dev chain): {committee!r}"
+    members = committee["members"]
+    assert isinstance(members, list), (
+        f"committee.members is not a list: {members!r}"
+    )
+    assert len(members) == 1, (
+        f"committee.members has {len(members)} entries, "
+        f"expected 1 (single-validator dev chain): {members!r}"
     )
 
     # ---------------------------------------------------------------
@@ -375,9 +388,13 @@ pkgs.testers.nixosTest {
     # let the wait loop keep polling instead of hard-failing.
     # `wait_for_unit("blockscout-backend.service")` only proves the
     # unit is active, not that migrations have completed.
+    # `runuser` instead of `sudo`: nixosTest VMs don't ship a
+    # generated /etc/sudoers, so `sudo -u postgres` can fail even
+    # when Postgres is healthy. `runuser` is part of util-linux,
+    # always present, and doesn't depend on sudoers configuration.
     def block_count_in_db():
         rc, out = machine.execute(
-            "${pkgs.sudo}/bin/sudo -u postgres "
+            "${pkgs.util-linux}/bin/runuser -u postgres -- "
             "${pkgs.postgresql}/bin/psql -At -d blockscout "
             "-c 'SELECT count(*) FROM blocks'"
         )
