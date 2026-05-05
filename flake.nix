@@ -143,9 +143,11 @@
         # blocks (one epoch crossed plus a 10-block buffer) AND for
         # the Blockscout indexer to catch up to the same threshold.
         # Adds ~70-180 s on top of `integration`'s 22-min cold baseline.
-        # Locked design lives in `~/.claude/plans/sharded-stargazing-
-        # puppy.md` §6.5; per-PR opt-out via CI policy is tracked in
-        # the M2.5 epic (#38).
+        # Probe vocabulary, default `blocksRequired`, and the
+        # in-memory-chain-DB / no-account-state / block-count-only
+        # design constraints are documented inline in
+        # `tests/integration-sync.nix`; the M2.5 epic at #38 tracks the
+        # per-PR opt-out CI policy.
         checks.integration-sync = import ./tests/integration-sync.nix {
           inherit pkgs system;
           flake = self;

@@ -16,7 +16,8 @@
 #     truth chain ID across backend/frontend/RPC). Adds ~70-180s wall-
 #     clock on top of the integration baseline; total ~24-25 min cold.
 #
-# Probe vocabulary (locked during M2.5 design, see plan §6.5):
+# Probe vocabulary (locked during M2.5 design — full rationale in
+# the M2.5 epic body at #38 and the per-probe issue at #34):
 #
 #   Geth-inherited (chain liveness):
 #     1. `eth_blockNumber >= blocksRequired`
@@ -201,6 +202,7 @@ pkgs.testers.nixosTest {
 
   testScript = ''
     import json
+    import time
 
     machine.start()
 
@@ -287,22 +289,23 @@ pkgs.testers.nixosTest {
     def block_number():
         return int(rpc_result("eth_blockNumber"), 16)
 
-    machine.wait_until_succeeds(
-        # `eth_blockNumber` returns hex-encoded uint (e.g. "0x46");
-        # `printf '%d'` decodes that to a decimal integer. The
-        # `"$(...)"` quoting captures jq's output so the printf
-        # argument is the entire hex string, not split by IFS.
-        "test $(printf '%d' \"$(curl -fsS http://127.0.0.1:8545 "
-        "-H 'Content-Type: application/json' "
-        '-d \'{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}\' '
-        "| ${pkgs.jq}/bin/jq -r '.result')\") "
-        "-ge ${toString blocksRequired}",
-        timeout=300,
-    )
-    height_after = block_number()
-    assert height_after >= ${toString blocksRequired}, (
-        f"chain did not reach blocksRequired: got {height_after}"
-    )
+    # Poll in Python rather than via `wait_until_succeeds` + a shell
+    # one-liner: keeps the hex→int conversion in Python (no in-VM jq
+    # / printf hex-decoding gymnastics that would race pipe stdin) and
+    # gives us a clear error message on timeout. Same effective
+    # contract as `wait_until_succeeds`: poll every 2 s, fail after
+    # the timeout window.
+    deadline = time.monotonic() + 300
+    while True:
+        height = block_number()
+        if height >= ${toString blocksRequired}:
+            break
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"chain did not reach blocksRequired "
+                f"(${toString blocksRequired}) in 300 s: got {height}"
+            )
+        time.sleep(2)
 
     # ---------------------------------------------------------------
     # 5. Probe 4 (aut_getCoreState height advancing) — sample twice
@@ -327,13 +330,28 @@ pkgs.testers.nixosTest {
     # cached `indexing-status` response while the underlying table is
     # empty, or vice versa.
     # ---------------------------------------------------------------
-    machine.wait_until_succeeds(
-        "test $(${pkgs.sudo}/bin/sudo -u postgres "
-        "${pkgs.postgresql}/bin/psql -At -d blockscout "
-        "-c 'SELECT count(*) FROM blocks') "
-        "-ge ${toString blocksRequired}",
-        timeout=600,
-    )
+    # Same Python-loop pattern as the eth_blockNumber wait above:
+    # query psql via machine.succeed, parse the result in Python,
+    # poll until the indexer has caught up to blocksRequired.
+    def block_count_in_db():
+        out = machine.succeed(
+            "${pkgs.sudo}/bin/sudo -u postgres "
+            "${pkgs.postgresql}/bin/psql -At -d blockscout "
+            "-c 'SELECT count(*) FROM blocks'"
+        ).strip()
+        return int(out)
+
+    deadline = time.monotonic() + 600
+    while True:
+        count = block_count_in_db()
+        if count >= ${toString blocksRequired}:
+            break
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"indexer did not reach blocksRequired "
+                f"(${toString blocksRequired}) in 600 s: got {count}"
+            )
+        time.sleep(5)
 
     # ---------------------------------------------------------------
     # 7. Probe 6 (/api/v2/main-page/indexing-status) — the
@@ -345,7 +363,7 @@ pkgs.testers.nixosTest {
     # ---------------------------------------------------------------
     machine.wait_until_succeeds(
         "curl -fsS http://127.0.0.1:4000/api/v2/main-page/indexing-status "
-        f"| ${pkgs.jq}/bin/jq -e "
+        "| ${pkgs.jq}/bin/jq -e "
         "'.finished_indexing_blocks == true or .indexed_blocks_ratio >= 1.0'",
         timeout=300,
     )
