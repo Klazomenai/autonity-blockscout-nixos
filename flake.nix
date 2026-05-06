@@ -51,6 +51,21 @@
       # modules that land in subsequent PRs. No aarch64 or darwin support
       # is planned.
       systems = [ "x86_64-linux" ];
+
+      # Overlay wiring flake-input packages into pkgs. Defined once at
+      # the outputs level so it's applied uniformly to (a) the
+      # nixosModules' `nixpkgs.overlays`, and (b) the per-system pkgs
+      # used by `apps.<system>.e2e` to construct a host-native runtime
+      # PATH that includes the same autonity / blockscout binaries the
+      # VM uses.
+      flakeOverlay = (
+        final: _prev: {
+          autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
+          autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
+          blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
+          blockscout-frontend = blockscout-frontend.packages.${final.stdenv.hostPlatform.system}.default;
+        }
+      );
     in
     {
       # Top-level aggregate module. Service modules are imported from
@@ -61,21 +76,52 @@
       # idiom — uniform with `CONTRIBUTING.md` and the rest of nixpkgs.
       nixosModules.default = {
         imports = [ ./modules ];
-        nixpkgs.overlays = [
-          (final: _prev: {
-            autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
-            autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
-            blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
-            blockscout-frontend = blockscout-frontend.packages.${final.stdenv.hostPlatform.system}.default;
-          })
-        ];
+        nixpkgs.overlays = [ flakeOverlay ];
       };
       nixosModules.autonity-blockscout = self.nixosModules.default;
     }
     // flake-utils.lib.eachSystem systems (
       system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ flakeOverlay ];
+        };
+
+        e2eApp = pkgs.writeShellApplication {
+          name = "run-e2e";
+          runtimeInputs = [
+            # Flake-input packages referenced directly. The
+            # `nixpkgs.overlays` entry on the nixosModules also exposes
+            # these as `pkgs.{autonity,blockscout,blockscout-frontend}`,
+            # but writeShellApplication's `runtimeInputs` expects
+            # derivations — referencing `flake-input.packages.<system>
+            # .default` directly here is the most direct path and
+            # avoids any overlay-resolution surprises.
+            autonity.packages.${system}.default
+            blockscout.packages.${system}.default
+            blockscout-frontend.packages.${system}.default
+            pkgs.postgresql
+            pkgs.redis
+            pkgs.nodejs_20
+            pkgs.python3
+            pkgs.curl
+            pkgs.openssl
+            pkgs.coreutils
+            pkgs.gnused
+            pkgs.gawk
+          ];
+          # The script itself lives at `tests/run-e2e.sh`; spliced in
+          # via store-path so the wrapper sees the canonical version.
+          # `tests/probes.py` is wired through E2E_PROBES_PY so the
+          # script can locate it under any invocation context.
+          # Invoked via `bash` because file-spliced sources land in
+          # the Nix store without the +x bit; bash doesn't require it.
+          text = ''
+            export E2E_PROBES_PY="${./tests/probes.py}"
+            exec bash ${./tests/run-e2e.sh} "$@"
+          '';
+        };
       in
       {
         formatter = pkgs.nixfmt-rfc-style;
@@ -151,6 +197,29 @@
         checks.integration-sync = import ./tests/integration-sync.nix {
           inherit pkgs system;
           flake = self;
+        };
+
+        # Host-native end-to-end smoke harness. Spawns the same
+        # 5-service stack as `integration-sync` (autonity --dev,
+        # postgres, redis, blockscout backend + frontend) as plain
+        # background processes in a tmpdir, runs the shared
+        # `tests/probes.py` probe sequence, and exits 0/non-zero. NOT
+        # a replacement for the VM check — explicitly does NOT exercise
+        # systemd hardening, namespace isolation, LoadCredential
+        # ingestion, or SupplementaryGroups socket access. The killer
+        # feature is the much shorter iteration loop (~3.5–5 min vs
+        # ~20 min for the VM) for non-systemd-shape work — probe
+        # vocabulary changes, JSON-RPC payload shape, indexer
+        # behaviour, frontend rendering, env-var contract drift.
+        #
+        # Probe LOGIC is shared with the VM check via `tests/probes.py`
+        # — single source of truth, no duplication. The VM testScript
+        # at `tests/integration-sync.nix` invokes the same script after
+        # the VM's units are up; this app invokes it after spawning
+        # host-native processes.
+        apps.e2e = {
+          type = "app";
+          program = "${e2eApp}/bin/run-e2e";
         };
       }
     );

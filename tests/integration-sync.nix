@@ -218,12 +218,18 @@ pkgs.testers.nixosTest {
         sslCertificate = "${selfSignedCerts}/cert.pem";
         sslCertificateKey = "${selfSignedCerts}/key.pem";
       };
+
+      # Probe script + minimal Python interpreter for the in-VM
+      # invocation. The probe LOGIC lives in `tests/probes.py` (single
+      # source of truth shared with the host-native `nix run .#e2e`
+      # runner per #35); the testScript below just sequences VM-only
+      # liveness gates and then invokes that script with the
+      # appropriate env-var contract.
+      environment.etc."probes.py".source = ./probes.py;
+      environment.systemPackages = [ pkgs.python3 ];
     };
 
   testScript = ''
-    import json
-    import time
-
     machine.start()
 
     # ---------------------------------------------------------------
@@ -249,284 +255,38 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(443)    # nginx HTTPS
 
     # ---------------------------------------------------------------
-    # 2. Probe 2 (eth_chainId) — exact-equality against the let-bound
-    # `chainIdHex`. Confirms Autonity is running the dev chain we
-    # expect, AND that the threading from `chainId` (Nix int) to
-    # `chainIdHex` (Nix-derived hex) is correct end-to-end.
-    # ---------------------------------------------------------------
-    def rpc_call(method, params=None):
-        body = json.dumps({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or [],
-            "id": 1,
-        })
-        out = machine.succeed(
-            "curl -fsS http://127.0.0.1:8545 "
-            "-H 'Content-Type: application/json' "
-            f"-d {repr(body)}"
-        )
-        return json.loads(out)
-
-    def rpc_result(method, params=None):
-        resp = rpc_call(method, params)
-        if "result" not in resp:
-            raise AssertionError(
-                f"{method} returned no result field: {resp!r}"
-            )
-        return resp["result"]
-
-    # Wait until JSON-RPC handler is answering coherently before
-    # probing for content — `wait_for_open_port` only proves the
-    # listener is bound, not that handlers are warm.
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:8545 "
-        "-H 'Content-Type: application/json' "
-        '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' ',
-        timeout=120,
-    )
-
-    chain_id_hex = rpc_result("eth_chainId")
-    assert chain_id_hex == "${chainIdHex}", (
-        f"eth_chainId mismatch: expected ${chainIdHex}, got {chain_id_hex!r}"
-    )
-
-    # ---------------------------------------------------------------
-    # 3. Probe 1 (eth_blockNumber >= blocksRequired) — wait for the
-    # chain to actually produce blocks. Block period in dev is 1s
-    # nominal; under TCG contention may degrade to 1.5-2s. Block-count
-    # exit is robust to that drift; no wall-clock heuristic.
+    # 2. Run the shared probe sequence inside the VM.
     #
-    # This wait gates everything below it: probes 4 and 5 (consensus-
-    # state probes) target the live Tendermint engine and need the
-    # chain to be in a settled epoch state; probe 6 (psql block count)
-    # needs the indexer to have caught up. Querying any of those
-    # before the chain has progressed past startup transients trips
-    # `tendermint_getCommittee` with "the inserting height is out of
-    # epoch range" (committee cache not yet populated for the resolved
-    # block height when only blocks 0-1 exist).
-    # ---------------------------------------------------------------
-    def block_number():
-        return int(rpc_result("eth_blockNumber"), 16)
-
-    # Poll in Python rather than via `wait_until_succeeds` + a shell
-    # one-liner: keeps the hex→int conversion in Python (no in-VM jq
-    # / printf hex-decoding gymnastics that would race pipe stdin) and
-    # gives us a clear error message on timeout. Same effective
-    # contract as `wait_until_succeeds`: poll every 2 s, fail after
-    # the timeout window.
-    deadline = time.monotonic() + 300
-    while True:
-        height = block_number()
-        if height >= ${toString blocksRequired}:
-            break
-        if time.monotonic() > deadline:
-            raise AssertionError(
-                f"chain did not reach blocksRequired "
-                f"(${toString blocksRequired}) in 300 s: got {height}"
-            )
-        time.sleep(2)
-
-    # ---------------------------------------------------------------
-    # 4. Probe 3 (tendermint_getCommittee at "0x0") — assert committee
-    # size is exactly 1, matching the dev chain's `MaxCommitteeSize=1`.
-    # Validates the Autonity-native consensus RPC namespace is
-    # functional, not just the geth-inherited eth_*.
+    # `tests/probes.py` is the single source of truth for probe
+    # LOGIC across both contexts (this VM + the host-native runner
+    # behind `nix run .#e2e`). It reads connection details and
+    # thresholds from environment variables. Here we set those env
+    # vars to point at loopback (the VM's perspective) and to the
+    # let-bound chainId / blocksRequired; in the host-native runner
+    # the same script gets the same env-var shape pointed at host
+    # processes instead.
     #
-    # We query at genesis ("0x0"), not "latest". `BlockChain
-    # .EpochByHeight` (`core/blockchain_reader.go:43`) has a fast-path
-    # for `height == 0` returning the genesis epoch directly. For any
-    # other height it delegates to `HeaderChain.EpochByHeight`
-    # (`core/headerchain.go:558`), which trips `ErrOutOfEpochRange`
-    # ("the inserting height is out of epoch range") whenever the
-    # queried height exceeds the latest registered epoch header's
-    # `NextEpochBlock`. At block ~72 in dev mode the only registered
-    # epoch header is still genesis (NextEpochBlock=60), so 72 > 60
-    # trips the gate — passing "latest" or any non-zero height fails
-    # until enough epoch transitions have been committed for the
-    # cache to span the current head. Genesis committee on dev is the
-    # pre-bonded dev validator (`core/genesis.go DeveloperGenesis
-    # Block`), size 1 — semantically the same assertion target as
-    # querying at "latest" would have been if the API permitted it.
-    # ---------------------------------------------------------------
-    # `tendermint_getCommittee` returns a `*types.Committee` struct
-    # serialised as `{"members": [...], "epochBlock": "...", ...}` —
-    # NOT a bare member list. Verified empirically against CI run
-    # 25394719018: response shape was
-    #   {"members": [{"address": "0xa7dd...", "votingPower": "0x3e8",
-    #                 "consensusKey": "0x..."}]}
-    # The single-validator dev chain pre-bonds the validator with
-    # `BondedStake = 1000` (`core/genesis.go DeveloperGenesisBlock`),
-    # which serialises as `votingPower: "0x3e8"` (1000 in hex).
-    committee = rpc_result("tendermint_getCommittee", ["0x0"])
-    assert isinstance(committee, dict) and "members" in committee, (
-        f"tendermint_getCommittee response shape unexpected: {committee!r}"
-    )
-    members = committee["members"]
-    assert isinstance(members, list), (
-        f"committee.members is not a list: {members!r}"
-    )
-    assert len(members) == 1, (
-        f"committee.members has {len(members)} entries, "
-        f"expected 1 (single-validator dev chain): {members!r}"
-    )
-
-    # ---------------------------------------------------------------
-    # 5. Probe 4 (tendermint_getCoreState height advancing) — sample
-    # twice with a sleep between, assert the Tendermint engine is
-    # still producing. Defends against the failure mode where the
-    # chain passed the threshold but then stalled (e.g. a consensus
-    # livelock or scheduler starvation under TCG).
-    # ---------------------------------------------------------------
-    # The Go CoreState struct (`consensus/tendermint/core/interfaces/
-    # state.go:36-79`) declares fields with capital-letter names and
-    # no explicit `json:"..."` tags, so encoding/json emits them
-    # verbatim: `"Height"`, not `"height"`. *big.Int marshals as a
-    # decimal numeric string (or as a JSON number depending on the
-    # marshaller). Try the canonical name first, then fall back —
-    # tolerate either casing in case future autonity versions add
-    # explicit json tags.
-    def core_height(state):
-        for key in ("Height", "height"):
-            if key in state:
-                return int(state[key])
-        raise AssertionError(
-            f"tendermint_getCoreState response missing height: {state!r}"
-        )
-
-    state_before = rpc_result("tendermint_getCoreState")
-    height_before = core_height(state_before)
-    machine.succeed("sleep 5")
-    state_after = rpc_result("tendermint_getCoreState")
-    height_after_state = core_height(state_after)
-    assert height_after_state > height_before, (
-        "tendermint_getCoreState height did not advance over 5s: "
-        f"before={height_before} after={height_after_state}"
-    )
-
-    # ---------------------------------------------------------------
-    # 6. Probe 5 (psql count(*) FROM blocks >= blocksRequired) — the
-    # belt-and-braces direct-DB probe. Catches API/DB drift: e.g. a
-    # cached `indexing-status` response while the underlying table is
-    # empty, or vice versa.
-    # ---------------------------------------------------------------
-    # Same Python-loop pattern as the eth_blockNumber wait above:
-    # query psql via machine.execute, parse the result in Python,
-    # poll until the indexer has caught up to blocksRequired.
+    # `PROBE_BACKEND_UNIT=blockscout-backend.service` enables the
+    # systemctl-show CHAIN_ID cross-check (probe 9), which is VM-
+    # specific (host-native mode runs the backend as a plain
+    # process and skips that probe with a log line).
     #
-    # `machine.execute` (not `succeed`) so we can tolerate the
-    # startup window where Blockscout's Ecto migrations
-    # (`Explorer.ReleaseTasks.migrate([])` inside the backend's
-    # ExecStart wrapper) haven't yet created the `blocks` table.
-    # Until then psql returns a non-zero status with "relation
-    # \"blocks\" does not exist"; we treat that as count = 0 and
-    # let the wait loop keep polling instead of hard-failing.
-    # `wait_for_unit("blockscout-backend.service")` only proves the
-    # unit is active, not that migrations have completed.
-    # `runuser` instead of `sudo`: nixosTest VMs don't ship a
-    # generated /etc/sudoers, so `sudo -u postgres` can fail even
-    # when Postgres is healthy. `runuser` is part of util-linux,
-    # always present, and doesn't depend on sudoers configuration.
-    #
-    # `last_psql` retains the last call's rc + output so the
-    # eventual timeout AssertionError can include what psql said.
-    # Without this, "relation does not exist" (expected during the
-    # migration window) and "auth failed" / "could not connect"
-    # (real bugs) all look identical to "indexer hasn't caught up
-    # yet" — until you hit the 600 s deadline and have nothing to
-    # debug from. Stored as a dict for self-documenting access; the
-    # 2>&1 redirect ensures stderr-only error messages are part of
-    # the captured output.
-    last_psql = {"rc": 0, "output": ""}
-
-    def block_count_in_db():
-        rc, out = machine.execute(
-            "${pkgs.util-linux}/bin/runuser -u postgres -- "
-            "${pkgs.postgresql}/bin/psql -At -d blockscout "
-            "-c 'SELECT count(*) FROM blocks' 2>&1"
-        )
-        last_psql["rc"] = rc
-        last_psql["output"] = out
-        if rc != 0:
-            return 0
-        return int(out.strip())
-
-    deadline = time.monotonic() + 600
-    while True:
-        count = block_count_in_db()
-        if count >= ${toString blocksRequired}:
-            break
-        if time.monotonic() > deadline:
-            raise AssertionError(
-                f"indexer did not reach blocksRequired "
-                f"(${toString blocksRequired}) in 600 s: got {count}; "
-                f"last psql rc={last_psql['rc']}, "
-                f"output={last_psql['output']!r}"
-            )
-        time.sleep(5)
-
+    # `runuser -u postgres --` is used in the psql command because
+    # nixosTest VMs don't ship a generated /etc/sudoers, so
+    # `sudo -u postgres` would fail even when Postgres is healthy.
     # ---------------------------------------------------------------
-    # 7. Probe 6 (/api/v2/main-page/indexing-status) — the
-    # Blockscout-side view. With dev's 1s block production the indexer
-    # may briefly oscillate between "finished_indexing_blocks: true"
-    # and "false" as new blocks land. We accept either
-    # `finished_indexing_blocks: true` or `indexed_blocks_ratio >=
-    # 1.0` to ride that ratio flap.
-    # ---------------------------------------------------------------
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/v2/main-page/indexing-status "
-        "| ${pkgs.jq}/bin/jq -e "
-        "'.finished_indexing_blocks == true or .indexed_blocks_ratio >= 1.0'",
-        timeout=300,
+    machine.succeed(
+        "PROBE_RPC_URL=http://127.0.0.1:8545 "
+        "PROBE_BACKEND_URL=http://127.0.0.1:4000 "
+        "PROBE_FRONTEND_URL=http://127.0.0.1:3000 "
+        "PROBE_CHAIN_ID=${toString chainId} "
+        "PROBE_BLOCKS_REQUIRED=${toString blocksRequired} "
+        "PROBE_PSQL_CMD='${pkgs.util-linux}/bin/runuser -u postgres -- "
+        "${pkgs.postgresql}/bin/psql -At -d blockscout' "
+        "PROBE_BACKEND_UNIT=blockscout-backend.service "
+        "${pkgs.python3}/bin/python3 /etc/probes.py",
+        timeout=1800,
     )
 
-    # ---------------------------------------------------------------
-    # 8. Probe 7 (/api/health) — full chain-aware health check.
-    # Returns 200 once the indexer has at least one block recorded
-    # within `Explorer.Chain.Health.Monitor.healthy_blocks_period`
-    # (default 5 min, comfortably passes at 1 block/sec); 500 when
-    # stale.
-    #
-    # The route is `/api/health`, NOT `/api/v2/health` — the `/health`
-    # scope is mounted at the `/api` level outside `/v2` (per
-    # `apps/block_scout_web/lib/block_scout_web/routers/api_router.ex`
-    # line 533). Hitting `/api/v2/health` lands on the V2
-    # FallbackController's `/*path` catch-all and returns 400 for
-    # unknown action — which is how the M2.5 design's earlier
-    # documentation was led astray.
-    # ---------------------------------------------------------------
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/health",
-        timeout=300,
-    )
-
-    # ---------------------------------------------------------------
-    # 9. Frontend cross-check — envs.js carries the dev chain ID, not
-    # the module-default MainNet ID. Validates the publicEnv override
-    # threading.
-    # ---------------------------------------------------------------
-    envsjs = machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:3000/assets/envs.js",
-        timeout=120,
-    )
-    assert '"${toString chainId}"' in envsjs, (
-        f"envs.js missing dev chain ID '${toString chainId}': {envsjs!r}"
-    )
-
-    # ---------------------------------------------------------------
-    # 10. Backend CHAIN_ID env cross-check — same pattern as the
-    # static `integration` test. The threading proved correct via the
-    # eth_chainId / envs.js / count-of-blocks probes; this assertion
-    # additionally verifies the backend module's `cfg.chain.id ->
-    # CHAIN_ID` env-var rendering, closing the regression mode where
-    # a future refactor of the backend's env wiring could leave this
-    # test green.
-    # ---------------------------------------------------------------
-    backend_env = machine.succeed(
-        "systemctl show -p Environment --value blockscout-backend.service"
-    ).strip()
-    assert "CHAIN_ID=${toString chainId}" in backend_env, (
-        f"backend CHAIN_ID env missing or mismatched: {backend_env!r}"
-    )
   '';
 }
