@@ -71,6 +71,12 @@ check_port_free "$PG_PORT" E2E_PG_PORT || port_conflict=1
 check_port_free "$REDIS_PORT" E2E_REDIS_PORT || port_conflict=1
 check_port_free "$RPC_PORT" E2E_RPC_PORT || port_conflict=1
 check_port_free "$WS_PORT" E2E_WS_PORT || port_conflict=1
+# Autonity still binds the P2P port even in `--dev` (with maxpeers=0
+# and nodiscover both forced). A conflict with another L1 node /
+# leftover autonity process produces a less targeted bind error
+# from the autonity binary itself; covering it here keeps the
+# preflight comprehensive.
+check_port_free "$P2P_PORT" E2E_P2P_PORT || port_conflict=1
 check_port_free "$BACKEND_PORT" E2E_BACKEND_PORT || port_conflict=1
 check_port_free "$FRONTEND_PORT" E2E_FRONTEND_PORT || port_conflict=1
 if [ $port_conflict -ne 0 ]; then
@@ -278,6 +284,15 @@ BLOCKSCOUT_ROOT=$(dirname "$(dirname "$BLOCKSCOUT_BIN")")
 # StateDirectory pattern from blockscout-backend.nix:212-216.
 mkdir -p "$STATE_DIR/backend-home"
 
+# RELEASE_COOKIE generated ONCE here (not inside backend_env) so the
+# same value is exported for both the migration `eval` and the
+# subsequent `start`. The systemd wrapper at
+# `modules/blockscout-backend.nix:300-309` keeps the cookie stable
+# across the unit's lifetime; if eval and start used different
+# cookies, any operator-side `bin/blockscout rpc` against the
+# running node would fail with a cookie-mismatch panic.
+BACKEND_RELEASE_COOKIE=$(openssl rand -hex 24)
+
 # Backend env. Same contract as `services.blockscout-backend`'s
 # `environment = { ... }` block at blockscout-backend.nix:1000-1027.
 backend_env() {
@@ -286,7 +301,7 @@ backend_env() {
   DATABASE_URL="$DATABASE_URL"
   ACCOUNT_DATABASE_URL="$DATABASE_URL"
   ACCOUNT_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
-  RELEASE_COOKIE="$(openssl rand -hex 24)"
+  RELEASE_COOKIE="$BACKEND_RELEASE_COOKIE"
   ECTO_USE_SSL="false"
   ETHEREUM_JSONRPC_VARIANT="geth"
   ETHEREUM_JSONRPC_HTTP_URL="http://127.0.0.1:${RPC_PORT}"
