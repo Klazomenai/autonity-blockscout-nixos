@@ -48,6 +48,49 @@ nix flake check
 
 Service-module composition, operator host-config patterns, and VM integration-test runbooks will be documented here as they land.
 
+## Running locally
+
+Two complementary harnesses for exercising the 5-service core stack (autonity, postgres, redis, blockscout backend + frontend) outside CI. Nginx + TLS-termination paths are NOT covered by these — that surface lives only in the VM check at `checks.<system>.integration-sync`:
+
+### `nix run .#e2e` — one-shot host-native smoke
+
+Spawns autonity (`--dev`), postgres, redis, blockscout backend, blockscout frontend as background processes in a tmpdir, runs the shared probe sequence (`tests/probes.py`), exits 0 on success or non-zero on first probe failure. Wall-clock target ~3.5–5 minutes on a warm cache.
+
+```sh
+nix run .#e2e
+```
+
+Tunable via env vars (defaults shown):
+
+```sh
+E2E_CHAIN_ID=65111111 E2E_BLOCKS_REQUIRED=70 nix run .#e2e
+
+# Keep the state dir for debugging instead of cleaning up on exit.
+E2E_KEEP_STATE=1 nix run .#e2e
+```
+
+### `devenv up` — long-lived stack for interactive debugging
+
+Brings the same 5 services up under process-compose; tail logs in a single TUI; `Ctrl-C` to stop. Useful when iterating on the indexer or frontend rendering.
+
+```sh
+devenv up
+# In another shell:
+e2e-probes        # Run the probe sequence against the running stack
+curl http://127.0.0.1:4000/api/health
+```
+
+### Authoritative VM check
+
+Both above harnesses are SUPPLEMENTARY to the nixosTest VM check at `checks.<system>.integration-sync`. The VM check exercises real systemd hardening (`DynamicUser`, `LoadCredential`, `RestrictAddressFamilies`, `SystemCallFilter`, etc.) and `SupplementaryGroups` cross-service socket access — none of which the host-native harnesses reproduce. The VM is the contract; `nix run .#e2e` and `devenv up` are debugging conveniences.
+
+```sh
+nix flake check                          # Includes integration-sync on push-to-main + nightly
+nix build .#checks.x86_64-linux.integration-sync -L   # Run the VM check directly
+```
+
+Probe LOGIC is shared via `tests/probes.py`; both the VM testScript and the host-native runner invoke the same Python script with different env-var contracts, so probes don't drift between contexts.
+
 ## License
 
 GPL-3.0-only. See [`LICENSE`](./LICENSE).
