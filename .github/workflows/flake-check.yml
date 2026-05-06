@@ -5,13 +5,43 @@ on:
     branches: [main]
   push:
     branches: [main]
+  schedule:
+    # Nightly run for the full check set including integration-sync.
+    # 03:17 UTC keeps the run off the on-the-hour spike of GHA traffic.
+    - cron: '17 3 * * *'
 
 concurrency:
   group: flake-check-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  # PR-time check set: fast feedback on the static + behavioural
+  # checks every PR genuinely needs (`fmt`, `hardening`, `integration`).
+  # `integration-sync` is excluded here per the M2.5 locked design (see
+  # epic #38) — it exercises real chain progression + indexer ingestion
+  # under TCG, runs ~25 min, and only earns its keep on `main` /
+  # nightly where the cost is amortised against actual landed work
+  # rather than per-PR review iterations.
+  check-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - name: nix build .#checks.x86_64-linux.{fmt,hardening,integration}
+        run: |
+          nix build --print-build-logs \
+            .#checks.x86_64-linux.fmt \
+            .#checks.x86_64-linux.hardening \
+            .#checks.x86_64-linux.integration
+
+  # Main + nightly check set: full `nix flake check`, including the
+  # slow `integration-sync` VM that drives Autonity in `--dev` mode.
+  # Runs on push to `main` (post-merge regression catch) and on the
+  # nightly cron (ongoing drift detection without per-PR cost).
+  check-full:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

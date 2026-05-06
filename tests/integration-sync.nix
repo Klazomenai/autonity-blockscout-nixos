@@ -428,14 +428,16 @@ pkgs.testers.nixosTest {
     # when Postgres is healthy. `runuser` is part of util-linux,
     # always present, and doesn't depend on sudoers configuration.
     #
-    # `last_psql_output` retains the last (rc, output) tuple from
-    # the call so the eventual timeout AssertionError can include
-    # what psql said. Without this, "relation does not exist"
-    # (expected during the migration window) and "auth failed" or
-    # "could not connect" (real bugs) all look identical to
-    # "indexer hasn't caught up yet" — until you hit the 600 s
-    # deadline and have nothing to debug from.
-    last_psql_output = ["", 0]
+    # `last_psql` retains the last call's rc + output so the
+    # eventual timeout AssertionError can include what psql said.
+    # Without this, "relation does not exist" (expected during the
+    # migration window) and "auth failed" / "could not connect"
+    # (real bugs) all look identical to "indexer hasn't caught up
+    # yet" — until you hit the 600 s deadline and have nothing to
+    # debug from. Stored as a dict for self-documenting access; the
+    # 2>&1 redirect ensures stderr-only error messages are part of
+    # the captured output.
+    last_psql = {"rc": 0, "output": ""}
 
     def block_count_in_db():
         rc, out = machine.execute(
@@ -443,8 +445,8 @@ pkgs.testers.nixosTest {
             "${pkgs.postgresql}/bin/psql -At -d blockscout "
             "-c 'SELECT count(*) FROM blocks' 2>&1"
         )
-        last_psql_output[0] = out
-        last_psql_output[1] = rc
+        last_psql["rc"] = rc
+        last_psql["output"] = out
         if rc != 0:
             return 0
         return int(out.strip())
@@ -458,8 +460,8 @@ pkgs.testers.nixosTest {
             raise AssertionError(
                 f"indexer did not reach blocksRequired "
                 f"(${toString blocksRequired}) in 600 s: got {count}; "
-                f"last psql exit={last_psql_output[1]}, "
-                f"output={last_psql_output[0]!r}"
+                f"last psql rc={last_psql['rc']}, "
+                f"output={last_psql['output']!r}"
             )
         time.sleep(5)
 
