@@ -125,14 +125,30 @@
         # service modules in a `pkgs.testers.nixosTest` VM and exercises real
         # cross-service connectivity, the bind-mounted envs.js
         # overlay, the nginx reverse-proxy paths, and restart
-        # resilience. Slow + memory-hungry (4 GiB VM, ~5+ min on a
-        # cold cache); runs on every PR via `nix flake check` but
-        # benefits massively from caching across repeated runs.
-        # Complementary to the static `hardening` check: that one
-        # asserts unit files render with the right `serviceConfig`;
-        # this one asserts the units actually run and talk to each
-        # other.
+        # resilience. Slow + memory-hungry (4 GiB VM); runs on every
+        # PR via `nix flake check` but benefits massively from caching
+        # across repeated runs. Complementary to the static `hardening`
+        # check: that one asserts unit files render with the right
+        # `serviceConfig`; this one asserts the units actually run and
+        # talk to each other.
         checks.integration = import ./tests/integration.nix {
+          inherit pkgs system;
+          flake = self;
+        };
+
+        # Behavioural full-stack VM SYNC test — same six-service stack
+        # as `integration`, but with Autonity in `--dev` mode driving
+        # real chain progression. Waits for the chain to produce >= 70
+        # blocks (one epoch crossed plus a 10-block buffer) AND for
+        # the Blockscout indexer to catch up to the same threshold.
+        # Slower than `integration` because it exercises real chain
+        # production + indexer ingestion under TCG-emulated CPU
+        # contention. Probe vocabulary, default `blocksRequired`, and
+        # the in-memory-chain-DB / no-account-state / block-count-only
+        # design constraints are documented inline in
+        # `tests/integration-sync.nix`; the M2.5 epic at #38 tracks the
+        # per-PR opt-out CI policy.
+        checks.integration-sync = import ./tests/integration-sync.nix {
           inherit pkgs system;
           flake = self;
         };
