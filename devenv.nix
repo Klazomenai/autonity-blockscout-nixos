@@ -103,14 +103,20 @@ in
         set -eu
         PGDATA="${stateDir}/pg"
         if [ ! -f "$PGDATA/PG_VERSION" ]; then
+          # --auth-host=scram-sha-256 + password_encryption =
+          # scram-sha-256 below for parity with the
+          # blockscout-postgresql NixOS module's auth posture.
           ${pkgs.postgresql}/bin/initdb -D "$PGDATA" \
-            --auth-local=trust --auth-host=md5 --no-locale --encoding=UTF8 \
+            --auth-local=trust --auth-host=scram-sha-256 --no-locale --encoding=UTF8 \
             --username=postgres
           mkdir -p "${stateDir}/pg-sock"
           cat >> "$PGDATA/postgresql.conf" <<EOF
         listen_addresses = '127.0.0.1'
         port = 5432
         unix_socket_directories = '${stateDir}/pg-sock'
+        # Match the blockscout-postgresql module's encryption choice;
+        # pairs with --auth-host=scram-sha-256 above.
+        password_encryption = scram-sha-256
         # Match the blockscout-postgresql NixOS module + tests/run-e2e.sh:
         # the postgres default of 100 exhausts under Blockscout's Ecto
         # connection pool during indexer catchup, tripping

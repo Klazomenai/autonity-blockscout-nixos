@@ -131,7 +131,15 @@ trap cleanup EXIT INT TERM
 
 echo "[e2e] starting postgres on port $PG_PORT"
 PGDATA="$STATE_DIR/pg"
-initdb -D "$PGDATA" --auth-local=trust --auth-host=md5 --no-locale --encoding=UTF8 --username=postgres >/dev/null
+# `--auth-host=scram-sha-256` for parity with the
+# blockscout-postgresql NixOS module's pg_hba posture (the module
+# wraps `services.postgresql` which defaults host auth to SCRAM on
+# newer postgres versions). MD5 would have worked locally but
+# diverges from the VM's authentication path; SCRAM is the modern
+# default and the password_encryption setting below ensures the
+# blockscout role's password is hashed with the same algorithm at
+# CREATE USER time.
+initdb -D "$PGDATA" --auth-local=trust --auth-host=scram-sha-256 --no-locale --encoding=UTF8 --username=postgres >/dev/null
 # Listen on loopback only; unix socket directory under STATE_DIR so
 # the harness doesn't collide with a host-installed postgres on
 # /run/postgresql.
@@ -140,6 +148,10 @@ cat >> "$PGDATA/postgresql.conf" <<EOF
 listen_addresses = '127.0.0.1'
 port = $PG_PORT
 unix_socket_directories = '$STATE_DIR/pg-sock'
+# Match the blockscout-postgresql NixOS module's encryption choice;
+# pairs with --auth-host=scram-sha-256 above so role passwords are
+# hashed with SCRAM at creation time.
+password_encryption = scram-sha-256
 # Blockscout's Ecto connection pool exhausts the postgres default
 # (100). The blockscout-postgresql NixOS module sets 250; match that
 # so the indexer doesn't trip "FATAL: sorry, too many clients

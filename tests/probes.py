@@ -46,6 +46,24 @@ Env-var contract:
                              Environment= directive. Skipped (with a
                              log line) when the backend isn't a
                              systemd unit (host-native mode).
+  PROBE_DEV_VALIDATOR_CONSENSUS_KEY
+                             Optional. If set, asserts that the
+                             single committee member returned by
+                             tendermint_getCommittee carries this
+                             exact `consensusKey` value. The dev
+                             chain pins
+                             `params.TestValidatorConsensusKey` at
+                             `cmd/utils/flags.go:1614` — the
+                             consensus pubkey is identical across
+                             every dev launch (unlike etherbase
+                             which rotates per
+                             `flags.go:1599-1606`), so the
+                             assertion is stable. Empirically the
+                             value serialises as a 0x-prefixed
+                             96-byte hex string (BLS public key,
+                             96 bytes = 192 hex chars). Default
+                             unset → only the committee size is
+                             asserted.
   PROBE_VERIFY_ENVS_CHAIN_ID Optional. If set to "1", asserts that
                              the rendered envs.js contains the
                              expected chain ID substring. Set in the
@@ -86,6 +104,7 @@ RPC_URL = os.environ.get("PROBE_RPC_URL", "http://127.0.0.1:8545")
 BACKEND_URL = os.environ.get("PROBE_BACKEND_URL", "http://127.0.0.1:4000")
 FRONTEND_URL = os.environ.get("PROBE_FRONTEND_URL", "http://127.0.0.1:3000")
 BACKEND_UNIT = os.environ.get("PROBE_BACKEND_UNIT")  # may be None
+DEV_VALIDATOR_CONSENSUS_KEY = os.environ.get("PROBE_DEV_VALIDATOR_CONSENSUS_KEY")  # may be None
 
 try:
     CHAIN_ID = int(os.environ["PROBE_CHAIN_ID"])
@@ -299,6 +318,19 @@ def probe_tendermint_committee():
             f"committee.members has {len(members)} entries, "
             f"expected 1 (single-validator dev chain): {members!r}"
         )
+    # Optional identity assertion — when PROBE_DEV_VALIDATOR_CONSENSUS_KEY
+    # is set, verify the single member's consensusKey matches. The
+    # dev chain pins `params.TestValidatorConsensusKey`, so the
+    # consensus pubkey is stable across every launch (the etherbase
+    # address rotates per launch and is NOT a stable assertion
+    # target). Default unset → only the size assertion runs.
+    if DEV_VALIDATOR_CONSENSUS_KEY:
+        got_key = members[0].get("consensusKey")
+        if got_key != DEV_VALIDATOR_CONSENSUS_KEY:
+            raise AssertionError(
+                f"committee.members[0].consensusKey mismatch: "
+                f"expected {DEV_VALIDATOR_CONSENSUS_KEY!r}, got {got_key!r}"
+            )
 
 
 def probe_tendermint_core_state_advances():
