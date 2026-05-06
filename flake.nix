@@ -108,8 +108,6 @@
             pkgs.curl
             pkgs.openssl
             pkgs.coreutils
-            pkgs.gnused
-            pkgs.gawk
             # The harness's port-conflict pre-flight uses `ss` from
             # iproute2 to detect bound ports cleanly without needing
             # a short-lived test connect; the result is filtered via

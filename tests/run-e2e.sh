@@ -234,12 +234,22 @@ chmod 600 "$STATE_DIR/creds/"*
 # pass through). Same logic as blockscout-backend.nix:241-268. The
 # fixed test password contains only unreserved characters so this
 # loop is a no-op for the default; kept for fidelity with production.
+#
+# LC_ALL=C so `${raw:i:1}` slices by BYTE rather than by Unicode
+# grapheme. Without it, in a UTF-8 locale a non-ASCII password byte
+# would be sliced as a multi-byte chunk and the `od -An -tx1` step
+# would emit two-byte hex (e.g. `c3a9`), producing a single
+# `%c3a9` instead of the correct two-percent-encoding `%c3%a9`.
+# Critical only for non-ASCII passwords; mirrored from the systemd
+# wrapper's same precaution.
 url_encode() {
   local raw="$1"
   local out=""
   local i=0
-  local len=${#raw}
+  local len
   local c hex
+  LC_ALL=C
+  len=${#raw}
   while [ $i -lt $len ]; do
     c=${raw:$i:1}
     case "$c" in
