@@ -392,45 +392,51 @@ fi
 WRITABLE="$STATE_DIR/frontend"
 mkdir -p "$WRITABLE/public/assets"
 
-# Include hidden entries in the mirror — the Next.js standalone tree
-# has a `.next/` directory at the package root that holds the
-# production build, and the default shell glob `*` skips dotfiles.
-shopt -s dotglob
+# Mirror loops scoped to a subshell so the `shopt -s dotglob`
+# inside doesn't leak into the rest of the script (later globs
+# would otherwise unexpectedly include hidden files).
+(
+  # Include hidden entries in the mirror — the Next.js standalone
+  # tree has a `.next/` directory at the package root that holds
+  # the production build, and the default shell glob `*` skips
+  # dotfiles.
+  shopt -s dotglob
 
-# Top-level entries except `public` (shadowed below) and `server.js`
-# (copied, see below).
-for entry in "$FRONTEND_PKG"/*; do
-  name=$(basename "$entry")
-  case "$name" in
-    public|server.js) continue ;;
-    *) ln -s "$entry" "$WRITABLE/$name" ;;
-  esac
-done
+  # Top-level entries except `public` (shadowed below) and
+  # `server.js` (copied, see below).
+  for entry in "$FRONTEND_PKG"/*; do
+    name=$(basename "$entry")
+    case "$name" in
+      public|server.js) continue ;;
+      *) ln -s "$entry" "$WRITABLE/$name" ;;
+    esac
+  done
 
-# server.js is copied (not symlinked) so Node's `__dirname`
-# resolves to $WRITABLE, not back to the read-only package
-# directory. Without this, server.js's `process.chdir(__dirname)`
-# CDs into the package and serves the original public/.
-# `--preserve-symlinks` would solve __dirname but breaks pnpm's
-# heavy symlink-based node_modules deduplication (Node fails to
-# resolve transitive deps like `styled-jsx/package.json`); copying
-# just this one small file gets us correct __dirname without
-# touching module resolution.
-cp "$FRONTEND_PKG/server.js" "$WRITABLE/server.js"
+  # server.js is copied (not symlinked) so Node's `__dirname`
+  # resolves to $WRITABLE, not back to the read-only package
+  # directory. Without this, server.js's `process.chdir(__dirname)`
+  # CDs into the package and serves the original public/.
+  # `--preserve-symlinks` would solve __dirname but breaks pnpm's
+  # heavy symlink-based node_modules deduplication (Node fails to
+  # resolve transitive deps like `styled-jsx/package.json`); copying
+  # just this one small file gets us correct __dirname without
+  # touching module resolution.
+  cp "$FRONTEND_PKG/server.js" "$WRITABLE/server.js"
 
-# `public/` entries except `assets` (we shadow that too).
-for entry in "$FRONTEND_PKG/public"/*; do
-  name=$(basename "$entry")
-  [ "$name" = "assets" ] && continue
-  ln -s "$entry" "$WRITABLE/public/$name"
-done
+  # `public/` entries except `assets` (we shadow that too).
+  for entry in "$FRONTEND_PKG/public"/*; do
+    name=$(basename "$entry")
+    [ "$name" = "assets" ] && continue
+    ln -s "$entry" "$WRITABLE/public/$name"
+  done
 
-# `public/assets/` entries except `envs.js` (the one file we replace).
-for entry in "$FRONTEND_PKG/public/assets"/*; do
-  name=$(basename "$entry")
-  [ "$name" = "envs.js" ] && continue
-  ln -s "$entry" "$WRITABLE/public/assets/$name"
-done
+  # `public/assets/` entries except `envs.js` (the one file we replace).
+  for entry in "$FRONTEND_PKG/public/assets"/*; do
+    name=$(basename "$entry")
+    [ "$name" = "envs.js" ] && continue
+    ln -s "$entry" "$WRITABLE/public/assets/$name"
+  done
+)
 
 # Generate a fresh envs.js with the correct chain ID. Same shape +
 # default values as the frontend module's `publicEnv` attrset

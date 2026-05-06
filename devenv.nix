@@ -276,25 +276,31 @@ in
         WRITABLE="${stateDir}/frontend"
         rm -rf "$WRITABLE"
         mkdir -p "$WRITABLE/public/assets"
-        # `dotglob` so the `.next/` production-build directory at the
-        # package root is mirrored — default shell glob skips
-        # dotfiles.
-        shopt -s dotglob
-        for entry in "${pkgs.blockscout-frontend}"/*; do
-          name=$(basename "$entry")
-          case "$name" in
-            public|server.js) continue ;;
-            *) ln -s "$entry" "$WRITABLE/$name" ;;
-          esac
-        done
-        # Copy server.js (not symlink) so Node's __dirname resolves
-        # to $WRITABLE; the script does `process.chdir(__dirname)`
-        # to find public/, which would otherwise CD back into the
-        # read-only package dir and serve the original envs.js. The
-        # alternative `--preserve-symlinks` flag breaks pnpm's
-        # symlink-based node_modules layout, so copying just this
-        # one small file is the targeted fix.
-        cp "${pkgs.blockscout-frontend}/server.js" "$WRITABLE/server.js"
+        # Mirror loops scoped to a subshell so the `shopt -s dotglob`
+        # inside doesn't leak into the surrounding script (later
+        # globs would otherwise unexpectedly include hidden files).
+        (
+          # `dotglob` so the `.next/` production-build directory at
+          # the package root is mirrored — default shell glob skips
+          # dotfiles.
+          shopt -s dotglob
+          for entry in "${pkgs.blockscout-frontend}"/*; do
+            name=$(basename "$entry")
+            case "$name" in
+              public|server.js) continue ;;
+              *) ln -s "$entry" "$WRITABLE/$name" ;;
+            esac
+          done
+          # Copy server.js (not symlink) so Node's __dirname
+          # resolves to $WRITABLE; the script does
+          # `process.chdir(__dirname)` to find public/, which would
+          # otherwise CD back into the read-only package dir and
+          # serve the original envs.js. The alternative
+          # `--preserve-symlinks` flag breaks pnpm's symlink-based
+          # node_modules layout, so copying just this one small
+          # file is the targeted fix.
+          cp "${pkgs.blockscout-frontend}/server.js" "$WRITABLE/server.js"
+        )
         for entry in "${pkgs.blockscout-frontend}/public"/*; do
           name=$(basename "$entry")
           [ "$name" = "assets" ] && continue

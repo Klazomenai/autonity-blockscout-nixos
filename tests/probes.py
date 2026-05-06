@@ -64,26 +64,21 @@ Env-var contract:
                              96 bytes = 192 hex chars). Default
                              unset → only the committee size is
                              asserted.
-  PROBE_VERIFY_ENVS_CHAIN_ID Optional. If set to "1", asserts that
-                             the rendered envs.js contains the
-                             expected chain ID substring. Set in the
-                             VM context where the frontend module
-                             bind-mounts a fresh envs.js generated
-                             from the test's chainId. Unset (default)
-                             in host-native mode where the frontend
-                             serves the package's baked-in envs.js
-                             with the upstream MainNet placeholder
-                             chain ID. Both VM and host-native
-                             runners now place a fresh envs.js with
-                             the test's chainId (VM via
-                             BindReadOnlyPaths overlay; host-native
-                             via a writable symlink-tree mirror in
-                             the state dir), so this gate is set to
-                             "1" in both contexts. Escape hatch:
-                             leave it unset to run probes.py against
-                             a stack that's serving the package's
-                             baked-in placeholder envs.js (only the
-                             "envs.js is served" half then runs).
+  PROBE_VERIFY_ENVS_CHAIN_ID Optional. If set to "1", additionally
+                             asserts that the rendered envs.js
+                             contains the expected chain ID. Both
+                             the VM testScript and the host-native
+                             runner set this to "1" — VM places a
+                             fresh envs.js via the frontend module's
+                             BindReadOnlyPaths overlay, host-native
+                             does the equivalent via a writable
+                             symlink-tree mirror in the state dir.
+                             Default (unset) is the escape hatch for
+                             running probes.py against a stack that
+                             serves the package's baked-in
+                             placeholder envs.js — only the "envs.js
+                             is served" half of the assertion then
+                             runs.
 
 Exit code 0 on all probes passing; non-zero with a clear stderr
 message on first failure.
