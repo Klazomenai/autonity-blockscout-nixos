@@ -193,9 +193,29 @@ def log(msg):
 
 
 def probe_eth_chain_id():
-    """Probe 1: eth_chainId == hex(chain_id) — exact equality."""
+    """Probe 1: eth_chainId == hex(chain_id) — exact equality.
+
+    Both harnesses gate on "JSON-RPC port is open" before invoking
+    probes (via `wait_for_open_port` / curl-or-tcp checks), but a
+    listening socket doesn't guarantee the JSON-RPC handler
+    goroutines are warm yet. Retry on connection-shaped exceptions
+    (URLError, ConnectionError) for up to 60 s; raise immediately on
+    a real protocol mismatch (rpc_result's AssertionError) — that's
+    the handler answering coherently with the wrong value, no point
+    waiting.
+    """
     log(f"probe 1: eth_chainId == {CHAIN_ID_HEX}")
-    got = rpc_result("eth_chainId")
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            got = rpc_result("eth_chainId")
+            break
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as e:
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"eth_chainId could not be reached within 60 s: {e!r}"
+                )
+            time.sleep(2)
     if got != CHAIN_ID_HEX:
         raise AssertionError(
             f"eth_chainId mismatch: expected {CHAIN_ID_HEX}, got {got!r}"

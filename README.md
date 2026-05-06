@@ -50,7 +50,7 @@ Service-module composition, operator host-config patterns, and VM integration-te
 
 ## Running locally
 
-Two complementary harnesses for exercising the full 6-service stack outside CI:
+Two complementary harnesses for exercising the 5-service core stack (autonity, postgres, redis, blockscout backend + frontend) outside CI. Nginx + TLS-termination paths are NOT covered by these — that surface lives only in the VM check at `checks.<system>.integration-sync`:
 
 ### `nix run .#e2e` — one-shot host-native smoke
 

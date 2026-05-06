@@ -282,20 +282,26 @@ echo "[e2e]   backend up"
 # --------------------------------------------------------------------
 
 echo "[e2e] starting blockscout-frontend on port $FRONTEND_PORT"
-# The frontend package ships a Next.js standalone server. Same env-var
-# shape as the systemd unit: process.env.NEXT_PUBLIC_* drives SSR,
-# window.__envs is loaded from /assets/envs.js bind-mounted onto the
-# package. Here we don't bind-mount; we just rely on the package's
-# baked-in placeholder being good enough for the chain-ID assertion in
-# probes.py (which only checks the substring is present, not which
-# layer rendered it). For a stricter cross-check we'd write a fresh
-# envs.js into a tmpdir + symlink in; out of scope for #35's smoke.
-FRONTEND_BIN=$(command -v blockscout-frontend 2>/dev/null || command -v node)
-NEXT_DIR=$(dirname "$(realpath "$(command -v blockscout-frontend 2>/dev/null || true)")" 2>/dev/null || true)
-if [ -z "$NEXT_DIR" ] || [ ! -d "$NEXT_DIR" ]; then
-  # Fallback: locate the standalone server.js via the blockscout-frontend package.
-  NEXT_DIR=$(dirname "$(find "$(dirname "$(dirname "$FRONTEND_BIN")")" -name server.js -path "*/standalone/*" 2>/dev/null | head -n 1)")
+# Locate the Next.js standalone server.js inside the frontend package.
+# Same shape as `devenv.nix`'s blockscout-frontend process — the
+# `command -v blockscout-frontend` -> `dirname` chain landed in
+# `<store>/bin` (where server.js doesn't live) under earlier drafts;
+# walk up from the binary to the package root and `find` the
+# standalone tree explicitly.
+FRONTEND_BIN=$(command -v blockscout-frontend)
+FRONTEND_PKG=$(dirname "$(dirname "$FRONTEND_BIN")")
+SERVER_JS=$(find "$FRONTEND_PKG" -name server.js -path "*/standalone/*" 2>/dev/null | head -n 1)
+if [ -z "$SERVER_JS" ] || [ ! -f "$SERVER_JS" ]; then
+  echo "[e2e] could not locate standalone/server.js under $FRONTEND_PKG" >&2
+  exit 1
 fi
+NEXT_DIR=$(dirname "$SERVER_JS")
+# We don't bind-mount a fresh envs.js (that's the systemd unit's
+# BindReadOnlyPaths overlay); the host-native frontend serves the
+# package's baked-in MainNet placeholder. probes.py's envs.js
+# cross-check is gated by PROBE_VERIFY_ENVS_CHAIN_ID, which we leave
+# unset here so only the "envs.js is served" half of the assertion
+# runs in host-native mode.
 (
   HOSTNAME=127.0.0.1
   PORT="$FRONTEND_PORT"
@@ -309,8 +315,8 @@ fi
   export HOSTNAME PORT NEXT_PUBLIC_NETWORK_ID NEXT_PUBLIC_API_HOST \
     NEXT_PUBLIC_API_PROTOCOL NEXT_PUBLIC_API_PORT NEXT_PUBLIC_APP_HOST \
     NEXT_PUBLIC_APP_PROTOCOL NEXT_PUBLIC_APP_PORT
-  cd "$NEXT_DIR" 2>/dev/null || true
-  exec node "$NEXT_DIR/server.js"
+  cd "$NEXT_DIR"
+  exec node "$SERVER_JS"
 ) >"$STATE_DIR/frontend.log" 2>&1 &
 PIDS+=($!)
 

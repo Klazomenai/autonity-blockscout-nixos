@@ -107,6 +107,11 @@ in
         listen_addresses = '127.0.0.1'
         port = 5432
         unix_socket_directories = '${stateDir}/pg-sock'
+        # Match the blockscout-postgresql NixOS module + tests/run-e2e.sh:
+        # the postgres default of 100 exhausts under Blockscout's Ecto
+        # connection pool during indexer catchup, tripping
+        # "FATAL: sorry, too many clients already".
+        max_connections = 250
         fsync = off
         synchronous_commit = off
         full_page_writes = off

@@ -284,6 +284,15 @@ pkgs.testers.nixosTest {
         "PROBE_PSQL_CMD='${pkgs.util-linux}/bin/runuser -u postgres -- "
         "${pkgs.postgresql}/bin/psql -At -d blockscout' "
         "PROBE_BACKEND_UNIT=blockscout-backend.service "
+        # PROBE_VERIFY_ENVS_CHAIN_ID=1 enables probes.py's stricter
+        # envs.js cross-check: assert the rendered envs.js contains
+        # the dev chain ID. Set in the VM context where the frontend
+        # module's BindReadOnlyPaths overlay places a fresh envs.js
+        # generated from the test's chainId; unset in host-native
+        # mode where the frontend serves the package's baked-in
+        # MainNet placeholder (probes.py then verifies envs.js is
+        # served but skips the value match).
+        "PROBE_VERIFY_ENVS_CHAIN_ID=1 "
         "${pkgs.python3}/bin/python3 /etc/probes.py",
         timeout=1800,
     )
