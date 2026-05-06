@@ -134,7 +134,8 @@ in
         set -eu
         # Idempotent: skip if blockscout DB exists.
         if ${pkgs.postgresql}/bin/psql -h ${stateDir}/pg-sock -p 5432 -U postgres \
-             -tAc "SELECT 1 FROM pg_database WHERE datname='blockscout'" | grep -q 1; then
+             -tAc "SELECT 1 FROM pg_database WHERE datname='blockscout'" \
+             | ${pkgs.gnugrep}/bin/grep -q 1; then
           echo "postgres-init: blockscout DB already present"
           exit 0
         fi

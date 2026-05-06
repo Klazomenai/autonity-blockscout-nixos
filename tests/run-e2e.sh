@@ -49,9 +49,12 @@ FRONTEND_PORT="${E2E_FRONTEND_PORT:-3000}"
 # letting an in-flight service fail with a cryptic "bind: address in
 # use" deep in its own log file.
 #
-# `ss -ltn` (iproute2) lists TCP listening sockets in numeric form;
-# the awk pattern matches both `127.0.0.1:<port>` and `0.0.0.0:<port>`
-# (and IPv6 equivalents) by anchoring on the trailing `:<port>`.
+# `ss -ltnH "( sport = :<port> )"` (iproute2) emits one line per
+# matching listening socket and nothing if the port is free; pipe
+# through `grep -q .` to set exit status from "non-empty" without
+# parsing the line itself. ss's filter-expression form covers
+# IPv4 + IPv6 + every loopback / wildcard bind shape uniformly,
+# so we don't need an awk pass over the textual output.
 # --------------------------------------------------------------------
 
 check_port_free() {
