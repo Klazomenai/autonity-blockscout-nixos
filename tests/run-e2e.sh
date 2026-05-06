@@ -40,6 +40,42 @@ BACKEND_PORT="${E2E_BACKEND_PORT:-4000}"
 FRONTEND_PORT="${E2E_FRONTEND_PORT:-3000}"
 
 # --------------------------------------------------------------------
+# Port-conflict pre-flight
+#
+# Many dev machines already have postgres / redis / similar listening
+# on the standard service ports the harness defaults to. Detect that
+# up front and exit with a targeted message naming the offending port
+# AND the env var that overrides it — much cheaper to debug than
+# letting an in-flight service fail with a cryptic "bind: address in
+# use" deep in its own log file.
+#
+# `ss -ltn` (iproute2) lists TCP listening sockets in numeric form;
+# the awk pattern matches both `127.0.0.1:<port>` and `0.0.0.0:<port>`
+# (and IPv6 equivalents) by anchoring on the trailing `:<port>`.
+# --------------------------------------------------------------------
+
+check_port_free() {
+  local port=$1
+  local var=$2
+  if ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q . ; then
+    echo "[e2e] port $port already in use; override via $var=<free-port>" >&2
+    return 1
+  fi
+}
+
+port_conflict=0
+check_port_free "$PG_PORT" E2E_PG_PORT || port_conflict=1
+check_port_free "$REDIS_PORT" E2E_REDIS_PORT || port_conflict=1
+check_port_free "$RPC_PORT" E2E_RPC_PORT || port_conflict=1
+check_port_free "$WS_PORT" E2E_WS_PORT || port_conflict=1
+check_port_free "$BACKEND_PORT" E2E_BACKEND_PORT || port_conflict=1
+check_port_free "$FRONTEND_PORT" E2E_FRONTEND_PORT || port_conflict=1
+if [ $port_conflict -ne 0 ]; then
+  echo "[e2e] aborting; resolve port conflicts above before retrying" >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------------
 # State dir + cleanup trap
 # --------------------------------------------------------------------
 
@@ -282,20 +318,22 @@ echo "[e2e]   backend up"
 # --------------------------------------------------------------------
 
 echo "[e2e] starting blockscout-frontend on port $FRONTEND_PORT"
-# Locate the Next.js standalone server.js inside the frontend package.
-# Same shape as `devenv.nix`'s blockscout-frontend process — the
-# `command -v blockscout-frontend` -> `dirname` chain landed in
-# `<store>/bin` (where server.js doesn't live) under earlier drafts;
-# walk up from the binary to the package root and `find` the
-# standalone tree explicitly.
+# Locate server.js inside the frontend package. The Blockscout fork's
+# pnpm/Next.js build flattens the standalone tree directly into the
+# package root (`<store>/server.js` rather than the upstream
+# Next.js convention of `<store>/.next/standalone/server.js`), so
+# `command -v blockscout-frontend` followed by walking up to the
+# package root + checking for `./server.js` is the right path.
+# Hard-fail with a clear error if the layout ever changes upstream.
 FRONTEND_BIN=$(command -v blockscout-frontend)
 FRONTEND_PKG=$(dirname "$(dirname "$FRONTEND_BIN")")
-SERVER_JS=$(find "$FRONTEND_PKG" -name server.js -path "*/standalone/*" 2>/dev/null | head -n 1)
-if [ -z "$SERVER_JS" ] || [ ! -f "$SERVER_JS" ]; then
-  echo "[e2e] could not locate standalone/server.js under $FRONTEND_PKG" >&2
+SERVER_JS="${FRONTEND_PKG}/server.js"
+if [ ! -f "$SERVER_JS" ]; then
+  echo "[e2e] could not locate server.js at $SERVER_JS" >&2
+  echo "[e2e]   blockscout-frontend package layout may have changed upstream" >&2
   exit 1
 fi
-NEXT_DIR=$(dirname "$SERVER_JS")
+NEXT_DIR="$FRONTEND_PKG"
 # We don't bind-mount a fresh envs.js (that's the systemd unit's
 # BindReadOnlyPaths overlay); the host-native frontend serves the
 # package's baked-in MainNet placeholder. probes.py's envs.js

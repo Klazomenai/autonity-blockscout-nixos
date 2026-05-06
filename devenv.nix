@@ -201,10 +201,17 @@ in
         mkdir -p ${stateDir}/backend-home
         ${envExports}
         cd ${pkgs.blockscout}
+        # RELEASE_COOKIE must be exported BEFORE the migration eval,
+        # not just before `start`. The blockscout release wrapper
+        # requires a cookie for any invocation (eval, start, rpc,
+        # etc.); the migrations call `bin/blockscout eval ...` which
+        # would otherwise fall back to the in-store `releases/COOKIE`
+        # placeholder file and fail. Same cookie reused for both eval
+        # and start so the BEAM nodes agree.
+        export RELEASE_COOKIE=$(${pkgs.openssl}/bin/openssl rand -hex 24)
         # Run migrations before start; idempotent. Same call as the
         # systemd wrapper at `modules/blockscout-backend.nix:324`.
         ${pkgs.blockscout}/bin/blockscout eval 'Explorer.ReleaseTasks.migrate([])'
-        export RELEASE_COOKIE=$(${pkgs.openssl}/bin/openssl rand -hex 24)
         exec ${pkgs.blockscout}/bin/blockscout start
       '';
       process-compose = {
@@ -235,13 +242,17 @@ in
         export NEXT_PUBLIC_APP_HOST=localhost
         export NEXT_PUBLIC_APP_PROTOCOL=http
         export NEXT_PUBLIC_APP_PORT=3000
-        # Locate the Next.js standalone server.js inside the package.
-        SERVER_JS=$(find ${pkgs.blockscout-frontend} -name server.js -path "*/standalone/*" | head -n 1)
-        if [ -z "$SERVER_JS" ]; then
-          echo "could not find server.js in ${pkgs.blockscout-frontend}" >&2
+        # Locate server.js in the frontend package. The Blockscout
+        # fork flattens the Next.js standalone tree to the package
+        # root (server.js lives at `${pkgs.blockscout-frontend}/server.js`),
+        # NOT under the upstream `*/standalone/*` convention. Direct
+        # path check is the right shape; same as `tests/run-e2e.sh`.
+        SERVER_JS="${pkgs.blockscout-frontend}/server.js"
+        if [ ! -f "$SERVER_JS" ]; then
+          echo "could not find server.js at $SERVER_JS" >&2
           exit 1
         fi
-        cd "$(dirname "$SERVER_JS")"
+        cd "${pkgs.blockscout-frontend}"
         exec ${pkgs.nodejs_20}/bin/node "$SERVER_JS"
       '';
       process-compose = {

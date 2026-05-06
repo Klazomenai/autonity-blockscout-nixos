@@ -96,7 +96,17 @@ except ValueError:
 
 CHAIN_ID_HEX = f"0x{CHAIN_ID:x}"  # lowercase hex per geth-family convention
 
-BLOCKS_REQUIRED = int(os.environ.get("PROBE_BLOCKS_REQUIRED", "70"))
+# Same parse-error reporting shape as PROBE_CHAIN_ID — surface a
+# concise one-liner rather than letting Python's traceback frighten
+# operators away from the env-var override path.
+_blocks_required_raw = os.environ.get("PROBE_BLOCKS_REQUIRED", "70")
+try:
+    BLOCKS_REQUIRED = int(_blocks_required_raw)
+except ValueError:
+    sys.exit(
+        f"PROBE_BLOCKS_REQUIRED must be a decimal integer, "
+        f"got: {_blocks_required_raw!r}"
+    )
 
 PSQL_CMD = os.environ.get("PROBE_PSQL_CMD")
 if PSQL_CMD is None:

@@ -110,6 +110,16 @@
             pkgs.coreutils
             pkgs.gnused
             pkgs.gawk
+            # `tests/run-e2e.sh` uses `find` to locate the frontend
+            # standalone server.js inside the blockscout-frontend
+            # package; writeShellApplication's runtimeInputs is the
+            # canonical PATH source so the harness doesn't depend on
+            # the host having findutils installed.
+            pkgs.findutils
+            # The harness's port-conflict pre-flight uses `ss` from
+            # iproute2 to detect bound ports cleanly without needing
+            # a short-lived test connect.
+            pkgs.iproute2
           ];
           # The script itself lives at `tests/run-e2e.sh`; spliced in
           # via store-path so the wrapper sees the canonical version.
