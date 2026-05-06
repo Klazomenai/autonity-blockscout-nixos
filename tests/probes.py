@@ -73,14 +73,17 @@ Env-var contract:
                              in host-native mode where the frontend
                              serves the package's baked-in envs.js
                              with the upstream MainNet placeholder
-                             chain ID — the host-native runner
-                             doesn't replicate the BindReadOnlyPaths
-                             overlay (out of scope for #35; would
-                             require copying the standalone tree to a
-                             writable tmpdir + overwriting envs.js).
-                             The envs.js file is still verified to be
-                             SERVED in host-native mode; only the
-                             chain-ID value assertion is skipped.
+                             chain ID. Both VM and host-native
+                             runners now place a fresh envs.js with
+                             the test's chainId (VM via
+                             BindReadOnlyPaths overlay; host-native
+                             via a writable symlink-tree mirror in
+                             the state dir), so this gate is set to
+                             "1" in both contexts. Escape hatch:
+                             leave it unset to run probes.py against
+                             a stack that's serving the package's
+                             baked-in placeholder envs.js (only the
+                             "envs.js is served" half then runs).
 
 Exit code 0 on all probes passing; non-zero with a clear stderr
 message on first failure.
@@ -154,8 +157,28 @@ def rpc_call(method, params=None):
 
 
 def rpc_result(method, params=None):
-    """rpc_call but return .result; raise if the response carries an error."""
+    """rpc_call but return .result.
+
+    Raises AssertionError with the underlying JSON-RPC error code +
+    message when the response carries an `error` key (e.g. method
+    not found, invalid params, or a server-side -32000 returned by
+    Autonity for things like "the inserting height is out of epoch
+    range"). Without surfacing the error payload, all such failures
+    look identical to "no result field" — much harder to diagnose.
+
+    Falls back to a generic "no result field" message when neither
+    `error` nor `result` is present in the response (malformed /
+    truncated JSON-RPC envelope).
+    """
     resp = rpc_call(method, params)
+    if "error" in resp:
+        err = resp["error"]
+        if isinstance(err, dict):
+            raise AssertionError(
+                f"{method} returned JSON-RPC error: "
+                f"code={err.get('code')!r}, message={err.get('message')!r}"
+            )
+        raise AssertionError(f"{method} returned JSON-RPC error: {err!r}")
     if "result" not in resp:
         raise AssertionError(f"{method} returned no result field: {resp!r}")
     return resp["result"]
@@ -444,17 +467,18 @@ def cross_check_envs_js():
     requested) contains the expected chain ID.
 
     The chain-ID-value assertion is gated by PROBE_VERIFY_ENVS_CHAIN_ID.
-    VM context sets it because the frontend module bind-mounts a fresh
-    envs.js generated from the test's chainId. Host-native mode
-    doesn't replicate that overlay (the frontend serves the package's
-    baked-in envs.js with the upstream MainNet placeholder); we still
-    verify envs.js is served, but skip the chain-ID-value match.
+    Both VM and host-native runners now place a fresh envs.js with
+    the test's chainId (VM via BindReadOnlyPaths overlay; host-native
+    via a writable symlink-tree mirror in the state dir), so this
+    gate is set to "1" in both contexts. The escape hatch remains:
+    leave it unset to run probes.py against a stack serving the
+    package's baked-in placeholder envs.js.
     """
     verify_chain_id = os.environ.get("PROBE_VERIFY_ENVS_CHAIN_ID") == "1"
     if verify_chain_id:
         log(f"cross-check 8: envs.js served + contains chain ID {CHAIN_ID}")
     else:
-        log("cross-check 8: envs.js served (chain-ID-value check skipped — host-native mode)")
+        log("cross-check 8: envs.js served (chain-ID-value check skipped — gate unset)")
     deadline = time.monotonic() + 120
     while True:
         try:

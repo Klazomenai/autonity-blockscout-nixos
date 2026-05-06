@@ -256,15 +256,63 @@ in
         # Locate server.js in the frontend package. The Blockscout
         # fork flattens the Next.js standalone tree to the package
         # root (server.js lives at `${pkgs.blockscout-frontend}/server.js`),
-        # NOT under the upstream `*/standalone/*` convention. Direct
-        # path check is the right shape; same as `tests/run-e2e.sh`.
-        SERVER_JS="${pkgs.blockscout-frontend}/server.js"
-        if [ ! -f "$SERVER_JS" ]; then
-          echo "could not find server.js at $SERVER_JS" >&2
+        # NOT under the upstream `*/standalone/*` convention.
+        if [ ! -f "${pkgs.blockscout-frontend}/server.js" ]; then
+          echo "could not find server.js at ${pkgs.blockscout-frontend}/server.js" >&2
           exit 1
         fi
-        cd "${pkgs.blockscout-frontend}"
-        exec ${pkgs.nodejs_20}/bin/node "$SERVER_JS"
+        # Build a writable mirror of the frontend package in
+        # ${stateDir}/frontend. The package is read-only (under
+        # /nix/store), so we can't directly overwrite envs.js — but
+        # Next.js's standalone server reads `public/` relative to its
+        # CWD, so we can stand up a writable shadow tree where
+        # everything except `public/assets/envs.js` is symlinked back
+        # to the package, then write a fresh envs.js with the correct
+        # chain ID. Mirrors the systemd module's BindReadOnlyPaths
+        # overlay at the userspace level — same end behaviour: SSR
+        # `process.env.NEXT_PUBLIC_*` and browser `window.__envs`
+        # agree on the chain ID instead of disagreeing (which would
+        # cause React hydration mismatches under any actual UI use).
+        WRITABLE="${stateDir}/frontend"
+        rm -rf "$WRITABLE"
+        mkdir -p "$WRITABLE/public/assets"
+        # `dotglob` so the `.next/` production-build directory at the
+        # package root is mirrored — default shell glob skips
+        # dotfiles.
+        shopt -s dotglob
+        for entry in "${pkgs.blockscout-frontend}"/*; do
+          name=$(basename "$entry")
+          case "$name" in
+            public|server.js) continue ;;
+            *) ln -s "$entry" "$WRITABLE/$name" ;;
+          esac
+        done
+        # Copy server.js (not symlink) so Node's __dirname resolves
+        # to $WRITABLE; the script does `process.chdir(__dirname)`
+        # to find public/, which would otherwise CD back into the
+        # read-only package dir and serve the original envs.js. The
+        # alternative `--preserve-symlinks` flag breaks pnpm's
+        # symlink-based node_modules layout, so copying just this
+        # one small file is the targeted fix.
+        cp "${pkgs.blockscout-frontend}/server.js" "$WRITABLE/server.js"
+        for entry in "${pkgs.blockscout-frontend}/public"/*; do
+          name=$(basename "$entry")
+          [ "$name" = "assets" ] && continue
+          ln -s "$entry" "$WRITABLE/public/$name"
+        done
+        for entry in "${pkgs.blockscout-frontend}/public/assets"/*; do
+          name=$(basename "$entry")
+          [ "$name" = "envs.js" ] && continue
+          ln -s "$entry" "$WRITABLE/public/assets/$name"
+        done
+        # Single-line JSON envs.js with NETWORK_ID overridden to the
+        # let-bound chainId. Other publicEnv defaults match
+        # `modules/blockscout-frontend.nix:106-120` (mirrored verbatim).
+        cat > "$WRITABLE/public/assets/envs.js" <<EOF
+        window.__envs = {"NEXT_PUBLIC_API_HOST":"localhost","NEXT_PUBLIC_API_PROTOCOL":"http","NEXT_PUBLIC_API_PORT":"4000","NEXT_PUBLIC_NETWORK_NAME":"Autonity","NEXT_PUBLIC_NETWORK_SHORT_NAME":"ATN","NEXT_PUBLIC_NETWORK_ID":"${toString chainId}","NEXT_PUBLIC_NETWORK_RPC_URL":"http://localhost:8545","NEXT_PUBLIC_NETWORK_CURRENCY_NAME":"Auton","NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL":"ATN","NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS":"18","NEXT_PUBLIC_APP_HOST":"localhost","NEXT_PUBLIC_APP_PROTOCOL":"http","NEXT_PUBLIC_APP_PORT":"3000"};
+        EOF
+        cd "$WRITABLE"
+        exec ${pkgs.nodejs_20}/bin/node "$WRITABLE/server.js"
       '';
       process-compose = {
         depends_on.blockscout-backend.condition = "process_healthy";

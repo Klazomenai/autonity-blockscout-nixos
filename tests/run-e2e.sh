@@ -373,19 +373,76 @@ echo "[e2e] starting blockscout-frontend on port $FRONTEND_PORT"
 # Hard-fail with a clear error if the layout ever changes upstream.
 FRONTEND_BIN=$(command -v blockscout-frontend)
 FRONTEND_PKG=$(dirname "$(dirname "$FRONTEND_BIN")")
-SERVER_JS="${FRONTEND_PKG}/server.js"
-if [ ! -f "$SERVER_JS" ]; then
-  echo "[e2e] could not locate server.js at $SERVER_JS" >&2
+if [ ! -f "${FRONTEND_PKG}/server.js" ]; then
+  echo "[e2e] could not locate server.js at ${FRONTEND_PKG}/server.js" >&2
   echo "[e2e]   blockscout-frontend package layout may have changed upstream" >&2
   exit 1
 fi
-NEXT_DIR="$FRONTEND_PKG"
-# We don't bind-mount a fresh envs.js (that's the systemd unit's
-# BindReadOnlyPaths overlay); the host-native frontend serves the
-# package's baked-in MainNet placeholder. probes.py's envs.js
-# cross-check is gated by PROBE_VERIFY_ENVS_CHAIN_ID, which we leave
-# unset here so only the "envs.js is served" half of the assertion
-# runs in host-native mode.
+# Build a writable mirror of the frontend package in $STATE_DIR. The
+# package itself is read-only (under /nix/store), so we can't
+# directly overwrite envs.js — but Next.js's standalone server reads
+# `public/` relative to its CWD, so we can stand up a writable
+# shadow tree where everything except `public/assets/envs.js` is
+# symlinked back to the package, then write a fresh envs.js with the
+# correct chain ID. Mirrors the systemd module's BindReadOnlyPaths
+# overlay at the userspace level — same end behaviour: SSR
+# `process.env.NEXT_PUBLIC_*` and browser `window.__envs` agree on
+# the chain ID instead of disagreeing (which would cause React
+# hydration mismatches under any actual UI rendering).
+WRITABLE="$STATE_DIR/frontend"
+mkdir -p "$WRITABLE/public/assets"
+
+# Include hidden entries in the mirror — the Next.js standalone tree
+# has a `.next/` directory at the package root that holds the
+# production build, and the default shell glob `*` skips dotfiles.
+shopt -s dotglob
+
+# Top-level entries except `public` (shadowed below) and `server.js`
+# (copied, see below).
+for entry in "$FRONTEND_PKG"/*; do
+  name=$(basename "$entry")
+  case "$name" in
+    public|server.js) continue ;;
+    *) ln -s "$entry" "$WRITABLE/$name" ;;
+  esac
+done
+
+# server.js is copied (not symlinked) so Node's `__dirname`
+# resolves to $WRITABLE, not back to the read-only package
+# directory. Without this, server.js's `process.chdir(__dirname)`
+# CDs into the package and serves the original public/.
+# `--preserve-symlinks` would solve __dirname but breaks pnpm's
+# heavy symlink-based node_modules deduplication (Node fails to
+# resolve transitive deps like `styled-jsx/package.json`); copying
+# just this one small file gets us correct __dirname without
+# touching module resolution.
+cp "$FRONTEND_PKG/server.js" "$WRITABLE/server.js"
+
+# `public/` entries except `assets` (we shadow that too).
+for entry in "$FRONTEND_PKG/public"/*; do
+  name=$(basename "$entry")
+  [ "$name" = "assets" ] && continue
+  ln -s "$entry" "$WRITABLE/public/$name"
+done
+
+# `public/assets/` entries except `envs.js` (the one file we replace).
+for entry in "$FRONTEND_PKG/public/assets"/*; do
+  name=$(basename "$entry")
+  [ "$name" = "envs.js" ] && continue
+  ln -s "$entry" "$WRITABLE/public/assets/$name"
+done
+
+# Generate a fresh envs.js with the correct chain ID. Same shape +
+# default values as the frontend module's `publicEnv` attrset
+# (`modules/blockscout-frontend.nix:106-120`), with NETWORK_ID
+# overridden to the dev chain we're running against. Single line of
+# JSON because Next.js inlines this into the page head; matches the
+# systemd module's `pkgs.writeText "blockscout-frontend-envs.js"`
+# rendering style.
+cat > "$WRITABLE/public/assets/envs.js" <<EOF
+window.__envs = {"NEXT_PUBLIC_API_HOST":"localhost","NEXT_PUBLIC_API_PROTOCOL":"http","NEXT_PUBLIC_API_PORT":"${BACKEND_PORT}","NEXT_PUBLIC_NETWORK_NAME":"Autonity","NEXT_PUBLIC_NETWORK_SHORT_NAME":"ATN","NEXT_PUBLIC_NETWORK_ID":"${CHAIN_ID}","NEXT_PUBLIC_NETWORK_RPC_URL":"http://localhost:${RPC_PORT}","NEXT_PUBLIC_NETWORK_CURRENCY_NAME":"Auton","NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL":"ATN","NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS":"18","NEXT_PUBLIC_APP_HOST":"localhost","NEXT_PUBLIC_APP_PROTOCOL":"http","NEXT_PUBLIC_APP_PORT":"${FRONTEND_PORT}"};
+EOF
+
 (
   HOSTNAME=127.0.0.1
   PORT="$FRONTEND_PORT"
@@ -399,8 +456,8 @@ NEXT_DIR="$FRONTEND_PKG"
   export HOSTNAME PORT NEXT_PUBLIC_NETWORK_ID NEXT_PUBLIC_API_HOST \
     NEXT_PUBLIC_API_PROTOCOL NEXT_PUBLIC_API_PORT NEXT_PUBLIC_APP_HOST \
     NEXT_PUBLIC_APP_PROTOCOL NEXT_PUBLIC_APP_PORT
-  cd "$NEXT_DIR"
-  exec node "$SERVER_JS"
+  cd "$WRITABLE"
+  exec node "$WRITABLE/server.js"
 ) >"$STATE_DIR/frontend.log" 2>&1 &
 PIDS+=($!)
 
@@ -420,6 +477,7 @@ PROBE_FRONTEND_URL="http://127.0.0.1:${FRONTEND_PORT}" \
 PROBE_CHAIN_ID="$CHAIN_ID" \
 PROBE_BLOCKS_REQUIRED="$BLOCKS_REQUIRED" \
 PROBE_PSQL_CMD="psql -h $STATE_DIR/pg-sock -p $PG_PORT -U blockscout -At -d blockscout" \
+PROBE_VERIFY_ENVS_CHAIN_ID=1 \
 PGPASSWORD="$DB_PASSWORD" \
 python3 "$PROBES_PY"
 
