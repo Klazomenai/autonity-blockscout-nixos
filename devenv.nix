@@ -21,13 +21,17 @@ let
   # `devenv processes destroy`s them).
   stateDir = config.devenv.state;
 
-  # Backend secrets directory + fixed test secrets. Mirrors the
-  # systemd ExecStart wrapper at `modules/blockscout-backend.nix`
-  # without the LoadCredential machinery — devenv processes don't run
-  # under systemd, so the secrets just live as plaintext files in the
-  # state dir. The values match the test fixture in
-  # `tests/integration-sync.nix`'s `system.activationScripts.test-secrets`
-  # (deterministic; not for production use).
+  # Backend test secrets. Mirrors the values used by the systemd
+  # ExecStart wrapper at `modules/blockscout-backend.nix` and the
+  # test fixture in `tests/integration-sync.nix`'s
+  # `system.activationScripts.test-secrets` (deterministic; not for
+  # production use). devenv processes don't run under systemd or
+  # inside a tmpfs-backed credentials dir, so we inject these
+  # directly via process-compose env-var directives (`backendEnv`
+  # below is rendered into `envExports` and `export`ed at the top of
+  # the backend process's shell). No on-disk credentials file is
+  # written — the values land in the BEAM's environment via the
+  # process supervisor's standard env mechanism.
   testSecretKeyBase = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   testDbPassword = "test-password-not-for-production";
 

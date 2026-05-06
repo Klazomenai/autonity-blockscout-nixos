@@ -249,12 +249,18 @@ chmod 600 "$STATE_DIR/creds/"*
 # Critical only for non-ASCII passwords; mirrored from the systemd
 # wrapper's same precaution.
 url_encode() {
+  # `local LC_ALL=C` so the C-locale override is confined to this
+  # function's scope. The systemd wrapper (which uses a `$(...)`
+  # subshell) gets the scoping for free; a function inherits the
+  # caller's environment, so without `local` the assignment would
+  # leak to the global shell and silently change locale for every
+  # subsequent command (curl, psql, node, etc.).
+  local LC_ALL=C
   local raw="$1"
   local out=""
   local i=0
   local len
   local c hex
-  LC_ALL=C
   len=${#raw}
   while [ $i -lt $len ]; do
     c=${raw:$i:1}

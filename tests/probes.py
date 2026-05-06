@@ -473,7 +473,24 @@ def main():
         f"blocks_required={BLOCKS_REQUIRED} backend_unit={BACKEND_UNIT or '(unset)'}"
     )
     for probe in probes:
-        probe()
+        # Convert any unexpected exception (URLError, ConnectionError,
+        # ValueError from a malformed JSON-RPC response, etc.) into a
+        # one-line stderr message naming the probe + the exception
+        # type, then exit non-zero. AssertionError is the "expected"
+        # failure shape that probes raise on their own — let that
+        # propagate verbatim so its message is preserved. Anything
+        # else means a probe internals issue or a transient runtime
+        # exception that escaped a probe's own retry loop; either
+        # way, the operator is best served by a concise summary
+        # rather than a Python traceback.
+        try:
+            probe()
+        except AssertionError:
+            raise
+        except Exception as exc:
+            sys.exit(
+                f"probe {probe.__name__} raised {type(exc).__name__}: {exc}"
+            )
     log("ALL PROBES PASSED")
 
 
