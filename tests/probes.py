@@ -240,18 +240,32 @@ def probe_eth_block_number_advances():
     gates everything below — probes 3+4 (consensus state) and 5+6+7
     (indexer + health) all need the chain to have advanced past startup
     transients.
+
+    Connection-shaped exceptions inside the loop (URLError /
+    ConnectionError / JSONDecodeError — autonity briefly unresponsive,
+    a single dropped request, malformed transient response, etc.) are
+    treated the same as "not yet at threshold": keep polling until
+    the deadline. Same pattern as `probe_eth_chain_id`. Without this,
+    a single transient hiccup would propagate up through `main()`'s
+    catch-all and abort the whole run with `probe ... raised
+    URLError`, even though the chain is healthy and would have
+    answered the next sample.
     """
     log(f"probe 2: poll eth_blockNumber until >= {BLOCKS_REQUIRED}")
     deadline = time.monotonic() + 300
+    height = None
     while True:
-        height = block_number()
-        if height >= BLOCKS_REQUIRED:
+        try:
+            height = block_number()
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError):
+            height = None
+        if height is not None and height >= BLOCKS_REQUIRED:
             log(f"  reached height {height}")
             return
         if time.monotonic() > deadline:
             raise AssertionError(
                 f"chain did not reach BLOCKS_REQUIRED ({BLOCKS_REQUIRED}) "
-                f"in 300 s: got {height}"
+                f"in 300 s: last sample {height!r}"
             )
         time.sleep(2)
 
