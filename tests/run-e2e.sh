@@ -438,30 +438,58 @@ mkdir -p "$WRITABLE/public/assets"
   done
 )
 
-# Generate a fresh envs.js with the correct chain ID. Same shape +
-# default values as the frontend module's `publicEnv` attrset
-# (`modules/blockscout-frontend.nix:106-120`), with NETWORK_ID
-# overridden to the dev chain we're running against. Single line of
-# JSON because Next.js inlines this into the page head; matches the
-# systemd module's `pkgs.writeText "blockscout-frontend-envs.js"`
-# rendering style.
-cat > "$WRITABLE/public/assets/envs.js" <<EOF
-window.__envs = {"NEXT_PUBLIC_API_HOST":"localhost","NEXT_PUBLIC_API_PROTOCOL":"http","NEXT_PUBLIC_API_PORT":"${BACKEND_PORT}","NEXT_PUBLIC_NETWORK_NAME":"Autonity","NEXT_PUBLIC_NETWORK_SHORT_NAME":"ATN","NEXT_PUBLIC_NETWORK_ID":"${CHAIN_ID}","NEXT_PUBLIC_NETWORK_RPC_URL":"http://localhost:${RPC_PORT}","NEXT_PUBLIC_NETWORK_CURRENCY_NAME":"Auton","NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL":"ATN","NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS":"18","NEXT_PUBLIC_APP_HOST":"localhost","NEXT_PUBLIC_APP_PROTOCOL":"http","NEXT_PUBLIC_APP_PORT":"${FRONTEND_PORT}"};
-EOF
+# Frontend publicEnv — single source of truth for BOTH the SSR
+# exports (loop below) AND the browser-side `window.__envs` content
+# (serialised into envs.js). Same attrset shape as the
+# blockscout-frontend module's default at
+# `modules/blockscout-frontend.nix:106-120`, with NETWORK_ID
+# overridden to the dev chainId we're running against. Locked in
+# step at the source — the frontend module's contract requires SSR
+# `process.env.NEXT_PUBLIC_*` and browser `window.__envs` to carry
+# the same set of keys, otherwise hydration mismatches and "current
+# chain ID"-style components disagree depending on which layer
+# rendered them.
+declare -A FRONTEND_PUBLIC_ENV=(
+  [NEXT_PUBLIC_API_HOST]="localhost"
+  [NEXT_PUBLIC_API_PROTOCOL]="http"
+  [NEXT_PUBLIC_API_PORT]="$BACKEND_PORT"
+  [NEXT_PUBLIC_NETWORK_NAME]="Autonity"
+  [NEXT_PUBLIC_NETWORK_SHORT_NAME]="ATN"
+  [NEXT_PUBLIC_NETWORK_ID]="$CHAIN_ID"
+  [NEXT_PUBLIC_NETWORK_RPC_URL]="http://localhost:$RPC_PORT"
+  [NEXT_PUBLIC_NETWORK_CURRENCY_NAME]="Auton"
+  [NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL]="ATN"
+  [NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS]="18"
+  [NEXT_PUBLIC_APP_HOST]="localhost"
+  [NEXT_PUBLIC_APP_PROTOCOL]="http"
+  [NEXT_PUBLIC_APP_PORT]="$FRONTEND_PORT"
+)
+
+# Render envs.js. Single-line JSON (matches the systemd module's
+# `pkgs.writeText` style); bash associative array iteration order
+# is unspecified but the JSON consumer doesn't care.
+{
+  printf 'window.__envs = {'
+  first=1
+  for key in "${!FRONTEND_PUBLIC_ENV[@]}"; do
+    val=${FRONTEND_PUBLIC_ENV[$key]}
+    [ "$first" -eq 0 ] && printf ','
+    first=0
+    printf '"%s":"%s"' "$key" "$val"
+  done
+  printf '};\n'
+} > "$WRITABLE/public/assets/envs.js"
 
 (
   HOSTNAME=127.0.0.1
   PORT="$FRONTEND_PORT"
-  NEXT_PUBLIC_NETWORK_ID="$CHAIN_ID"
-  NEXT_PUBLIC_API_HOST="localhost"
-  NEXT_PUBLIC_API_PROTOCOL="http"
-  NEXT_PUBLIC_API_PORT="$BACKEND_PORT"
-  NEXT_PUBLIC_APP_HOST="localhost"
-  NEXT_PUBLIC_APP_PROTOCOL="http"
-  NEXT_PUBLIC_APP_PORT="$FRONTEND_PORT"
-  export HOSTNAME PORT NEXT_PUBLIC_NETWORK_ID NEXT_PUBLIC_API_HOST \
-    NEXT_PUBLIC_API_PROTOCOL NEXT_PUBLIC_API_PORT NEXT_PUBLIC_APP_HOST \
-    NEXT_PUBLIC_APP_PROTOCOL NEXT_PUBLIC_APP_PORT
+  export HOSTNAME PORT
+  # SSR exports — full FRONTEND_PUBLIC_ENV key set, derived from
+  # the same array that rendered envs.js. Iterating once for both
+  # eliminates the drift hazard between SSR and browser.
+  for key in "${!FRONTEND_PUBLIC_ENV[@]}"; do
+    export "$key=${FRONTEND_PUBLIC_ENV[$key]}"
+  done
   cd "$WRITABLE"
   exec node "$WRITABLE/server.js"
 ) >"$STATE_DIR/frontend.log" 2>&1 &

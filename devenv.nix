@@ -65,6 +65,40 @@ let
     lib.mapAttrsToList (k: v: "export ${k}=${lib.escapeShellArg v}") backendEnv
   );
 
+  # Frontend `publicEnv` — the SAME attrset shape as the
+  # blockscout-frontend module's default at
+  # `modules/blockscout-frontend.nix:106-120`, with NETWORK_ID
+  # overridden to the dev chainId. Single source of truth for both
+  # the SSR exports (rendered into `frontendEnvExports` below) AND
+  # the browser-side `window.__envs` content (serialised via
+  # `builtins.toJSON` into envs.js). They MUST stay in lockstep —
+  # the frontend module's contract is that SSR reads
+  # `process.env.NEXT_PUBLIC_*` and the browser reads
+  # `window.__envs`; if the two diverge, hydration mismatches and
+  # any "current chain ID"-style components show different values
+  # depending on which layer rendered them.
+  frontendPublicEnv = {
+    NEXT_PUBLIC_API_HOST = "localhost";
+    NEXT_PUBLIC_API_PROTOCOL = "http";
+    NEXT_PUBLIC_API_PORT = "4000";
+    NEXT_PUBLIC_NETWORK_NAME = "Autonity";
+    NEXT_PUBLIC_NETWORK_SHORT_NAME = "ATN";
+    NEXT_PUBLIC_NETWORK_ID = toString chainId;
+    NEXT_PUBLIC_NETWORK_RPC_URL = "http://localhost:8545";
+    NEXT_PUBLIC_NETWORK_CURRENCY_NAME = "Auton";
+    NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL = "ATN";
+    NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS = "18";
+    NEXT_PUBLIC_APP_HOST = "localhost";
+    NEXT_PUBLIC_APP_PROTOCOL = "http";
+    NEXT_PUBLIC_APP_PORT = "3000";
+  };
+
+  frontendEnvExports = lib.concatStringsSep "\n" (
+    lib.mapAttrsToList (k: v: "export ${k}=${lib.escapeShellArg v}") frontendPublicEnv
+  );
+
+  frontendEnvJsContent = "window.__envs = ${builtins.toJSON frontendPublicEnv};";
+
 in
 {
   packages = with pkgs; [
@@ -246,13 +280,12 @@ in
         set -eu
         export HOSTNAME=127.0.0.1
         export PORT=3000
-        export NEXT_PUBLIC_NETWORK_ID=${toString chainId}
-        export NEXT_PUBLIC_API_HOST=localhost
-        export NEXT_PUBLIC_API_PROTOCOL=http
-        export NEXT_PUBLIC_API_PORT=4000
-        export NEXT_PUBLIC_APP_HOST=localhost
-        export NEXT_PUBLIC_APP_PROTOCOL=http
-        export NEXT_PUBLIC_APP_PORT=3000
+        # SSR exports — the FULL frontendPublicEnv key set, derived
+        # from the same attrset that renders envs.js below. The
+        # frontend module's contract requires SSR `process.env`
+        # and browser `window.__envs` to match; deriving both from
+        # a single source means they can't drift.
+        ${frontendEnvExports}
         # Locate server.js in the frontend package. The Blockscout
         # fork flattens the Next.js standalone tree to the package
         # root (server.js lives at `${pkgs.blockscout-frontend}/server.js`),
@@ -311,11 +344,11 @@ in
           [ "$name" = "envs.js" ] && continue
           ln -s "$entry" "$WRITABLE/public/assets/$name"
         done
-        # Single-line JSON envs.js with NETWORK_ID overridden to the
-        # let-bound chainId. Other publicEnv defaults match
-        # `modules/blockscout-frontend.nix:106-120` (mirrored verbatim).
-        cat > "$WRITABLE/public/assets/envs.js" <<EOF
-        window.__envs = {"NEXT_PUBLIC_API_HOST":"localhost","NEXT_PUBLIC_API_PROTOCOL":"http","NEXT_PUBLIC_API_PORT":"4000","NEXT_PUBLIC_NETWORK_NAME":"Autonity","NEXT_PUBLIC_NETWORK_SHORT_NAME":"ATN","NEXT_PUBLIC_NETWORK_ID":"${toString chainId}","NEXT_PUBLIC_NETWORK_RPC_URL":"http://localhost:8545","NEXT_PUBLIC_NETWORK_CURRENCY_NAME":"Auton","NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL":"ATN","NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS":"18","NEXT_PUBLIC_APP_HOST":"localhost","NEXT_PUBLIC_APP_PROTOCOL":"http","NEXT_PUBLIC_APP_PORT":"3000"};
+        # envs.js content rendered from the same `frontendPublicEnv`
+        # attrset as the SSR exports above; locked-in-step via Nix
+        # eval (`builtins.toJSON`).
+        cat > "$WRITABLE/public/assets/envs.js" <<'EOF'
+        ${frontendEnvJsContent}
         EOF
         cd "$WRITABLE"
         exec ${pkgs.nodejs_20}/bin/node "$WRITABLE/server.js"
