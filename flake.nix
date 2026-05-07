@@ -122,11 +122,16 @@
           # via store-path so the wrapper sees the canonical version.
           # `tests/probes.py` is wired through E2E_PROBES_PY so the
           # script can locate it under any invocation context.
-          # Invoked via `bash` because file-spliced sources land in
-          # the Nix store without the +x bit; bash doesn't require it.
+          # Invoked via the absolute Nix-store bash path because
+          # file-spliced sources land in the Nix store without the +x
+          # bit (bash doesn't require it), and writeShellApplication's
+          # runtimeInputs PATH doesn't include bash by default — using
+          # ${pkgs.bash}/bin/bash makes the wrapper hermetic against
+          # hosts that don't have bash on the system PATH (pure CI
+          # shells, minimal containers).
           text = ''
             export E2E_PROBES_PY="${./tests/probes.py}"
-            exec bash ${./tests/run-e2e.sh} "$@"
+            exec ${pkgs.bash}/bin/bash ${./tests/run-e2e.sh} "$@"
           '';
         };
       in

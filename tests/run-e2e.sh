@@ -40,6 +40,44 @@ BACKEND_PORT="${E2E_BACKEND_PORT:-4000}"
 FRONTEND_PORT="${E2E_FRONTEND_PORT:-3000}"
 
 # --------------------------------------------------------------------
+# Env-var input validation
+#
+# Without this, a typo like `E2E_FRONTEND_PORT=300o` (letter o) or an
+# out-of-range `E2E_FRONTEND_PORT=99999` would interpolate verbatim
+# into `ss "( sport = :$port )"` filter expressions or URLs and
+# produce a confusing failure deep in the stack — not a targeted
+# "E2E_FRONTEND_PORT must be 1..65535, got '300o'" early.
+# --------------------------------------------------------------------
+
+require_positive_int() {
+  local var=$1
+  local val=$2
+  if ! [[ "$val" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[e2e] $var must be a positive decimal integer; got '$val'" >&2
+    exit 1
+  fi
+}
+
+require_port() {
+  local var=$1
+  local val=$2
+  if ! [[ "$val" =~ ^[0-9]+$ ]] || [ "$val" -lt 1 ] || [ "$val" -gt 65535 ]; then
+    echo "[e2e] $var must be an integer in 1..65535; got '$val'" >&2
+    exit 1
+  fi
+}
+
+require_positive_int E2E_CHAIN_ID "$CHAIN_ID"
+require_positive_int E2E_BLOCKS_REQUIRED "$BLOCKS_REQUIRED"
+require_port E2E_PG_PORT "$PG_PORT"
+require_port E2E_REDIS_PORT "$REDIS_PORT"
+require_port E2E_RPC_PORT "$RPC_PORT"
+require_port E2E_WS_PORT "$WS_PORT"
+require_port E2E_P2P_PORT "$P2P_PORT"
+require_port E2E_BACKEND_PORT "$BACKEND_PORT"
+require_port E2E_FRONTEND_PORT "$FRONTEND_PORT"
+
+# --------------------------------------------------------------------
 # Port-conflict pre-flight
 #
 # Many dev machines already have postgres / redis / similar listening

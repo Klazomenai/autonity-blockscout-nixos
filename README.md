@@ -85,11 +85,12 @@ curl http://127.0.0.1:4000/api/health
 Both above harnesses are SUPPLEMENTARY to the nixosTest VM check at `checks.<system>.integration-sync`. The VM check exercises real systemd hardening (`DynamicUser`, `LoadCredential`, `RestrictAddressFamilies`, `SystemCallFilter`, etc.) and `SupplementaryGroups` cross-service socket access — none of which the host-native harnesses reproduce. The VM is the contract; `nix run .#e2e` and `devenv up` are debugging conveniences.
 
 ```sh
-nix flake check                          # Locally evaluates ALL checks (fmt + hardening + integration-sync)
-nix build .#checks.x86_64-linux.integration-sync -L   # Run the VM check directly
+nix flake check                          # Locally evaluates ALL checks (fmt + hardening + integration + integration-sync)
+nix build .#checks.x86_64-linux.integration-sync -L   # Run the sync VM check directly
+nix build .#checks.x86_64-linux.integration -L        # Run the unit-health VM check directly
 ```
 
-The GitHub Actions workflow is the asymmetric one: the PR job runs only the fast `fmt`+`hardening` checks, while push-to-main and nightly schedules also run `integration-sync`. `nix flake check` itself is symmetric — locally, expect the full set to evaluate.
+The GitHub Actions workflow is the asymmetric one: the PR job runs only the fast `fmt`+`hardening` checks, while push-to-main and nightly schedules also run the two VM checks (`integration` + `integration-sync`). `nix flake check` itself is symmetric — locally, expect the full set to evaluate.
 
 Probe LOGIC is shared via `tests/probes.py`; both the VM testScript and the host-native runner invoke the same Python script with different env-var contracts, so probes don't drift between contexts.
 
