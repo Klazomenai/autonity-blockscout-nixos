@@ -94,6 +94,10 @@ The GitHub Actions workflow is the asymmetric one: the PR job runs only the fast
 
 Probe LOGIC is shared via `tests/probes.py`; both the VM testScript and the host-native runner invoke the same Python script with different env-var contracts, so probes don't drift between contexts.
 
+### M3 post-deploy probe (forward reference)
+
+The local sync test asserts boolean chain liveness via `eth_blockNumber` advancement; under `--dev` the node is the chain source so `eth_syncing` returns `false` tautologically and is excluded from the M2.5 vocabulary. M3's MainNet target is the inverse — a freshly-installed node genuinely catches up and `eth_syncing` carries rich object data during the catch-up window. The probe contract for that scenario is locked in [`docs/m3-sync-probe.md`](./docs/m3-sync-probe.md): state-presence check (object → boolean transition) plus minimum block-delta over a configurable probe window. Implementation lands with the M3 host config.
+
 ## License
 
 GPL-3.0-only. See [`LICENSE`](./LICENSE).
