@@ -236,75 +236,75 @@ pkgs.testers.nixosTest {
   testScript =
     { nodes, ... }:
     ''
-    machine.start()
+      machine.start()
 
-    # ---------------------------------------------------------------
-    # 1. Boot completion + per-unit readiness.
-    # ---------------------------------------------------------------
-    machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("autonity.service")
-    machine.wait_for_unit("postgresql.service")
-    machine.wait_for_unit("redis-blockscout.service")
-    machine.wait_for_unit("blockscout-backend.service")
-    machine.wait_for_unit("blockscout-frontend.service")
-    machine.wait_for_unit("nginx.service")
+      # ---------------------------------------------------------------
+      # 1. Boot completion + per-unit readiness.
+      # ---------------------------------------------------------------
+      machine.wait_for_unit("multi-user.target")
+      machine.wait_for_unit("autonity.service")
+      machine.wait_for_unit("postgresql.service")
+      machine.wait_for_unit("redis-blockscout.service")
+      machine.wait_for_unit("blockscout-backend.service")
+      machine.wait_for_unit("blockscout-frontend.service")
+      machine.wait_for_unit("nginx.service")
 
-    machine.wait_for_open_port(8545)   # Autonity HTTP RPC
-    # Backend + frontend take longer to bind their ports under the
-    # sync test than under `integration` because Autonity's continuous
-    # block production competes for scheduler time. Raised the
-    # timeout from the default 900 s (15 min) to 1800 s (30 min) for
-    # both, matching the empirical worst case observed under TCG.
-    # The 4-core VM helps but doesn't eliminate the contention.
-    machine.wait_for_open_port(4000, timeout=1800)  # Blockscout backend
-    machine.wait_for_open_port(3000, timeout=1800)  # Blockscout frontend
-    machine.wait_for_open_port(443)    # nginx HTTPS
+      machine.wait_for_open_port(8545)   # Autonity HTTP RPC
+      # Backend + frontend take longer to bind their ports under the
+      # sync test than under `integration` because Autonity's continuous
+      # block production competes for scheduler time. Raised the
+      # timeout from the default 900 s (15 min) to 1800 s (30 min) for
+      # both, matching the empirical worst case observed under TCG.
+      # The 4-core VM helps but doesn't eliminate the contention.
+      machine.wait_for_open_port(4000, timeout=1800)  # Blockscout backend
+      machine.wait_for_open_port(3000, timeout=1800)  # Blockscout frontend
+      machine.wait_for_open_port(443)    # nginx HTTPS
 
-    # ---------------------------------------------------------------
-    # 2. Run the shared probe sequence inside the VM.
-    #
-    # `tests/probes.py` is the single source of truth for probe
-    # LOGIC across both contexts (this VM + the host-native runner
-    # behind `nix run .#e2e`). It reads connection details and
-    # thresholds from environment variables. Here we set those env
-    # vars to point at loopback (the VM's perspective); PROBE_CHAIN_ID
-    # is rendered from `nodes.machine.services.autonity.chainId`
-    # so the assertion side stays in lockstep with what the running
-    # autonity unit and the indexer/frontend actually saw.
-    #
-    # `PROBE_BACKEND_UNIT=blockscout-backend.service` enables the
-    # systemctl-show CHAIN_ID cross-check (probe 9), which is VM-
-    # specific (host-native mode runs the backend as a plain
-    # process and skips that probe with a log line).
-    #
-    # `runuser -u postgres --` is used in the psql command because
-    # nixosTest VMs don't ship a generated /etc/sudoers, so
-    # `sudo -u postgres` would fail even when Postgres is healthy.
-    # ---------------------------------------------------------------
-    machine.succeed(
-        "PROBE_RPC_URL=http://127.0.0.1:8545 "
-        "PROBE_BACKEND_URL=http://127.0.0.1:4000 "
-        "PROBE_FRONTEND_URL=http://127.0.0.1:3000 "
-        "PROBE_CHAIN_ID=${toString nodes.machine.services.autonity.chainId} "
-        "PROBE_BLOCKS_REQUIRED=${toString blocksRequired} "
-        "PROBE_PSQL_CMD='${pkgs.util-linux}/bin/runuser -u postgres -- "
-        "${pkgs.postgresql}/bin/psql -At -d blockscout' "
-        "PROBE_BACKEND_UNIT=blockscout-backend.service "
-        # PROBE_VERIFY_ENVS_CHAIN_ID=1 enables probes.py's stricter
-        # envs.js cross-check: assert the rendered envs.js contains
-        # the dev chain ID. Set to "1" in BOTH the VM context (where
-        # the frontend module's BindReadOnlyPaths overlay places a
-        # fresh envs.js from the test's chainId) AND the host-native
-        # `nix run .#e2e` context (which achieves the equivalent via
-        # a writable symlink-tree mirror in its state dir, server.js
-        # copied + envs.js generated from the same single-source
-        # `frontendPublicEnv` attrset that drives the SSR exports).
-        # Unset is the escape hatch for running probes.py against a
-        # stack serving the package's baked-in placeholder envs.js.
-        "PROBE_VERIFY_ENVS_CHAIN_ID=1 "
-        "${pkgs.python3}/bin/python3 /etc/probes.py",
-        timeout=1800,
-    )
+      # ---------------------------------------------------------------
+      # 2. Run the shared probe sequence inside the VM.
+      #
+      # `tests/probes.py` is the single source of truth for probe
+      # LOGIC across both contexts (this VM + the host-native runner
+      # behind `nix run .#e2e`). It reads connection details and
+      # thresholds from environment variables. Here we set those env
+      # vars to point at loopback (the VM's perspective); PROBE_CHAIN_ID
+      # is rendered from `nodes.machine.services.autonity.chainId`
+      # so the assertion side stays in lockstep with what the running
+      # autonity unit and the indexer/frontend actually saw.
+      #
+      # `PROBE_BACKEND_UNIT=blockscout-backend.service` enables the
+      # systemctl-show CHAIN_ID cross-check (probe 9), which is VM-
+      # specific (host-native mode runs the backend as a plain
+      # process and skips that probe with a log line).
+      #
+      # `runuser -u postgres --` is used in the psql command because
+      # nixosTest VMs don't ship a generated /etc/sudoers, so
+      # `sudo -u postgres` would fail even when Postgres is healthy.
+      # ---------------------------------------------------------------
+      machine.succeed(
+          "PROBE_RPC_URL=http://127.0.0.1:8545 "
+          "PROBE_BACKEND_URL=http://127.0.0.1:4000 "
+          "PROBE_FRONTEND_URL=http://127.0.0.1:3000 "
+          "PROBE_CHAIN_ID=${toString nodes.machine.services.autonity.chainId} "
+          "PROBE_BLOCKS_REQUIRED=${toString blocksRequired} "
+          "PROBE_PSQL_CMD='${pkgs.util-linux}/bin/runuser -u postgres -- "
+          "${pkgs.postgresql}/bin/psql -At -d blockscout' "
+          "PROBE_BACKEND_UNIT=blockscout-backend.service "
+          # PROBE_VERIFY_ENVS_CHAIN_ID=1 enables probes.py's stricter
+          # envs.js cross-check: assert the rendered envs.js contains
+          # the dev chain ID. Set to "1" in BOTH the VM context (where
+          # the frontend module's BindReadOnlyPaths overlay places a
+          # fresh envs.js from the test's chainId) AND the host-native
+          # `nix run .#e2e` context (which achieves the equivalent via
+          # a writable symlink-tree mirror in its state dir, server.js
+          # copied + envs.js generated from the same single-source
+          # `frontendPublicEnv` attrset that drives the SSR exports).
+          # Unset is the escape hatch for running probes.py against a
+          # stack serving the package's baked-in placeholder envs.js.
+          "PROBE_VERIFY_ENVS_CHAIN_ID=1 "
+          "${pkgs.python3}/bin/python3 /etc/probes.py",
+          timeout=1800,
+      )
 
-  '';
+    '';
 }
