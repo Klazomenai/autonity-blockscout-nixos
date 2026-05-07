@@ -36,10 +36,13 @@ Env-var contract:
                              crossed (EpochPeriod=60 in dev) plus a
                              10-block buffer for TCG VM contention.
   PROBE_PSQL_CMD             REQUIRED, full psql command line.
-                             Examples:
+                             Examples (matching the actual harnesses):
                                VM:    "runuser -u postgres -- psql -At -d blockscout"
-                               host:  "psql -At -d blockscout -h /tmp/run-e2e-xxx/pg"
-                             The script appends `-c '<query>'` to it.
+                               host:  "psql -h $STATE_DIR/pg-sock -p 5432 -U blockscout -At -d blockscout"
+                             The host-native runner injects $STATE_DIR
+                             (a mktemp -d path) and uses a Unix socket
+                             dir under it; PGPASSWORD is set in the
+                             same env. The script appends `-c '<query>'`.
   PROBE_BACKEND_UNIT         Optional. If set, the systemctl-show
                              cross-check runs to assert
                              CHAIN_ID=<chain_id> is in the unit's
@@ -208,11 +211,23 @@ last_psql = {"rc": 0, "output": ""}
 
 
 def block_count_in_db():
-    proc = subprocess.run(
-        PSQL_ARGV + ["-c", "SELECT count(*) FROM blocks"],
-        capture_output=True,
-        text=True,
-    )
+    # 10 s per-call cap. libpq has no enforced default for connect-hangs
+    # on a stuck Unix socket, so without this an outer 600 s deadline
+    # could be eaten by a single call that never returns. TimeoutExpired
+    # is treated as a transient miss (returns 0) so the outer poll loop
+    # retries; persistent stalls hit the deadline + retain last_psql for
+    # the AssertionError message.
+    try:
+        proc = subprocess.run(
+            PSQL_ARGV + ["-c", "SELECT count(*) FROM blocks"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        last_psql["rc"] = -1
+        last_psql["output"] = f"psql timed out after {exc.timeout}s"
+        return 0
     last_psql["rc"] = proc.returncode
     last_psql["output"] = (proc.stdout + proc.stderr).strip()
     if proc.returncode != 0:
