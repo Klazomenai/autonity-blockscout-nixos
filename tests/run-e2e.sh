@@ -94,6 +94,14 @@ PIDS=()
 
 cleanup() {
   rc=$?
+  # Clear all traps first so cleanup runs exactly once. With the
+  # default `trap ... EXIT INT TERM` shape, an INT/TERM signal would
+  # fire cleanup once via the signal handler, then the explicit
+  # `exit $rc` at the bottom of this function would re-trigger the
+  # EXIT trap and run cleanup AGAIN — double-kill, double-rm,
+  # confusing logs. `trap - EXIT INT TERM` resets to default
+  # behaviour for the rest of this invocation.
+  trap - EXIT INT TERM
   echo "[e2e] cleanup (rc=$rc, killing ${#PIDS[@]} children)"
   for pid in "${PIDS[@]}"; do
     if kill -0 "$pid" 2>/dev/null; then

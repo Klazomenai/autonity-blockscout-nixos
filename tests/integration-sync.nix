@@ -286,12 +286,15 @@ pkgs.testers.nixosTest {
         "PROBE_BACKEND_UNIT=blockscout-backend.service "
         # PROBE_VERIFY_ENVS_CHAIN_ID=1 enables probes.py's stricter
         # envs.js cross-check: assert the rendered envs.js contains
-        # the dev chain ID. Set in the VM context where the frontend
-        # module's BindReadOnlyPaths overlay places a fresh envs.js
-        # generated from the test's chainId; unset in host-native
-        # mode where the frontend serves the package's baked-in
-        # MainNet placeholder (probes.py then verifies envs.js is
-        # served but skips the value match).
+        # the dev chain ID. Set to "1" in BOTH the VM context (where
+        # the frontend module's BindReadOnlyPaths overlay places a
+        # fresh envs.js from the test's chainId) AND the host-native
+        # `nix run .#e2e` context (which achieves the equivalent via
+        # a writable symlink-tree mirror in its state dir, server.js
+        # copied + envs.js generated from the same single-source
+        # `frontendPublicEnv` attrset that drives the SSR exports).
+        # Unset is the escape hatch for running probes.py against a
+        # stack serving the package's baked-in placeholder envs.js.
         "PROBE_VERIFY_ENVS_CHAIN_ID=1 "
         "${pkgs.python3}/bin/python3 /etc/probes.py",
         timeout=1800,
