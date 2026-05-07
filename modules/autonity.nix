@@ -139,6 +139,23 @@ in
 
         Production deployments must use `network = "mainnet"` or
         `network = "bakerloo"`.
+
+        ## `eth_syncing` semantics per network
+
+        - `dev`: returns boolean `false` tautologically — the node IS
+          the chain source, so `progress.CurrentBlock >=
+          progress.HighestBlock` always holds (verified empirically
+          2026-05-07 across four sample points; see
+          `docs/m3-sync-probe.md`). Therefore `eth_syncing` is NOT in
+          the M2.5 local sync probe vocabulary; chain liveness is
+          asserted via `eth_blockNumber` advancing instead.
+        - `mainnet` / `bakerloo`: returns a JSON object with
+          `startingBlock` / `currentBlock` / `highestBlock` during
+          catch-up, then transitions to boolean `false` once the head
+          matches the network. This shape carries the signal needed
+          for the M3 post-deploy probe contract documented at
+          `docs/m3-sync-probe.md` (object vs boolean state-presence
+          check + minimum block-delta over a probe window).
       '';
     };
 
