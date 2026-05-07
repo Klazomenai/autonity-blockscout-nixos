@@ -21,7 +21,10 @@
 #
 #   Geth-inherited (chain liveness):
 #     1. `eth_blockNumber >= blocksRequired`
-#     2. `eth_chainId == chainIdHex`
+#     2. `eth_chainId == "0x" + lib.toLower (lib.toHexString chainId)`
+#        (hex form computed inside `tests/probes.py` from the
+#        PROBE_CHAIN_ID integer; assertion side reads
+#        `nodes.machine.services.autonity.chainId`)
 #
 #   Autonity-native (consensus liveness — richer signal):
 #     3. `tendermint_getCommittee` — assert committee size is exactly
@@ -80,13 +83,16 @@
 let
   hostName = "explorer.test";
 
-  # Dev chain. Source-of-truth Nix integer; downstream consumers
-  # (backend `chain.id`, frontend `publicEnv.NEXT_PUBLIC_NETWORK_ID`,
-  # test assertion) all read from this binding. Hex form is computed
-  # at eval time via `lib.toHexString` and lowercased to match the
-  # geth-family JSON-RPC convention.
-  chainId = 65111111;
-  chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+  # Chain ID is no longer a test-fixture-local Nix variable. The
+  # autonity module's `services.autonity.chainId` is enum-driven from
+  # `services.autonity.network`, so setting `network = "dev"` (below)
+  # populates `chainId = 65111111` automatically. Downstream consumers
+  # (backend's `chain.id` default, frontend's
+  # `publicEnv.NEXT_PUBLIC_NETWORK_ID` default) inherit from the same
+  # source. The probe env-var contract reads
+  # `nodes.machine.services.autonity.chainId` at testScript
+  # render time (see the `testScript = { nodes, ... }: ''…''` form
+  # below) so the assertion side stays in lockstep too.
 
   # Number of blocks the chain must advance to before the test exits
   # successfully. Default 70 = one full epoch crossed (EpochPeriod=60)
@@ -121,7 +127,6 @@ pkgs.testers.nixosTest {
     {
       config,
       lib,
-      options,
       ...
     }:
     {
@@ -185,27 +190,22 @@ pkgs.testers.nixosTest {
         enable = true;
         secretKeyBaseFile = "/run/test-secrets/skb";
         databasePasswordFile = "/run/test-secrets/db_password";
-        # Single-source-of-truth threading: backend's `CHAIN_ID` env
-        # var reads from the let-bound `chainId` (65111111). Module
-        # default is 65000000 (MainNet), so this override is genuinely
-        # active — unlike the static `integration` test where the
-        # binding happens to match the default.
-        chain.id = chainId;
+        # `chain.id` no longer needs an explicit override. The
+        # backend module's default for `chain.id` reads from
+        # `config.services.autonity.chainId`, which is itself
+        # enum-driven from `services.autonity.network = "dev"` above.
+        # The chain ID flows through one path: autonity module →
+        # backend's CHAIN_ID env, no second site to keep in sync.
       };
 
       services.blockscout-frontend = {
         enable = true;
-        # Single-source-of-truth threading: frontend's
-        # `NEXT_PUBLIC_NETWORK_ID` reads from the same `chainId`. The
-        # `//`-against-`options.<…>.default` pattern preserves all 13
-        # other publicEnv defaults while overriding only the chain ID.
-        # See `tests/integration.nix` for the full rationale —
-        # `types.attrsOf` with a non-empty default is shadowed by any
-        # user-provided definition rather than per-key merged, so the
-        # explicit `default //` form is required.
-        publicEnv = options.services.blockscout-frontend.publicEnv.default // {
-          NEXT_PUBLIC_NETWORK_ID = toString chainId;
-        };
+        # `publicEnv` no longer needs the
+        # `options.services.blockscout-frontend.publicEnv.default //`
+        # override either: the frontend module's `NEXT_PUBLIC_NETWORK_ID`
+        # default reads from `config.services.autonity.chainId`, so
+        # the dev chain ID flows through to envs.js and the SSR
+        # exports automatically.
       };
 
       services.blockscout-nginx = {
@@ -229,7 +229,13 @@ pkgs.testers.nixosTest {
       environment.systemPackages = [ pkgs.python3 ];
     };
 
-  testScript = ''
+  # `nodes` argument exposes the resolved per-node config so
+  # the testScript's PROBE_CHAIN_ID env var reads from the same
+  # `services.autonity.chainId` value the running VM saw — no
+  # test-fixture-local mirror to keep in lockstep.
+  testScript =
+    { nodes, ... }:
+    ''
     machine.start()
 
     # ---------------------------------------------------------------
@@ -261,10 +267,10 @@ pkgs.testers.nixosTest {
     # LOGIC across both contexts (this VM + the host-native runner
     # behind `nix run .#e2e`). It reads connection details and
     # thresholds from environment variables. Here we set those env
-    # vars to point at loopback (the VM's perspective) and to the
-    # let-bound chainId / blocksRequired; in the host-native runner
-    # the same script gets the same env-var shape pointed at host
-    # processes instead.
+    # vars to point at loopback (the VM's perspective); PROBE_CHAIN_ID
+    # is rendered from `nodes.machine.services.autonity.chainId`
+    # so the assertion side stays in lockstep with what the running
+    # autonity unit and the indexer/frontend actually saw.
     #
     # `PROBE_BACKEND_UNIT=blockscout-backend.service` enables the
     # systemctl-show CHAIN_ID cross-check (probe 9), which is VM-
@@ -279,7 +285,7 @@ pkgs.testers.nixosTest {
         "PROBE_RPC_URL=http://127.0.0.1:8545 "
         "PROBE_BACKEND_URL=http://127.0.0.1:4000 "
         "PROBE_FRONTEND_URL=http://127.0.0.1:3000 "
-        "PROBE_CHAIN_ID=${toString chainId} "
+        "PROBE_CHAIN_ID=${toString nodes.machine.services.autonity.chainId} "
         "PROBE_BLOCKS_REQUIRED=${toString blocksRequired} "
         "PROBE_PSQL_CMD='${pkgs.util-linux}/bin/runuser -u postgres -- "
         "${pkgs.postgresql}/bin/psql -At -d blockscout' "

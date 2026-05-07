@@ -32,23 +32,17 @@
 let
   hostName = "explorer.test";
 
-  # Single source of truth for the chain ID this VM exercises. With
-  # `services.autonity.network` at its default ("mainnet") the running
-  # binary returns chain ID 65000000 from `eth_chainId`, so this value
-  # must match. Future fixtures running against `network = "dev"` (#34)
-  # change the binary's compiled-in chain to 65111111 and re-bind this
-  # `let` to that value; everything downstream — backend `chain.id`,
-  # frontend `publicEnv.NEXT_PUBLIC_NETWORK_ID`, and the test
-  # assertion — re-evaluates from the same one place.
-  #
-  # `chainIdHex` is computed at Nix eval time via `lib.toHexString`
-  # (which emits uppercase hex without a `0x` prefix). Geth-family
-  # JSON-RPC returns lowercase hex, so we normalise via `lib.toLower`
-  # before prefixing. The hex form is never written by hand — the
-  # only authoring site for the chain ID is the integer `chainId`
-  # above; bumping it re-derives the hex automatically.
-  chainId = 65000000;
-  chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+  # The chain ID this VM exercises is the autonity module's
+  # `services.autonity.chainId` default for the running `network`
+  # value (`mainnet` → 65000000 here, since `services.autonity.network`
+  # is left at its module default). Backend `chain.id` and frontend
+  # `publicEnv.NEXT_PUBLIC_NETWORK_ID` defaults both read from
+  # `config.services.autonity.chainId`, so no per-test override is
+  # needed at the consumer modules. The testScript reads
+  # `nodes.machine.services.autonity.chainId` at render time so the
+  # assertion side stays in lockstep — single authoring site, three
+  # downstream readers (backend env, frontend envs.js, test
+  # assertion).
 
   # Self-signed cert generated at build time by `pkgs.runCommand`,
   # with the result stored in the Nix store. The test isn't validating
@@ -87,7 +81,6 @@ pkgs.testers.nixosTest {
     {
       config,
       lib,
-      options,
       ...
     }:
     {
@@ -229,49 +222,21 @@ pkgs.testers.nixosTest {
         enable = true;
         secretKeyBaseFile = "/run/test-secrets/skb";
         databasePasswordFile = "/run/test-secrets/db_password";
-        # Single-source-of-truth threading: backend's `CHAIN_ID` env
-        # var reads from the let-bound `chainId` at the top of this
-        # file. The value happens to match this option's module-level
-        # default (65000000) — the explicit binding makes the variable's
-        # intent clear and prevents silent drift if either side is
-        # bumped independently in the future (e.g. `network = "dev"`
-        # under #34, which switches `chainId` to 65111111).
-        chain.id = chainId;
+        # `chain.id` inherits from `config.services.autonity.chainId`
+        # via the backend module's default. With
+        # `services.autonity.network` at the module default
+        # (`mainnet`), the autonity option resolves to 65000000 —
+        # the same value the binary's compiled-in MainNet config
+        # returns from `eth_chainId`. No per-test override needed.
       };
 
       services.blockscout-frontend = {
         enable = true;
-        # Single-source-of-truth threading: frontend's
-        # `NEXT_PUBLIC_NETWORK_ID` reads from the same let-bound
-        # `chainId`. The module's `publicEnv` default is a non-empty
-        # attrset of 13 keys (3 API + 7 network + 3 app); empirically
-        # — verified against CI run 25331628915 on this PR's first
-        # push — for `types.attrsOf` with a non-empty default, that
-        # default is a single definition that gets fully shadowed by
-        # any user-provided definition rather than per-key merged. The
-        # earlier `publicEnv.NEXT_PUBLIC_NETWORK_ID = toString chainId;`
-        # form left envs.js with only that one key and the existing
-        # `NEXT_PUBLIC_NETWORK_NAME in envsjs` assertion failed.
-        #
-        # To preserve every other default while overriding only the
-        # chain ID, we read the default out of `options` and
-        # `//`-override the single key, producing one user definition
-        # that contains all 13 keys with the chain ID re-bound. The
-        # pattern is robust against future additions to the module's
-        # default (new keys land automatically; no re-edit needed).
-        #
-        # Caveat: this single user-side definition takes priority over
-        # any sibling-module definitions of `publicEnv.<key>` that get
-        # imported alongside this fixture. Acceptable in this VM test
-        # because no sibling module contributes; if that ever changes
-        # we'd need to switch to a stack of `mkMerge` definitions.
-        # (The current alternative — leaving `publicEnv` unset and
-        # letting the default cover everything — would prevent us from
-        # parameterising the chain ID by `let`-bound `chainId`, which
-        # is the whole point of #33.)
-        publicEnv = options.services.blockscout-frontend.publicEnv.default // {
-          NEXT_PUBLIC_NETWORK_ID = toString chainId;
-        };
+        # `publicEnv` likewise inherits from the autonity option:
+        # the frontend module's `NEXT_PUBLIC_NETWORK_ID` default reads
+        # from `config.services.autonity.chainId`, so envs.js and the
+        # SSR exports both pick up the same chain ID without any test
+        # site override.
       };
 
       services.blockscout-nginx = {
@@ -293,7 +258,21 @@ pkgs.testers.nixosTest {
       };
     };
 
-  testScript = ''
+  # `nodes` exposes the resolved per-node config; `chainId` /
+  # `chainIdHex` here are derived once from
+  # `nodes.machine.services.autonity.chainId` so the assertion side
+  # of the test reads the same value the running VM saw, with no
+  # test-fixture-local mirror to keep in lockstep.
+  testScript =
+    {
+      nodes,
+      ...
+    }:
+    let
+      chainId = nodes.machine.services.autonity.chainId;
+      chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+    in
+    ''
     import json
     import re
 
