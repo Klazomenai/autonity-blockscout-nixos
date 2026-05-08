@@ -357,14 +357,17 @@ pkgs.testers.nixosTest {
       ).strip()
       assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
 
-      # `services.blockscout-backend.chain.id` (set in the fixture from
-      # the `chainId` let-binding) must propagate into the unit's
-      # `Environment=` block as `CHAIN_ID=<int>`. Without this assertion
-      # a regression in the backend module's `chain.id -> CHAIN_ID`
-      # plumbing would leave the test green: the eth_chainId / envs.js
-      # assertions only exercise the autonity binary and frontend overlay,
-      # which are upstream of the backend's env wiring. `systemctl show
-      # -p Environment` returns all Environment directives joined on a
+      # `services.blockscout-backend.chain.id` (which inherits from
+      # `config.services.autonity.chainId` via the backend module's
+      # default; assertion side reads the same chainId via
+      # `nodes.machine.services.autonity.chainId` in the testScript
+      # let-binding) must propagate into the unit's `Environment=`
+      # block as `CHAIN_ID=<int>`. Without this assertion a regression
+      # in the backend module's `chain.id -> CHAIN_ID` plumbing would
+      # leave the test green: the eth_chainId / envs.js assertions
+      # only exercise the autonity binary and frontend overlay, which
+      # are upstream of the backend's env wiring. `systemctl show -p
+      # Environment` returns all Environment directives joined on a
       # single line, so substring containment is the right check.
       backend_env = machine.succeed(
           "systemctl show -p Environment --value blockscout-backend.service"

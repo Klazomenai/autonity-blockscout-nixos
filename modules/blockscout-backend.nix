@@ -631,13 +631,14 @@ in
         default = config.services.autonity.chainId;
         defaultText = literalExpression "config.services.autonity.chainId";
         description = ''
-          Chain ID. Defaults to `config.services.autonity.chainId`,
-          which is itself enum-driven from
-          `services.autonity.network` (mainnet → 65000000,
-          bakerloo → 65010004, dev → 65111111). Operators running a
-          custom chain should set `services.autonity.chainId` and let
-          it flow through to the backend's `CHAIN_ID` env var,
-          rather than overriding here directly.
+          Chain ID. Defaults to `config.services.autonity.chainId` —
+          see the autonity module's option docs for the enum-driven
+          per-network default values (mirroring them here would just
+          drift if the upstream `params/*_config.go` constants ever
+          change). Operators running a custom chain should set
+          `services.autonity.chainId` once and let it flow through to
+          the backend's `CHAIN_ID` env var, rather than overriding
+          here directly.
         '';
       };
       coin = mkOption {
