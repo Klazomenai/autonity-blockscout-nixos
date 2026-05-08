@@ -32,23 +32,17 @@
 let
   hostName = "explorer.test";
 
-  # Single source of truth for the chain ID this VM exercises. With
-  # `services.autonity.network` at its default ("mainnet") the running
-  # binary returns chain ID 65000000 from `eth_chainId`, so this value
-  # must match. Future fixtures running against `network = "dev"` (#34)
-  # change the binary's compiled-in chain to 65111111 and re-bind this
-  # `let` to that value; everything downstream — backend `chain.id`,
-  # frontend `publicEnv.NEXT_PUBLIC_NETWORK_ID`, and the test
-  # assertion — re-evaluates from the same one place.
-  #
-  # `chainIdHex` is computed at Nix eval time via `lib.toHexString`
-  # (which emits uppercase hex without a `0x` prefix). Geth-family
-  # JSON-RPC returns lowercase hex, so we normalise via `lib.toLower`
-  # before prefixing. The hex form is never written by hand — the
-  # only authoring site for the chain ID is the integer `chainId`
-  # above; bumping it re-derives the hex automatically.
-  chainId = 65000000;
-  chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+  # The chain ID this VM exercises is the autonity module's
+  # `services.autonity.chainId` default for the running `network`
+  # value (`mainnet` → 65000000 here, since `services.autonity.network`
+  # is left at its module default). Backend `chain.id` and frontend
+  # `publicEnv.NEXT_PUBLIC_NETWORK_ID` defaults both read from
+  # `config.services.autonity.chainId`, so no per-test override is
+  # needed at the consumer modules. The testScript reads
+  # `nodes.machine.services.autonity.chainId` at render time so the
+  # assertion side stays in lockstep — single authoring site, three
+  # downstream readers (backend env, frontend envs.js, test
+  # assertion).
 
   # Self-signed cert generated at build time by `pkgs.runCommand`,
   # with the result stored in the Nix store. The test isn't validating
@@ -87,7 +81,6 @@ pkgs.testers.nixosTest {
     {
       config,
       lib,
-      options,
       ...
     }:
     {
@@ -229,49 +222,21 @@ pkgs.testers.nixosTest {
         enable = true;
         secretKeyBaseFile = "/run/test-secrets/skb";
         databasePasswordFile = "/run/test-secrets/db_password";
-        # Single-source-of-truth threading: backend's `CHAIN_ID` env
-        # var reads from the let-bound `chainId` at the top of this
-        # file. The value happens to match this option's module-level
-        # default (65000000) — the explicit binding makes the variable's
-        # intent clear and prevents silent drift if either side is
-        # bumped independently in the future (e.g. `network = "dev"`
-        # under #34, which switches `chainId` to 65111111).
-        chain.id = chainId;
+        # `chain.id` inherits from `config.services.autonity.chainId`
+        # via the backend module's default. With
+        # `services.autonity.network` at the module default
+        # (`mainnet`), the autonity option resolves to 65000000 —
+        # the same value the binary's compiled-in MainNet config
+        # returns from `eth_chainId`. No per-test override needed.
       };
 
       services.blockscout-frontend = {
         enable = true;
-        # Single-source-of-truth threading: frontend's
-        # `NEXT_PUBLIC_NETWORK_ID` reads from the same let-bound
-        # `chainId`. The module's `publicEnv` default is a non-empty
-        # attrset of 13 keys (3 API + 7 network + 3 app); empirically
-        # — verified against CI run 25331628915 on this PR's first
-        # push — for `types.attrsOf` with a non-empty default, that
-        # default is a single definition that gets fully shadowed by
-        # any user-provided definition rather than per-key merged. The
-        # earlier `publicEnv.NEXT_PUBLIC_NETWORK_ID = toString chainId;`
-        # form left envs.js with only that one key and the existing
-        # `NEXT_PUBLIC_NETWORK_NAME in envsjs` assertion failed.
-        #
-        # To preserve every other default while overriding only the
-        # chain ID, we read the default out of `options` and
-        # `//`-override the single key, producing one user definition
-        # that contains all 13 keys with the chain ID re-bound. The
-        # pattern is robust against future additions to the module's
-        # default (new keys land automatically; no re-edit needed).
-        #
-        # Caveat: this single user-side definition takes priority over
-        # any sibling-module definitions of `publicEnv.<key>` that get
-        # imported alongside this fixture. Acceptable in this VM test
-        # because no sibling module contributes; if that ever changes
-        # we'd need to switch to a stack of `mkMerge` definitions.
-        # (The current alternative — leaving `publicEnv` unset and
-        # letting the default cover everything — would prevent us from
-        # parameterising the chain ID by `let`-bound `chainId`, which
-        # is the whole point of #33.)
-        publicEnv = options.services.blockscout-frontend.publicEnv.default // {
-          NEXT_PUBLIC_NETWORK_ID = toString chainId;
-        };
+        # `publicEnv` likewise inherits from the autonity option:
+        # the frontend module's `NEXT_PUBLIC_NETWORK_ID` default reads
+        # from `config.services.autonity.chainId`, so envs.js and the
+        # SSR exports both pick up the same chain ID without any test
+        # site override.
       };
 
       services.blockscout-nginx = {
@@ -293,271 +258,288 @@ pkgs.testers.nixosTest {
       };
     };
 
-  testScript = ''
-    import json
-    import re
+  # `nodes` exposes the resolved per-node config; `chainId` /
+  # `chainIdHex` here are derived once from
+  # `nodes.machine.services.autonity.chainId` so the assertion side
+  # of the test reads the same value the running VM saw, with no
+  # test-fixture-local mirror to keep in lockstep.
+  testScript =
+    {
+      nodes,
+      ...
+    }:
+    let
+      chainId = nodes.machine.services.autonity.chainId;
+      chainIdHex = "0x" + pkgs.lib.toLower (pkgs.lib.toHexString chainId);
+    in
+    ''
+      import json
+      import re
 
-    machine.start()
+      machine.start()
 
-    # ---------------------------------------------------------------
-    # 1. Boot completion + per-unit readiness.
-    # ---------------------------------------------------------------
-    machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("autonity.service")
-    machine.wait_for_unit("postgresql.service")
-    machine.wait_for_unit("redis-blockscout.service")
-    machine.wait_for_unit("blockscout-backend.service")
-    machine.wait_for_unit("blockscout-frontend.service")
-    machine.wait_for_unit("nginx.service")
+      # ---------------------------------------------------------------
+      # 1. Boot completion + per-unit readiness.
+      # ---------------------------------------------------------------
+      machine.wait_for_unit("multi-user.target")
+      machine.wait_for_unit("autonity.service")
+      machine.wait_for_unit("postgresql.service")
+      machine.wait_for_unit("redis-blockscout.service")
+      machine.wait_for_unit("blockscout-backend.service")
+      machine.wait_for_unit("blockscout-frontend.service")
+      machine.wait_for_unit("nginx.service")
 
-    # ---------------------------------------------------------------
-    # 1a. `services.autonity.staticNodes` ExecStartPre side-effect.
-    #     The fixture above sets a one-element list; this step
-    #     asserts the wrapper rendered `static-nodes.json` into
-    #     StateDirectory with mode 0600 and that the file parses as
-    #     a single-element JSON array of enode URIs. Parsing rather
-    #     than substring-matching catches malformed JSON, accidental
-    #     wrong list shape (e.g. nested), or a dropped/duplicated
-    #     element. With DynamicUser the file lives at
-    #     `/var/lib/private/autonity/static-nodes.json` (root has
-    #     full traversal regardless of permission bits), and the
-    #     symlink at `/var/lib/autonity` points there.
-    # ---------------------------------------------------------------
-    machine.succeed("test -f /var/lib/autonity/static-nodes.json")
-    mode = machine.succeed(
-        "stat -c %a /var/lib/autonity/static-nodes.json"
-    ).strip()
-    assert mode == "600", f"static-nodes.json mode is {mode!r}, expected 600"
-    static_nodes_raw = machine.succeed("cat /var/lib/autonity/static-nodes.json")
-    static_nodes_json = json.loads(static_nodes_raw)
-    assert isinstance(static_nodes_json, list), (
-        f"static-nodes.json is not a JSON list: {static_nodes_raw!r}"
-    )
-    assert len(static_nodes_json) == 1, (
-        f"static-nodes.json has {len(static_nodes_json)} entries, expected 1: {static_nodes_json!r}"
-    )
-    assert (
-        isinstance(static_nodes_json[0], str)
-        and static_nodes_json[0].startswith("enode://")
-    ), (
-        f"static-nodes.json[0] is not an enode URI: {static_nodes_json!r}"
-    )
+      # ---------------------------------------------------------------
+      # 1a. `services.autonity.staticNodes` ExecStartPre side-effect.
+      #     The fixture above sets a one-element list; this step
+      #     asserts the wrapper rendered `static-nodes.json` into
+      #     StateDirectory with mode 0600 and that the file parses as
+      #     a single-element JSON array of enode URIs. Parsing rather
+      #     than substring-matching catches malformed JSON, accidental
+      #     wrong list shape (e.g. nested), or a dropped/duplicated
+      #     element. With DynamicUser the file lives at
+      #     `/var/lib/private/autonity/static-nodes.json` (root has
+      #     full traversal regardless of permission bits), and the
+      #     symlink at `/var/lib/autonity` points there.
+      # ---------------------------------------------------------------
+      machine.succeed("test -f /var/lib/autonity/static-nodes.json")
+      mode = machine.succeed(
+          "stat -c %a /var/lib/autonity/static-nodes.json"
+      ).strip()
+      assert mode == "600", f"static-nodes.json mode is {mode!r}, expected 600"
+      static_nodes_raw = machine.succeed("cat /var/lib/autonity/static-nodes.json")
+      static_nodes_json = json.loads(static_nodes_raw)
+      assert isinstance(static_nodes_json, list), (
+          f"static-nodes.json is not a JSON list: {static_nodes_raw!r}"
+      )
+      assert len(static_nodes_json) == 1, (
+          f"static-nodes.json has {len(static_nodes_json)} entries, expected 1: {static_nodes_json!r}"
+      )
+      assert (
+          isinstance(static_nodes_json[0], str)
+          and static_nodes_json[0].startswith("enode://")
+      ), (
+          f"static-nodes.json[0] is not an enode URI: {static_nodes_json!r}"
+      )
 
-    # ---------------------------------------------------------------
-    # 2. Loopback ports listening.
-    # ---------------------------------------------------------------
-    machine.wait_for_open_port(8545)   # Autonity HTTP RPC
-    machine.wait_for_open_port(4000)   # Blockscout backend
-    machine.wait_for_open_port(3000)   # Blockscout frontend
-    machine.wait_for_open_port(80)     # nginx HTTP (redirects to 443)
-    machine.wait_for_open_port(443)    # nginx HTTPS
+      # ---------------------------------------------------------------
+      # 2. Loopback ports listening.
+      # ---------------------------------------------------------------
+      machine.wait_for_open_port(8545)   # Autonity HTTP RPC
+      machine.wait_for_open_port(4000)   # Blockscout backend
+      machine.wait_for_open_port(3000)   # Blockscout frontend
+      machine.wait_for_open_port(80)     # nginx HTTP (redirects to 443)
+      machine.wait_for_open_port(443)    # nginx HTTPS
 
-    # ---------------------------------------------------------------
-    # 3. Cross-service connectivity surfaces.
-    # ---------------------------------------------------------------
-    # PostgreSQL still exposes its standard UNIX socket for ad-hoc
-    # operator access (`psql`, `pg_dump`); the backend itself reaches
-    # it over TCP-localhost because the Postgrex layer only honours
-    # URL host:port for the connect call.
-    machine.succeed("test -S /run/postgresql/.s.PGSQL.5432")
+      # ---------------------------------------------------------------
+      # 3. Cross-service connectivity surfaces.
+      # ---------------------------------------------------------------
+      # PostgreSQL still exposes its standard UNIX socket for ad-hoc
+      # operator access (`psql`, `pg_dump`); the backend itself reaches
+      # it over TCP-localhost because the Postgrex layer only honours
+      # URL host:port for the connect call.
+      machine.succeed("test -S /run/postgresql/.s.PGSQL.5432")
 
-    # PostgreSQL TCP-localhost (matches services.blockscout-postgresql
-    # default of listen_addresses="localhost").
-    machine.wait_for_open_port(5432)
+      # PostgreSQL TCP-localhost (matches services.blockscout-postgresql
+      # default of listen_addresses="localhost").
+      machine.wait_for_open_port(5432)
 
-    # Redis TCP-localhost (matches services.blockscout-redis default
-    # of bind="127.0.0.1" + port=6379). Redis pivoted off UNIX
-    # sockets because Redix.URI.to_start_options/1 rejects the
-    # `unix://` scheme.
-    machine.wait_for_open_port(6379)
+      # Redis TCP-localhost (matches services.blockscout-redis default
+      # of bind="127.0.0.1" + port=6379). Redis pivoted off UNIX
+      # sockets because Redix.URI.to_start_options/1 rejects the
+      # `unix://` scheme.
+      machine.wait_for_open_port(6379)
 
-    # Backend joins no host system groups — both data-plane services
-    # reached over TCP, so SupplementaryGroups should be empty.
-    supp = machine.succeed(
-        "systemctl show -p SupplementaryGroups --value blockscout-backend.service"
-    ).strip()
-    assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
+      # Backend joins no host system groups — both data-plane services
+      # reached over TCP, so SupplementaryGroups should be empty.
+      supp = machine.succeed(
+          "systemctl show -p SupplementaryGroups --value blockscout-backend.service"
+      ).strip()
+      assert supp == "", f"backend should have no SupplementaryGroups, got: {supp!r}"
 
-    # `services.blockscout-backend.chain.id` (set in the fixture from
-    # the `chainId` let-binding) must propagate into the unit's
-    # `Environment=` block as `CHAIN_ID=<int>`. Without this assertion
-    # a regression in the backend module's `chain.id -> CHAIN_ID`
-    # plumbing would leave the test green: the eth_chainId / envs.js
-    # assertions only exercise the autonity binary and frontend overlay,
-    # which are upstream of the backend's env wiring. `systemctl show
-    # -p Environment` returns all Environment directives joined on a
-    # single line, so substring containment is the right check.
-    backend_env = machine.succeed(
-        "systemctl show -p Environment --value blockscout-backend.service"
-    ).strip()
-    assert "CHAIN_ID=${toString chainId}" in backend_env, (
-        f"backend CHAIN_ID env missing or mismatched: {backend_env!r}"
-    )
+      # `services.blockscout-backend.chain.id` (which inherits from
+      # `config.services.autonity.chainId` via the backend module's
+      # default; assertion side reads the same chainId via
+      # `nodes.machine.services.autonity.chainId` in the testScript
+      # let-binding) must propagate into the unit's `Environment=`
+      # block as `CHAIN_ID=<int>`. Without this assertion a regression
+      # in the backend module's `chain.id -> CHAIN_ID` plumbing would
+      # leave the test green: the eth_chainId / envs.js assertions
+      # only exercise the autonity binary and frontend overlay, which
+      # are upstream of the backend's env wiring. `systemctl show -p
+      # Environment` returns all Environment directives joined on a
+      # single line, so substring containment is the right check.
+      backend_env = machine.succeed(
+          "systemctl show -p Environment --value blockscout-backend.service"
+      ).strip()
+      assert "CHAIN_ID=${toString chainId}" in backend_env, (
+          f"backend CHAIN_ID env missing or mismatched: {backend_env!r}"
+      )
 
-    # ---------------------------------------------------------------
-    # 4. Backend ↔ Autonity loopback RPC. `wait_until_succeeds` not
-    #    `succeed` — `wait_for_open_port(8545)` only proves the
-    #    listener is bound, not that the JSON-RPC handler goroutines
-    #    are answering yet. On slow/contended hosts that gap is real.
-    # ---------------------------------------------------------------
-    rpc = machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:8545 "
-        "-H 'Content-Type: application/json' "
-        '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' ',
-        timeout=120,
-    )
-    # Tightened from a substring-only check ("\"result\"" in rpc) to
-    # exact-equality against the let-bound chainIdHex. The hex literal
-    # is computed at Nix eval time from the integer `chainId`, so any
-    # drift between Autonity's compiled-in chain ID and the test
-    # fixture's expectation surfaces here as a clear mismatch instead
-    # of silently passing.
-    rpc_json = json.loads(rpc)
-    assert rpc_json.get("result") == "${chainIdHex}", (
-        f"eth_chainId mismatch: expected ${chainIdHex}, got {rpc!r}"
-    )
+      # ---------------------------------------------------------------
+      # 4. Backend ↔ Autonity loopback RPC. `wait_until_succeeds` not
+      #    `succeed` — `wait_for_open_port(8545)` only proves the
+      #    listener is bound, not that the JSON-RPC handler goroutines
+      #    are answering yet. On slow/contended hosts that gap is real.
+      # ---------------------------------------------------------------
+      rpc = machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:8545 "
+          "-H 'Content-Type: application/json' "
+          '-d \'{"jsonrpc":"2.0","method":"eth_chainId","id":1}\' ',
+          timeout=120,
+      )
+      # Tightened from a substring-only check ("\"result\"" in rpc) to
+      # exact-equality against the let-bound chainIdHex. The hex literal
+      # is computed at Nix eval time from the integer `chainId`, so any
+      # drift between Autonity's compiled-in chain ID and the test
+      # fixture's expectation surfaces here as a clear mismatch instead
+      # of silently passing.
+      rpc_json = json.loads(rpc)
+      assert rpc_json.get("result") == "${chainIdHex}", (
+          f"eth_chainId mismatch: expected ${chainIdHex}, got {rpc!r}"
+      )
 
-    # ---------------------------------------------------------------
-    # 5. Backend health endpoints.
-    #    /api/health/liveness — confirms BEAM + the Phoenix endpoint
-    #      are listening (does not touch Postgres / Redis / Autonity).
-    #    /api/health/readiness — runs a Postgres query against
-    #      `last_db_block_status`, so it surfaces password-auth /
-    #      TCP-localhost / migration failures.
-    #    /api/v2/health — full chain-aware health check; rejected
-    #      with 400 in this test because the autonity node runs with
-    #      `--nodiscover --maxpeers=0`, never advances past genesis,
-    #      and the indexer therefore has no recorded block to assert
-    #      `is_healthy_indexing`. Real-chain readiness is M3 territory.
-    # ---------------------------------------------------------------
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/health/liveness",
-        timeout=120,
-    )
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/health/readiness",
-        timeout=120,
-    )
+      # ---------------------------------------------------------------
+      # 5. Backend health endpoints.
+      #    /api/health/liveness — confirms BEAM + the Phoenix endpoint
+      #      are listening (does not touch Postgres / Redis / Autonity).
+      #    /api/health/readiness — runs a Postgres query against
+      #      `last_db_block_status`, so it surfaces password-auth /
+      #      TCP-localhost / migration failures.
+      #    /api/v2/health — full chain-aware health check; rejected
+      #      with 400 in this test because the autonity node runs with
+      #      `--nodiscover --maxpeers=0`, never advances past genesis,
+      #      and the indexer therefore has no recorded block to assert
+      #      `is_healthy_indexing`. Real-chain readiness is M3 territory.
+      # ---------------------------------------------------------------
+      machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:4000/api/health/liveness",
+          timeout=120,
+      )
+      machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:4000/api/health/readiness",
+          timeout=120,
+      )
 
-    # ---------------------------------------------------------------
-    # 6. Frontend SSR + bind-mounted envs.js. `wait_until_succeeds`
-    #    not `succeed` — Next.js binds 3000 well before the SSR worker
-    #    is warm; the first request can return 502/500 while the
-    #    route is being compiled. On constrained CI runners that
-    #    warm-up window can be tens of seconds.
-    # ---------------------------------------------------------------
-    envsjs = machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:3000/assets/envs.js",
-        timeout=120,
-    )
-    assert "window.__envs" in envsjs, (
-        f"envs.js does not contain window.__envs assignment: {envsjs!r}"
-    )
-    assert "NEXT_PUBLIC_NETWORK_NAME" in envsjs, (
-        f"envs.js missing expected NEXT_PUBLIC_* keys: {envsjs!r}"
-    )
-    # Cross-check the chain-ID single-source-of-truth threading: the
-    # let-bound `chainId` (sourced as a Nix integer) must end up in the
-    # rendered envs.js as the JS string value of NEXT_PUBLIC_NETWORK_ID.
-    # This catches drift between backend `CHAIN_ID` and frontend's
-    # rendered envs.js — the failure mode that the threading was put
-    # in place to prevent.
-    assert '"${toString chainId}"' in envsjs, (
-        f"envs.js missing chain ID '${toString chainId}': {envsjs!r}"
-    )
+      # ---------------------------------------------------------------
+      # 6. Frontend SSR + bind-mounted envs.js. `wait_until_succeeds`
+      #    not `succeed` — Next.js binds 3000 well before the SSR worker
+      #    is warm; the first request can return 502/500 while the
+      #    route is being compiled. On constrained CI runners that
+      #    warm-up window can be tens of seconds.
+      # ---------------------------------------------------------------
+      envsjs = machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:3000/assets/envs.js",
+          timeout=120,
+      )
+      assert "window.__envs" in envsjs, (
+          f"envs.js does not contain window.__envs assignment: {envsjs!r}"
+      )
+      assert "NEXT_PUBLIC_NETWORK_NAME" in envsjs, (
+          f"envs.js missing expected NEXT_PUBLIC_* keys: {envsjs!r}"
+      )
+      # Cross-check the chain-ID single-source-of-truth threading: the
+      # let-bound `chainId` (sourced as a Nix integer) must end up in the
+      # rendered envs.js as the JS string value of NEXT_PUBLIC_NETWORK_ID.
+      # This catches drift between backend `CHAIN_ID` and frontend's
+      # rendered envs.js — the failure mode that the threading was put
+      # in place to prevent.
+      assert '"${toString chainId}"' in envsjs, (
+          f"envs.js missing chain ID '${toString chainId}': {envsjs!r}"
+      )
 
-    homepage = machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:3000/",
-        timeout=120,
-    )
-    assert "envs.js" in homepage, (
-        "frontend HTML does not reference envs.js — "
-        "the bind-mount overlay would have nothing to load against"
-    )
+      homepage = machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:3000/",
+          timeout=120,
+      )
+      assert "envs.js" in homepage, (
+          "frontend HTML does not reference envs.js — "
+          "the bind-mount overlay would have nothing to load against"
+      )
 
-    # ---------------------------------------------------------------
-    # 7. Nginx reverse-proxy round-trips. `curl -k` skips trust
-    #    check on the self-signed cert; the assertion is "TLS
-    #    terminates and the proxy_pass reaches the right upstream".
-    # ---------------------------------------------------------------
-    # `--resolve <hostname>:443:127.0.0.1` pins DNS resolution to
-    # loopback while letting the URL itself carry the hostname — that
-    # way TLS SNI carries `${hostName}` (matching the certificate's
-    # CN/SAN and the nginx server-block selection key) AND the HTTP
-    # `Host:` header lines up automatically. Setting `Host:` manually
-    # against an IP-literal URL the way an earlier draft did would
-    # leave SNI as `127.0.0.1`, which nginx server-block selection
-    # doesn't match against — the request would land on whatever
-    # nginx considers the default TLS vhost and inadvertently exercise
-    # the wrong configuration.
-    # First HTTPS round-trip uses `wait_until_succeeds` because
-    # `wait_for_open_port(443)` only proves the listener is bound,
-    # not that nginx has finished loading the vhost config and the
-    # `proxy_pass` upstreams (frontend / backend) have completed
-    # their own warmup. Subsequent curls in this section reuse
-    # `succeed` — by then the proxy path is confirmed up.
-    proxied_health = machine.wait_until_succeeds(
-        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/api/health/liveness",
-        timeout=120,
-    )
-    # nginx /api/health/liveness and direct backend
-    # /api/health/liveness must agree — proxy_pass should be
-    # transparent to the response body. liveness chosen over the v2
-    # full-health endpoint for the same reason as step 5: the latter
-    # 400s on a fresh genesis chain.
-    direct_health = machine.succeed(
-        "curl -fsS http://127.0.0.1:4000/api/health/liveness"
-    )
-    assert proxied_health == direct_health, (
-        "nginx /api/health/liveness mismatch — proxy_pass altered the body. "
-        f"direct={direct_health!r} proxied={proxied_health!r}"
-    )
+      # ---------------------------------------------------------------
+      # 7. Nginx reverse-proxy round-trips. `curl -k` skips trust
+      #    check on the self-signed cert; the assertion is "TLS
+      #    terminates and the proxy_pass reaches the right upstream".
+      # ---------------------------------------------------------------
+      # `--resolve <hostname>:443:127.0.0.1` pins DNS resolution to
+      # loopback while letting the URL itself carry the hostname — that
+      # way TLS SNI carries `${hostName}` (matching the certificate's
+      # CN/SAN and the nginx server-block selection key) AND the HTTP
+      # `Host:` header lines up automatically. Setting `Host:` manually
+      # against an IP-literal URL the way an earlier draft did would
+      # leave SNI as `127.0.0.1`, which nginx server-block selection
+      # doesn't match against — the request would land on whatever
+      # nginx considers the default TLS vhost and inadvertently exercise
+      # the wrong configuration.
+      # First HTTPS round-trip uses `wait_until_succeeds` because
+      # `wait_for_open_port(443)` only proves the listener is bound,
+      # not that nginx has finished loading the vhost config and the
+      # `proxy_pass` upstreams (frontend / backend) have completed
+      # their own warmup. Subsequent curls in this section reuse
+      # `succeed` — by then the proxy path is confirmed up.
+      proxied_health = machine.wait_until_succeeds(
+          "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/api/health/liveness",
+          timeout=120,
+      )
+      # nginx /api/health/liveness and direct backend
+      # /api/health/liveness must agree — proxy_pass should be
+      # transparent to the response body. liveness chosen over the v2
+      # full-health endpoint for the same reason as step 5: the latter
+      # 400s on a fresh genesis chain.
+      direct_health = machine.succeed(
+          "curl -fsS http://127.0.0.1:4000/api/health/liveness"
+      )
+      assert proxied_health == direct_health, (
+          "nginx /api/health/liveness mismatch — proxy_pass altered the body. "
+          f"direct={direct_health!r} proxied={proxied_health!r}"
+      )
 
-    proxied_root = machine.succeed(
-        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/"
-    )
-    assert "envs.js" in proxied_root, (
-        "nginx / does not reverse-proxy frontend correctly"
-    )
+      proxied_root = machine.succeed(
+          "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/"
+      )
+      assert "envs.js" in proxied_root, (
+          "nginx / does not reverse-proxy frontend correctly"
+      )
 
-    proxied_envsjs = machine.succeed(
-        "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/assets/envs.js"
-    )
-    assert proxied_envsjs == envsjs, (
-        "envs.js bytes differ between direct frontend and through nginx — "
-        "indicates either the bind-mount overlay or the proxy is "
-        "altering content"
-    )
+      proxied_envsjs = machine.succeed(
+          "curl -fsSk --resolve ${hostName}:443:127.0.0.1 https://${hostName}/assets/envs.js"
+      )
+      assert proxied_envsjs == envsjs, (
+          "envs.js bytes differ between direct frontend and through nginx — "
+          "indicates either the bind-mount overlay or the proxy is "
+          "altering content"
+      )
 
-    # ---------------------------------------------------------------
-    # 8. Restart resilience — backend reconnects to Postgres + Redis
-    #    + Autonity without operator intervention. Readiness is the
-    #    right probe here: it does the same DB query as on first boot,
-    #    so a broken connection (e.g. credential not re-read on
-    #    restart) would surface as a 500 instead of a 200. The full
-    #    /api/v2/health is skipped for the same reason as steps 5/7
-    #    (chain stays at genesis under --nodiscover).
-    # ---------------------------------------------------------------
-    machine.systemctl("restart blockscout-backend.service")
-    machine.wait_for_unit("blockscout-backend.service")
-    machine.wait_for_open_port(4000)
-    machine.wait_until_succeeds(
-        "curl -fsS http://127.0.0.1:4000/api/health/readiness",
-        timeout=240,
-    )
+      # ---------------------------------------------------------------
+      # 8. Restart resilience — backend reconnects to Postgres + Redis
+      #    + Autonity without operator intervention. Readiness is the
+      #    right probe here: it does the same DB query as on first boot,
+      #    so a broken connection (e.g. credential not re-read on
+      #    restart) would surface as a 500 instead of a 200. The full
+      #    /api/v2/health is skipped for the same reason as steps 5/7
+      #    (chain stays at genesis under --nodiscover).
+      # ---------------------------------------------------------------
+      machine.systemctl("restart blockscout-backend.service")
+      machine.wait_for_unit("blockscout-backend.service")
+      machine.wait_for_open_port(4000)
+      machine.wait_until_succeeds(
+          "curl -fsS http://127.0.0.1:4000/api/health/readiness",
+          timeout=240,
+      )
 
-    # ---------------------------------------------------------------
-    # 9. HTTP → HTTPS redirect via forceSSL.
-    #    Accept any 3xx status — nginx ships 301 today, but `forceSSL`
-    #    is documented to issue 30x and a future nixpkgs/nginx change
-    #    to 307/308 would still satisfy the intent of "redirect
-    #    happened" without us needing to chase the exact code.
-    # ---------------------------------------------------------------
-    redirect_status = machine.succeed(
-        "curl -sSI -H 'Host: ${hostName}' http://127.0.0.1/ | head -1"
-    ).strip()
-    assert re.search(r"^HTTP/\S+\s+3\d\d\b", redirect_status), (
-        f"forceSSL HTTP→HTTPS redirect missing: {redirect_status!r}"
-    )
-  '';
+      # ---------------------------------------------------------------
+      # 9. HTTP → HTTPS redirect via forceSSL.
+      #    Accept any 3xx status — nginx ships 301 today, but `forceSSL`
+      #    is documented to issue 30x and a future nixpkgs/nginx change
+      #    to 307/308 would still satisfy the intent of "redirect
+      #    happened" without us needing to chase the exact code.
+      # ---------------------------------------------------------------
+      redirect_status = machine.succeed(
+          "curl -sSI -H 'Host: ${hostName}' http://127.0.0.1/ | head -1"
+      ).strip()
+      assert re.search(r"^HTTP/\S+\s+3\d\d\b", redirect_status), (
+          f"forceSSL HTTP→HTTPS redirect missing: {redirect_status!r}"
+      )
+    '';
 }

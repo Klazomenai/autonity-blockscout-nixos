@@ -24,6 +24,7 @@ let
     mkIf
     types
     concatStringsSep
+    literalExpression
     ;
 
   # CLI flag attrset → shell string via lib.cli. Null values are dropped,
@@ -156,6 +157,49 @@ in
           for the M3 post-deploy probe contract documented at
           `docs/m3-sync-probe.md` (object vs boolean state-presence
           check + minimum block-delta over a probe window).
+      '';
+    };
+
+    chainId = mkOption {
+      type = types.ints.positive;
+      default =
+        {
+          mainnet = 65000000;
+          bakerloo = 65010004;
+          dev = 65111111;
+        }
+        .${cfg.network};
+      defaultText = literalExpression ''
+        {
+          mainnet = 65000000;
+          bakerloo = 65010004;
+          dev = 65111111;
+        }.''${cfg.network}
+      '';
+      description = ''
+        Chain ID of the network the autonity node is participating in.
+
+        Default is enum-driven from `services.autonity.network`:
+
+        - `mainnet` → 65000000 (per `params/mainnet_config.go`)
+        - `bakerloo` → 65010004 (per `params/bakerloo_config.go`)
+        - `dev` → 65111111 (per `core/genesis.go`'s `DeveloperGenesisBlock`)
+
+        This option exists so consumer modules (`blockscout-backend`,
+        `blockscout-frontend`) can read the chain ID from a single
+        source rather than each operator having to set it three
+        places. The default tracks the upstream `params/*_config.go`
+        constants for the standard networks.
+
+        Operators running a custom chain (different bootnodes, custom
+        genesis, non-standard chain ID) can set this directly. The
+        autonity binary itself is configured via `network` and
+        `extraArgs`; this option does NOT cause an `--networkid` flag
+        to be emitted — it ONLY parameterises consumer modules
+        (`blockscout-backend.CHAIN_ID`,
+        `blockscout-frontend.publicEnv.NEXT_PUBLIC_NETWORK_ID`). If you
+        run a custom chain you'll typically need to override BOTH this
+        option AND pass a corresponding genesis flag via `extraArgs`.
       '';
     };
 

@@ -48,6 +48,7 @@ let
     mkIf
     types
     mapAttrsToList
+    literalExpression
     ;
 
   # NEXT_PUBLIC_* — Next.js itself exposes env vars to the client based
@@ -109,7 +110,7 @@ in
         NEXT_PUBLIC_API_PORT = "4000";
         NEXT_PUBLIC_NETWORK_NAME = "Autonity";
         NEXT_PUBLIC_NETWORK_SHORT_NAME = "ATN";
-        NEXT_PUBLIC_NETWORK_ID = "65000000";
+        NEXT_PUBLIC_NETWORK_ID = toString config.services.autonity.chainId;
         NEXT_PUBLIC_NETWORK_RPC_URL = "http://localhost:8545";
         NEXT_PUBLIC_NETWORK_CURRENCY_NAME = "Auton";
         NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL = "ATN";
@@ -118,6 +119,23 @@ in
         NEXT_PUBLIC_APP_PROTOCOL = "http";
         NEXT_PUBLIC_APP_PORT = "3000";
       };
+      defaultText = literalExpression ''
+        {
+          NEXT_PUBLIC_API_HOST = "localhost";
+          NEXT_PUBLIC_API_PROTOCOL = "http";
+          NEXT_PUBLIC_API_PORT = "4000";
+          NEXT_PUBLIC_NETWORK_NAME = "Autonity";
+          NEXT_PUBLIC_NETWORK_SHORT_NAME = "ATN";
+          NEXT_PUBLIC_NETWORK_ID = toString config.services.autonity.chainId;
+          NEXT_PUBLIC_NETWORK_RPC_URL = "http://localhost:8545";
+          NEXT_PUBLIC_NETWORK_CURRENCY_NAME = "Auton";
+          NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL = "ATN";
+          NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS = "18";
+          NEXT_PUBLIC_APP_HOST = "localhost";
+          NEXT_PUBLIC_APP_PROTOCOL = "http";
+          NEXT_PUBLIC_APP_PORT = "3000";
+        }
+      '';
       description = ''
         Public, browser-readable runtime configuration. Every key MUST
         begin with `NEXT_PUBLIC_` and contain only uppercase letters,
@@ -136,6 +154,14 @@ in
         deployments override `NEXT_PUBLIC_API_HOST`,
         `NEXT_PUBLIC_APP_HOST`, and `NEXT_PUBLIC_*_PROTOCOL` to match
         the public domain served through the nginx reverse proxy.
+
+        `NEXT_PUBLIC_NETWORK_ID` defaults to
+        `toString config.services.autonity.chainId`, which is itself
+        enum-driven from `services.autonity.network`. Operators
+        replacing `publicEnv` wholesale must include their own
+        `NEXT_PUBLIC_NETWORK_ID` value; operators running custom
+        chains should set `services.autonity.chainId` and let it flow
+        through here.
       '';
     };
 
