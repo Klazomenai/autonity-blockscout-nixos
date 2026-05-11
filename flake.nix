@@ -298,6 +298,64 @@
           + self.nixosConfigurations.ovh-test.config.networking.hostName
           + ")"
         );
+
+        # Shellcheck pass over every non-orchestrator Makefile recipe
+        # in `deployments/ovh-test/Makefile`. The recipes are the
+        # highest-bug-density file in the deployment (Make + Bash
+        # syntax mixing, ~270 lines of shell embedded in Make
+        # context) and shell bugs fail mid-cruise on real OVH
+        # hardware, where retries cost euros.
+        #
+        # Approach: render each recipe via `make --no-print-directory
+        # -n <recipe>` with fake env vars, pipe the rendered shell
+        # through `shellcheck -s bash`. `shellcheck` can't parse
+        # Makefile syntax directly (Make's `$(if …)` is not a Bash
+        # `if`), so the render-then-check pattern is the standard
+        # workaround.
+        #
+        # The `cruise` aggregate recipe is excluded — its rendered
+        # output under `make -n` contains submake-failure chatter
+        # that confuses shellcheck (SC2317 / SC2035 cascades). The
+        # subtargets it invokes (`provision`, `dns-up`, `install`,
+        # `deploy`, `test`, `halt`, `dns-down`) are each checked
+        # individually below; the orchestrator's quoting is checked
+        # by inspection during PR review.
+        checks.makefile-shellcheck =
+          pkgs.runCommand "check-makefile-shellcheck"
+            {
+              nativeBuildInputs = [
+                pkgs.gnumake
+                pkgs.shellcheck
+              ];
+            }
+            ''
+              set -euo pipefail
+              cd ${self}/deployments/ovh-test
+
+              recipes="provision halt dns-up dns-down install deploy test logs snapshot render-runtime-nix stage"
+              failed=0
+              for r in $recipes; do
+                rendered=$(OVH_TOKEN=fake OVH_PROJECT_ID=fake \
+                           GCLOUD_PROJECT=fake DNS_ZONE=fake \
+                           DOMAIN=fake IP=1.2.3.4 \
+                           make --no-print-directory -n "$r" 2>/dev/null || true)
+                output=$(echo "$rendered" | shellcheck -s bash - 2>&1 || true)
+                if [ -n "$output" ]; then
+                  echo "shellcheck issue in recipe $r:"
+                  echo "$output"
+                  echo "---"
+                  failed=1
+                fi
+              done
+
+              if [ $failed -eq 1 ]; then
+                echo "shellcheck found real issues above — fix the Makefile recipes"
+                exit 1
+              fi
+
+              echo "all $(echo "$recipes" | wc -w) recipes shellcheck-clean"
+              touch $out
+            '';
       }
     );
 }

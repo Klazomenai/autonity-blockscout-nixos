@@ -125,7 +125,7 @@ provision:
 	   echo "[provision] FAILED to parse instance ID; raw response:"; echo "$$response"; exit 1; fi; \
 	 echo "$$instance_id" > .last-instance-id; \
 	 echo "[provision] waiting for IP (timeout 300s)..."; \
-	 for i in $$(seq 1 60); do \
+	 for _ in $$(seq 1 60); do \
 	   ip=$$(ovh-cli cloud project $(OVH_PROJECT_ID) instance show --instance-id "$$instance_id" --output json 2>/dev/null \
 	     | jq -r '.ipAddresses[]? | select(.type=="public" and .version==4) | .ip' | head -1); \
 	   if [ -n "$$ip" ] && [ "$$ip" != "null" ]; then \
@@ -166,7 +166,7 @@ dns-up:
 	  --rrdatas="$(IP)" --type=A --ttl=$(DOMAIN_TTL) \
 	  --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)"
 	@echo "[dns-up] propagation poll (5 min cap)..."
-	@for i in $$(seq 1 30); do \
+	@for _ in $$(seq 1 30); do \
 	  resolved=$$(dig +short "$(DOMAIN)" @8.8.8.8 | head -1); \
 	  if [ "$$resolved" = "$(IP)" ]; then echo "[dns-up] propagated"; exit 0; fi; \
 	  sleep 10; \
@@ -262,11 +262,11 @@ cruise:
 	@$(MAKE) provision | tee .cruise.log
 	@ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
 	 if [ -z "$$ip" ]; then echo "[cruise] no IP captured; aborting"; exit 1; fi; \
-	 export IP=$$ip; \
-	 echo "[cruise] step 2/7: dns-up IP=$$ip"; $(MAKE) dns-up IP=$$ip; \
-	 echo "[cruise] step 3/7: install IP=$$ip"; $(MAKE) install IP=$$ip; \
-	 echo "[cruise] step 4/7: deploy IP=$$ip"; $(MAKE) deploy IP=$$ip; \
-	 echo "[cruise] step 5/7: test IP=$$ip"; $(MAKE) test IP=$$ip; \
+	 export IP="$$ip"; \
+	 echo "[cruise] step 2/7: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
+	 echo "[cruise] step 3/7: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
+	 echo "[cruise] step 4/7: deploy IP=$$ip"; $(MAKE) deploy IP="$$ip"; \
+	 echo "[cruise] step 5/7: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
 	 echo "[cruise] step 6/7: halt"; $(MAKE) halt; \
 	 echo "[cruise] step 7/7: dns-down"; $(MAKE) dns-down; \
 	 echo "[cruise] complete; remember to record discoveries in README.md"

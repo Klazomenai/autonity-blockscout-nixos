@@ -13,6 +13,10 @@ hardware-configuration.nix
 # bookkeeping.
 .last-instance-id
 
+# Cruise orchestrator log — written by `make cruise` so it can parse
+# the IP back out of provision's output for downstream submakes.
+.cruise.log
+
 # Spec captures from `make capture-specs` (when implemented).
 # Operators distil rows into the README's Discovered Specs section
 # by hand; raw captures stay local.
