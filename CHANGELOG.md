@@ -1,5 +1,7 @@
 # Changelog
 
+Managed by [release-please](https://github.com/googleapis/release-please). Entries are added automatically from Conventional Commit messages when release PRs are cut.
+
 ## 0.1.0-alpha.0 (2026-05-11)
 
 
@@ -22,7 +24,3 @@
 ### Miscellaneous Chores
 
 * gitignore tests/__pycache__ + Release-As override for v0.1.0-alpha.0 ⛵ ([#48](https://github.com/Klazomenai/autonity-blockscout-nixos/issues/48)) ([7a3b590](https://github.com/Klazomenai/autonity-blockscout-nixos/commit/7a3b5901ead68e0b77fc7f9951a1fae34096c0c1)), closes [#47](https://github.com/Klazomenai/autonity-blockscout-nixos/issues/47)
-
-## Changelog
-
-Managed by [release-please](https://github.com/googleapis/release-please). Entries are added automatically from Conventional Commit messages when release PRs are cut.
