@@ -14,3 +14,7 @@ devenv.lock
 # QEMU images (future VM integration tests)
 *.qcow2
 *.img
+
+# Python bytecode cache (tests/probes.py invoked from host-native runs)
+__pycache__/
+*.pyc
