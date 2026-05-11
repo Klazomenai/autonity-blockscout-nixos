@@ -335,10 +335,31 @@
               recipes="provision halt dns-up dns-down install deploy test logs snapshot render-runtime-nix stage"
               failed=0
               for r in $recipes; do
-                rendered=$(OVH_TOKEN=fake OVH_PROJECT_ID=fake \
-                           GCLOUD_PROJECT=fake DNS_ZONE=fake \
-                           DOMAIN=fake IP=1.2.3.4 \
-                           make --no-print-directory -n "$r" 2>/dev/null || true)
+                # Render the recipe via `make -n`. If `make` itself
+                # fails (broken Makefile, renamed recipe, missing
+                # SHELL, etc.) treat it as a check failure — without
+                # this, an empty rendered string would pass
+                # shellcheck silently and mask a real Makefile bug.
+                if ! rendered=$(OVH_TOKEN=fake OVH_PROJECT_ID=fake \
+                                GCLOUD_PROJECT=fake DNS_ZONE=fake \
+                                DOMAIN=fake IP=1.2.3.4 \
+                                make --no-print-directory -n "$r" 2>&1); then
+                  echo "make -n $r failed (recipe rename or Makefile parse error?):"
+                  echo "$rendered"
+                  echo "---"
+                  failed=1
+                  continue
+                fi
+                # Defensive: if `rendered` came back empty for any
+                # other reason (recipe with no commands, comment-only,
+                # etc.), flag it. Every recipe in the check list is
+                # expected to emit at least one shell command.
+                if [ -z "$(echo "$rendered" | tr -d '[:space:]')" ]; then
+                  echo "make -n $r produced empty output; recipe missing or comment-only"
+                  echo "---"
+                  failed=1
+                  continue
+                fi
                 output=$(echo "$rendered" | shellcheck -s bash - 2>&1 || true)
                 if [ -n "$output" ]; then
                   echo "shellcheck issue in recipe $r:"

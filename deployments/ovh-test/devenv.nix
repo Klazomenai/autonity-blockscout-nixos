@@ -16,8 +16,12 @@
     nixos-anywhere
     disko
 
-    # SSH for nixos-rebuild --target-host, scp'ing pharos-runtime.nix,
-    # journalctl streaming, port forwarding for the probe step.
+    # SSH for nixos-rebuild --target-host (closure copies host→host
+    # over SSH), journalctl streaming, port forwarding for the
+    # probe step. NOT used to ship pharos-runtime.nix — that file
+    # is operator-local and consumed at Nix-eval time on the
+    # operator's machine; the closure is built locally and pushed
+    # to the target via the standard nixos-rebuild mechanism.
     openssh
 
     # Probe runner — tests/probes.py is plain stdlib.

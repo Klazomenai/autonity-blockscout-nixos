@@ -63,6 +63,7 @@ The `printf` form (no trailing newline) is deliberate — `acme_email` and `serv
 ## Permissions
 
 - Directory `~/.config/pharos-secrets/`: mode 0700.
-- Each file: mode 0600.
-- On the host, files land at `/var/lib/pharos-secrets/<name>` mode 0600 owned root:root (preserved by `--extra-files`'s tar transfer).
-- `pharos-runtime.nix` lands at `/etc/pharos-runtime.nix` mode 0600 owned root:root.
+- Each operator-local file: mode 0600.
+- On the target host, `secret_key_base` + `database_password` land at `/var/lib/pharos-secrets/<name>` mode 0600 owned root:root (preserved by `--extra-files`'s tar transfer).
+- On the target host, `root_authorized_keys` lands at `/root/.ssh/authorized_keys` mode 0600 owned root:root.
+- `pharos-runtime.nix` is NOT transferred to the host. It lives only in the operator's `deployments/ovh-test/pharos-runtime.nix` (gitignored), where `flake.nix` imports it at Nix-eval time on the operator's machine. The closure built from that evaluation is what `nixos-anywhere` / `nixos-rebuild` ships to the target — so the operator's values are baked in, but the file itself never leaves the operator's machine.

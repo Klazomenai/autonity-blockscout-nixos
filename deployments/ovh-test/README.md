@@ -136,7 +136,7 @@ Append-only record of observations from real test-cruise runs. Each entry: date,
 > | Observed CPU peak | e.g. `~6 cores sustained mid-sync` |
 > | Disk used `/var/lib/autonity` | e.g. `~180 GiB after probe pass` |
 > | Disk used `/var/lib/private/postgresql` | e.g. `~75 GiB after probe pass` |
-> | Time to first block | e.g. `~3 min from `make install` finish` |
+> | Time to first block | e.g. ~3 min after `make install` finish |
 > | Time to probe pass | e.g. `~45 min on warm OVH catalogue` |
 > | Hourly cost (€) | e.g. `~0.30 EUR/hr` |
 > | Surprises | e.g. `disk path was /dev/sda not /dev/nvme0n1; updated disk-config.nix` |

@@ -141,12 +141,17 @@ provision:
 halt:
 	@$(call require_var,OVH_TOKEN)
 	@$(call require_var,OVH_PROJECT_ID)
-	@if [ ! -f .last-instance-id ]; then \
-	  echo "[halt] no .last-instance-id; pass instance ID via INSTANCE_ID=... if needed"; exit 1; fi
-	@instance_id=$$(cat .last-instance-id); \
+	@if [ -n "$(INSTANCE_ID)" ]; then \
+	  instance_id="$(INSTANCE_ID)"; \
+	  echo "[halt] using INSTANCE_ID=$$instance_id (overrides .last-instance-id)"; \
+	 elif [ -f .last-instance-id ]; then \
+	  instance_id=$$(cat .last-instance-id); \
+	 else \
+	  echo "[halt] no .last-instance-id; pass instance ID via INSTANCE_ID=..."; exit 1; \
+	 fi; \
 	 echo "[halt] destroying instance $$instance_id"; \
 	 ovh-cli cloud project $(OVH_PROJECT_ID) instance delete --instance-id "$$instance_id"; \
-	 rm -f .last-instance-id; \
+	 if [ -z "$(INSTANCE_ID)" ]; then rm -f .last-instance-id; fi; \
 	 echo "[halt] done"
 
 # ----------------------------------------------------------------------

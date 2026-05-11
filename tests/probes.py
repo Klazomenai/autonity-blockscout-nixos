@@ -54,11 +54,20 @@ Env-var contract:
                              indexer trails Autonity slightly under
                              normal operation; demanding equality
                              would flap on every block.
-  PROBE_M3_CATCHUP_TIMEOUT   M3-only. Default 14400 (4 hours).
-                             Outer deadline for `eth_syncing` to
-                             transition to boolean false. MainNet
-                             catch-up on a fresh archive node can
-                             take hours; default is generous.
+  PROBE_M3_TRANSIENT_BUDGET  M3-only. Default 60.
+                             Maximum consecutive `eth_syncing`
+                             transient failures (URLError /
+                             ConnectionError / JSONDecodeError)
+                             before the probe gives up with a
+                             "RPC unreachable" error. Resets on
+                             any successful response. NOT a
+                             catch-up deadline — the locked
+                             contract in `docs/m3-sync-probe.md`
+                             explicitly excludes catch-up
+                             timeouts ("That's an SLO concern,
+                             not a probe concern"). Operators
+                             who want an ops-side deadline wrap
+                             this script with shell `timeout`.
   PROBE_RPC_URL              Default http://127.0.0.1:8545
                              Autonity HTTP JSON-RPC endpoint.
   PROBE_BACKEND_URL          Default http://127.0.0.1:4000
@@ -201,7 +210,7 @@ def _parse_positive_int(name, default):
 PROGRESS_BLOCKS = _parse_positive_int("PROBE_PROGRESS_BLOCKS", 10)
 PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_PROBE_WINDOW_SECONDS", 60)
 BLOCKS_TOLERANCE = _parse_positive_int("PROBE_BLOCKS_TOLERANCE", 5)
-M3_CATCHUP_TIMEOUT = _parse_positive_int("PROBE_M3_CATCHUP_TIMEOUT", 14400)
+M3_TRANSIENT_BUDGET = _parse_positive_int("PROBE_M3_TRANSIENT_BUDGET", 60)
 
 
 # --------------------------------------------------------------------
@@ -635,22 +644,41 @@ def probe_eth_syncing_caught_up():
           sample again, assert delta >= PROGRESS_BLOCKS, then
           continue polling.
 
-    Outer deadline is M3_CATCHUP_TIMEOUT (default 4 h). Real MainNet
-    catch-up on a fresh archive node can take hours; tighter
-    deadlines flake on slow OVH catalogue moments.
+    NO catch-up deadline is enforced — the locked contract in
+    `docs/m3-sync-probe.md` excludes catch-up timeouts as an SLO
+    concern, not a probe concern. The probe will poll indefinitely
+    as long as the chain is making progress. Operators who want an
+    ops-side deadline wrap this script with shell `timeout`.
+
+    A separate `M3_TRANSIENT_BUDGET` bounds consecutive RPC failures
+    (URLError / ConnectionError / JSONDecodeError) so the probe
+    can't loop forever against an unreachable node. The budget
+    resets on any successful eth_syncing response — it tolerates
+    transient hiccups but exits cleanly on a persistent outage.
     """
     log(
         f"M3 probe 2: eth_syncing caught-up "
         f"(progress >= {PROGRESS_BLOCKS} blocks over {PROBE_WINDOW_SECONDS}s window, "
-        f"timeout {M3_CATCHUP_TIMEOUT}s)"
+        f"transient budget {M3_TRANSIENT_BUDGET} consecutive failures)"
     )
-    deadline = time.monotonic() + M3_CATCHUP_TIMEOUT
     progress_checked = False
+    transient_failures = 0
     while True:
         try:
             syncing = rpc_result("eth_syncing")
+            transient_failures = 0  # reset on success
         except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as exc:
-            log(f"  eth_syncing transient: {exc!r}; retrying in 10s")
+            transient_failures += 1
+            if transient_failures >= M3_TRANSIENT_BUDGET:
+                raise AssertionError(
+                    f"eth_syncing unreachable: {transient_failures} consecutive "
+                    f"transient failures (budget {M3_TRANSIENT_BUDGET}). "
+                    f"Last error: {exc!r}"
+                )
+            log(
+                f"  eth_syncing transient {transient_failures}/{M3_TRANSIENT_BUDGET}: "
+                f"{exc!r}; retrying in 10s"
+            )
             time.sleep(10)
             continue
         if syncing is False:
@@ -673,14 +701,15 @@ def probe_eth_syncing_caught_up():
                     f"eth_syncing object missing currentBlock field: {syncing!r}"
                 )
             baseline = int(current, 16) if isinstance(current, str) else int(current)
-            log(f"  catch-up in progress (currentBlock={baseline}); checking progress over {PROBE_WINDOW_SECONDS}s")
+            log(
+                f"  catch-up in progress (currentBlock={baseline}); "
+                f"checking progress over {PROBE_WINDOW_SECONDS}s"
+            )
             time.sleep(PROBE_WINDOW_SECONDS)
             try:
                 syncing2 = rpc_result("eth_syncing")
             except Exception as exc:
-                raise AssertionError(
-                    f"eth_syncing follow-up sample failed: {exc!r}"
-                )
+                raise AssertionError(f"eth_syncing follow-up sample failed: {exc!r}")
             if syncing2 is False:
                 log("  caught up during progress window")
                 return
@@ -700,16 +729,16 @@ def probe_eth_syncing_caught_up():
                     f"chain progress too slow: {delta} blocks over {PROBE_WINDOW_SECONDS}s "
                     f"(required >= {PROGRESS_BLOCKS}); baseline={baseline}, sample={sample2}"
                 )
-            log(f"  progress OK: {delta} blocks over {PROBE_WINDOW_SECONDS}s; continuing to poll for caught-up")
+            log(
+                f"  progress OK: {delta} blocks over {PROBE_WINDOW_SECONDS}s; "
+                f"continuing to poll for caught-up"
+            )
             progress_checked = True
             continue
-        # Progress already verified; just keep polling for the
-        # transition to boolean false.
-        if time.monotonic() > deadline:
-            raise AssertionError(
-                f"eth_syncing did not transition to false within {M3_CATCHUP_TIMEOUT}s "
-                f"(progress verified, but caught-up state never reached)"
-            )
+        # Progress verified; keep polling for transition to boolean
+        # false. Transient-budget logic above also covers this
+        # phase — the RPC must keep answering for the loop to
+        # remain alive.
         time.sleep(10)
 
 
