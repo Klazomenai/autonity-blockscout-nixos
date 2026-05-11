@@ -1,0 +1,272 @@
+# M3 OVH test-bed Makefile — provision → install → deploy → test → halt.
+#
+# Operator brings env vars (see README.md Prerequisites + ./.envrc.example
+# if you adopt direnv). Each recipe validates its required vars at entry.
+#
+# All recipes are designed to run from inside `devenv shell` (or with
+# the equivalent toolchain on PATH: nixos-anywhere, ovh-cli, gcloud,
+# ssh, jq, curl, python3, openssl).
+
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -euo pipefail -c
+.DEFAULT_GOAL := help
+
+# ----------------------------------------------------------------------
+# Defaults — overridable by env or `make VAR=value`.
+# ----------------------------------------------------------------------
+
+OVH_REGION   ?= UK1
+OVH_FLAVOR   ?= b3-8
+OVH_IMAGE    ?= NixOS 25.05
+DOMAIN_TTL   ?= 300
+
+SECRETS_DIR  := $(HOME)/.config/pharos-secrets
+STAGING_DIR  := $(CURDIR)/.staging
+RUNTIME_NIX  := $(CURDIR)/pharos-runtime.nix
+
+# ----------------------------------------------------------------------
+# Required-var guards. Each recipe lists which vars it needs.
+# ----------------------------------------------------------------------
+
+define require_var
+$(if $($(1)),,$(error $(1) is not set; see README.md Prerequisites))
+endef
+
+# ----------------------------------------------------------------------
+# Help
+# ----------------------------------------------------------------------
+
+.PHONY: help
+help:
+	@echo "M3 OVH test-bed recipes"
+	@echo ""
+	@echo "  make provision           Spin up an OVH instance (writes IP=... line + .last-instance-id)"
+	@echo "  make dns-up IP=<ip>      Add A record DOMAIN -> IP via Cloud DNS"
+	@echo "  make install IP=<ip>     nixos-anywhere install with --extra-files staging"
+	@echo "  make deploy IP=<ip>      nixos-rebuild switch --target-host (after install)"
+	@echo "  make test IP=<ip>        Run M3 probe contract via SSH-tunneled ports"
+	@echo "  make logs IP=<ip>        Stream journalctl of the 6 services"
+	@echo "  make snapshot IP=<ip>    (TBD) capture state for forensics"
+	@echo "  make halt                Destroy the instance recorded in .last-instance-id"
+	@echo "  make dns-down            Remove the A record DOMAIN -> *"
+	@echo "  make cruise              Full cycle: provision -> dns-up -> install -> deploy -> test -> halt -> dns-down"
+	@echo ""
+	@echo "Required env vars (subset per recipe):"
+	@echo "  OVH_TOKEN OVH_PROJECT_ID         (provision, halt)"
+	@echo "  GCLOUD_PROJECT DNS_ZONE DOMAIN   (dns-up, dns-down)"
+	@echo "  IP                               (install, deploy, test, logs, snapshot)"
+
+# ----------------------------------------------------------------------
+# pharos-runtime.nix — operator-rendered overlay containing
+# server_name + acme_email. Lives at $(RUNTIME_NIX) (this directory,
+# gitignored). NOT shipped to the host — consumed at Nix evaluation
+# on the operator's machine when building the closure that
+# nixos-anywhere / nixos-rebuild ships to the target. The flake's
+# `nixosConfigurations.ovh-test` conditionally imports it via
+# `lib.optional (builtins.pathExists …)`.
+# ----------------------------------------------------------------------
+
+.PHONY: render-runtime-nix
+render-runtime-nix:
+	@$(call require_var,DOMAIN)
+	@if [ ! -f "$(SECRETS_DIR)/server_name" ]; then \
+	  echo "[render] missing $(SECRETS_DIR)/server_name; see secrets.example.md"; exit 1; fi
+	@if [ ! -f "$(SECRETS_DIR)/acme_email" ]; then \
+	  echo "[render] missing $(SECRETS_DIR)/acme_email; see secrets.example.md"; exit 1; fi
+	@server_name=$$(cat "$(SECRETS_DIR)/server_name"); \
+	 acme_email=$$(cat "$(SECRETS_DIR)/acme_email"); \
+	 if [ "$$server_name" != "$(DOMAIN)" ]; then \
+	   echo "[render] WARNING: server_name ($$server_name) != DOMAIN ($(DOMAIN))"; \
+	   echo "[render]          ACME HTTP-01 will validate against DOMAIN; mismatch breaks issuance."; \
+	 fi; \
+	 printf '{\n  services.blockscout-nginx = {\n    serverName = "%s";\n    acme.email = "%s";\n  };\n}\n' \
+	   "$$server_name" "$$acme_email" > "$(RUNTIME_NIX)"
+	@echo "[render] wrote $(RUNTIME_NIX) (gitignored, consumed at Nix-eval on this machine)"
+
+# ----------------------------------------------------------------------
+# Staging dir for --extra-files. Mirrors the on-host layout exactly
+# (--extra-files copies the path contents to / on the target).
+#
+# Ships the LoadCredential-style secrets (read by services at unit
+# start) + the operator's SSH authorized_keys for root@. Does NOT
+# ship pharos-runtime.nix — that's consumed locally at flake-eval
+# time, not on the target host.
+# ----------------------------------------------------------------------
+
+.PHONY: stage
+stage: render-runtime-nix
+	@for f in secret_key_base database_password root_authorized_keys; do \
+	  if [ ! -f "$(SECRETS_DIR)/$$f" ]; then \
+	    echo "[stage] missing $(SECRETS_DIR)/$$f; see secrets.example.md"; exit 1; fi; \
+	done
+	@rm -rf "$(STAGING_DIR)"
+	@install -d -m 0700 "$(STAGING_DIR)/var/lib/pharos-secrets"
+	@install -m 0600 "$(SECRETS_DIR)/secret_key_base"   "$(STAGING_DIR)/var/lib/pharos-secrets/secret_key_base"
+	@install -m 0600 "$(SECRETS_DIR)/database_password" "$(STAGING_DIR)/var/lib/pharos-secrets/database_password"
+	@install -d -m 0700 "$(STAGING_DIR)/root/.ssh"
+	@install -m 0600 "$(SECRETS_DIR)/root_authorized_keys" "$(STAGING_DIR)/root/.ssh/authorized_keys"
+	@echo "[stage] $(STAGING_DIR) ready ($(shell find $(STAGING_DIR) -type f 2>/dev/null | wc -l) files)"
+
+# ----------------------------------------------------------------------
+# OVH compute lifecycle
+# ----------------------------------------------------------------------
+
+.PHONY: provision
+provision:
+	@$(call require_var,OVH_TOKEN)
+	@$(call require_var,OVH_PROJECT_ID)
+	@name="pharos-test-$$(date -u +%Y%m%d-%H%M%S)"; \
+	 echo "[provision] flavor=$(OVH_FLAVOR) image=$(OVH_IMAGE) region=$(OVH_REGION) name=$$name"; \
+	 response=$$(ovh-cli cloud project $(OVH_PROJECT_ID) instance create \
+	   --flavor "$(OVH_FLAVOR)" --image "$(OVH_IMAGE)" --region "$(OVH_REGION)" \
+	   --name "$$name" --output json); \
+	 instance_id=$$(echo "$$response" | jq -r '.id // empty'); \
+	 if [ -z "$$instance_id" ]; then \
+	   echo "[provision] FAILED to parse instance ID; raw response:"; echo "$$response"; exit 1; fi; \
+	 echo "$$instance_id" > .last-instance-id; \
+	 echo "[provision] waiting for IP (timeout 300s)..."; \
+	 for i in $$(seq 1 60); do \
+	   ip=$$(ovh-cli cloud project $(OVH_PROJECT_ID) instance show --instance-id "$$instance_id" --output json 2>/dev/null \
+	     | jq -r '.ipAddresses[]? | select(.type=="public" and .version==4) | .ip' | head -1); \
+	   if [ -n "$$ip" ] && [ "$$ip" != "null" ]; then \
+	     echo "IP=$$ip"; \
+	     echo "[provision] instance $$instance_id at $$ip"; \
+	     echo "[provision] export IP=$$ip in your shell, then: make dns-up && make install"; \
+	     exit 0; fi; \
+	   sleep 5; \
+	 done; \
+	 echo "[provision] timed out waiting for IP"; exit 1
+
+.PHONY: halt
+halt:
+	@$(call require_var,OVH_TOKEN)
+	@$(call require_var,OVH_PROJECT_ID)
+	@if [ ! -f .last-instance-id ]; then \
+	  echo "[halt] no .last-instance-id; pass instance ID via INSTANCE_ID=... if needed"; exit 1; fi
+	@instance_id=$$(cat .last-instance-id); \
+	 echo "[halt] destroying instance $$instance_id"; \
+	 ovh-cli cloud project $(OVH_PROJECT_ID) instance delete --instance-id "$$instance_id"; \
+	 rm -f .last-instance-id; \
+	 echo "[halt] done"
+
+# ----------------------------------------------------------------------
+# Cloud DNS
+# ----------------------------------------------------------------------
+
+.PHONY: dns-up
+dns-up:
+	@$(call require_var,GCLOUD_PROJECT)
+	@$(call require_var,DNS_ZONE)
+	@$(call require_var,DOMAIN)
+	@$(call require_var,IP)
+	@echo "[dns-up] $(DOMAIN) -> $(IP) (zone $(DNS_ZONE), ttl $(DOMAIN_TTL))"
+	@gcloud auth print-identity-token >/dev/null 2>&1 || { \
+	  echo "[dns-up] gcloud not authenticated; run 'gcloud auth login' or activate a service account"; exit 1; }
+	@gcloud dns record-sets create "$(DOMAIN)." \
+	  --rrdatas="$(IP)" --type=A --ttl=$(DOMAIN_TTL) \
+	  --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)"
+	@echo "[dns-up] propagation poll (5 min cap)..."
+	@for i in $$(seq 1 30); do \
+	  resolved=$$(dig +short "$(DOMAIN)" @8.8.8.8 | head -1); \
+	  if [ "$$resolved" = "$(IP)" ]; then echo "[dns-up] propagated"; exit 0; fi; \
+	  sleep 10; \
+	done; \
+	echo "[dns-up] WARNING: not propagated within 5 min; install may need to retry ACME"
+
+.PHONY: dns-down
+dns-down:
+	@$(call require_var,GCLOUD_PROJECT)
+	@$(call require_var,DNS_ZONE)
+	@$(call require_var,DOMAIN)
+	@echo "[dns-down] removing A record for $(DOMAIN)"
+	@gcloud dns record-sets delete "$(DOMAIN)." --type=A \
+	  --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)" --quiet || \
+	  echo "[dns-down] no record found (already deleted?)"
+
+# ----------------------------------------------------------------------
+# NixOS install + deploy
+# ----------------------------------------------------------------------
+
+.PHONY: install
+install: stage
+	@$(call require_var,IP)
+	@echo "[install] nixos-anywhere $(IP) (flake .#ovh-test, --extra-files $(STAGING_DIR))"
+	@cd ../.. && nixos-anywhere \
+	  --flake '.#ovh-test' \
+	  --extra-files "$(STAGING_DIR)" \
+	  --generate-hardware-config nixos-generate-config \
+	    "$(CURDIR)/hardware-configuration.nix" \
+	  --ssh-option ConnectTimeout=30 \
+	  --ssh-option ServerAliveInterval=30 \
+	  --target-host "root@$(IP)"
+	@echo "[install] done; $(CURDIR)/hardware-configuration.nix written (gitignored)"
+
+.PHONY: deploy
+deploy: render-runtime-nix
+	@$(call require_var,IP)
+	@echo "[deploy] nixos-rebuild switch --flake .#ovh-test --target-host root@$(IP)"
+	@echo "[deploy] (operator's local pharos-runtime.nix baked into the closure on this machine; not shipped separately)"
+	@cd ../.. && nixos-rebuild switch \
+	  --flake '.#ovh-test' \
+	  --target-host "root@$(IP)" \
+	  --use-remote-sudo
+
+# ----------------------------------------------------------------------
+# Probes — M3 contract via SSH tunnels (no public TLS dependency for
+# the probe path; ACME issuance is a separate concern that you verify
+# by `curl -sv https://$DOMAIN/`).
+# ----------------------------------------------------------------------
+
+.PHONY: test
+test:
+	@$(call require_var,IP)
+	@echo "[test] opening SSH tunnels for ports 8545, 4000, 3000"
+	@ssh -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -fN \
+	  -L 8545:127.0.0.1:8545 -L 4000:127.0.0.1:4000 -L 3000:127.0.0.1:3000 \
+	  -M -S /tmp/pharos-test-$(IP).sock "root@$(IP)"
+	@trap 'ssh -S /tmp/pharos-test-$(IP).sock -O exit "root@$(IP)" 2>/dev/null || true' EXIT; \
+	 echo "[test] tunnels up; running probes.py PROBE_MODE=m3"; \
+	 PROBE_MODE=m3 \
+	 PROBE_RPC_URL=http://127.0.0.1:8545 \
+	 PROBE_BACKEND_URL=http://127.0.0.1:4000 \
+	 PROBE_FRONTEND_URL=http://127.0.0.1:3000 \
+	 PROBE_CHAIN_ID=65000000 \
+	 PROBE_PSQL_CMD="ssh -S /tmp/pharos-test-$(IP).sock root@$(IP) runuser -u postgres -- psql -At -d blockscout" \
+	 python3 ../../tests/probes.py; \
+	 rc=$$?; \
+	 ssh -S /tmp/pharos-test-$(IP).sock -O exit "root@$(IP)" 2>/dev/null || true; \
+	 trap - EXIT; \
+	 exit $$rc
+
+.PHONY: logs
+logs:
+	@$(call require_var,IP)
+	@ssh -o ConnectTimeout=30 "root@$(IP)" \
+	  'journalctl -fu autonity blockscout-backend blockscout-frontend blockscout-postgresql blockscout-redis nginx'
+
+.PHONY: snapshot
+snapshot:
+	@$(call require_var,IP)
+	@echo "[snapshot] TBD — implement on the first cruise that surfaces a bug worth forensicating."
+	@echo "[snapshot] For now, capture by hand:"
+	@echo "  ssh root@$(IP) 'free -m && df -h && systemctl --no-pager --failed && journalctl -b --no-pager | tail -200'"
+
+# ----------------------------------------------------------------------
+# Aggregate — full test cruise. Use carefully (paid hardware time).
+# ----------------------------------------------------------------------
+
+.PHONY: cruise
+cruise:
+	@echo "[cruise] WARNING: this provisions a paid OVH instance. Halt is on you."
+	@echo "[cruise] step 1/7: provision"
+	@$(MAKE) provision | tee .cruise.log
+	@ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
+	 if [ -z "$$ip" ]; then echo "[cruise] no IP captured; aborting"; exit 1; fi; \
+	 export IP=$$ip; \
+	 echo "[cruise] step 2/7: dns-up IP=$$ip"; $(MAKE) dns-up IP=$$ip; \
+	 echo "[cruise] step 3/7: install IP=$$ip"; $(MAKE) install IP=$$ip; \
+	 echo "[cruise] step 4/7: deploy IP=$$ip"; $(MAKE) deploy IP=$$ip; \
+	 echo "[cruise] step 5/7: test IP=$$ip"; $(MAKE) test IP=$$ip; \
+	 echo "[cruise] step 6/7: halt"; $(MAKE) halt; \
+	 echo "[cruise] step 7/7: dns-down"; $(MAKE) dns-down; \
+	 echo "[cruise] complete; remember to record discoveries in README.md"

@@ -1,22 +1,64 @@
 """End-to-end probe sequence for the Autonity + Blockscout sync test.
 
-This script is the single source of truth for probe LOGIC across both
+This script is the single source of truth for probe LOGIC across three
 test-running contexts:
 
   - VM (`tests/integration-sync.nix`'s nixosTest testScript invokes it
     via `machine.succeed("python3 /etc/probes.py", environment={...})`
-    after the VM's units are up).
+    after the VM's units are up). PROBE_MODE=dev (default).
   - Host-native (`tests/run-e2e.sh` invokes it after spinning up the
-    5-service stack as background processes).
+    5-service stack as background processes). PROBE_MODE=dev (default).
+  - Real-hardware OVH test-bed (`deployments/ovh-test/Makefile`'s
+    `make test` invokes it over SSH-tunneled ports). PROBE_MODE=m3.
 
-The two contexts differ only in HOW they reach localhost:port (nixosTest
-SSH-into-the-VM-and-curl vs plain curl from the host process). The
-probes themselves use plain `subprocess` + `urllib` and read connection
-details from environment variables, so the same Python file runs
-unmodified in either context.
+The contexts differ in HOW they reach localhost:port and in WHICH probe
+shape is appropriate for the chain under test. In `dev` mode the node IS
+the chain source (single-validator --dev, deterministic 1s blocks, no
+catch-up notion), so the probe asserts on block-count thresholds. In
+`m3` mode the node is catching up with MainNet, so the probe asserts on
+`eth_syncing`'s object→boolean transition plus a minimum block-delta
+over a configurable window. The contract is documented in
+`docs/m3-sync-probe.md`.
+
+The probes themselves use plain `subprocess` + `urllib` and read
+connection details from environment variables, so the same Python file
+runs unmodified in every context.
 
 Env-var contract:
 
+  PROBE_MODE                 Default "dev". One of:
+                               "dev" — single-validator --dev chain;
+                                       probes assert on
+                                       `eth_blockNumber >= BLOCKS_REQUIRED`,
+                                       committee size == 1.
+                               "m3"  — real-MainNet catch-up;
+                                       probes assert on `eth_syncing`
+                                       object→boolean transition +
+                                       minimum block-delta over a
+                                       probe window; committee size
+                                       > 0; psql count within
+                                       tolerance of eth_blockNumber.
+                             The PROBE_MODE=m3 contract is locked in
+                             `docs/m3-sync-probe.md`.
+  PROBE_PROGRESS_BLOCKS      M3-only. Default 10.
+                             Minimum eth_syncing.currentBlock delta
+                             over PROBE_PROBE_WINDOW_SECONDS during
+                             the catch-up phase.
+  PROBE_PROBE_WINDOW_SECONDS M3-only. Default 60.
+                             Sample interval between two
+                             currentBlock readings for the
+                             progress assertion.
+  PROBE_BLOCKS_TOLERANCE     M3-only. Default 5.
+                             Allowed lag between psql block count
+                             and eth_blockNumber. Blockscout's
+                             indexer trails Autonity slightly under
+                             normal operation; demanding equality
+                             would flap on every block.
+  PROBE_M3_CATCHUP_TIMEOUT   M3-only. Default 14400 (4 hours).
+                             Outer deadline for `eth_syncing` to
+                             transition to boolean false. MainNet
+                             catch-up on a fresh archive node can
+                             take hours; default is generous.
   PROBE_RPC_URL              Default http://127.0.0.1:8545
                              Autonity HTTP JSON-RPC endpoint.
   PROBE_BACKEND_URL          Default http://127.0.0.1:4000
@@ -132,6 +174,34 @@ PSQL_CMD = os.environ.get("PROBE_PSQL_CMD")
 if PSQL_CMD is None:
     sys.exit("PROBE_PSQL_CMD env var is required (e.g. 'psql -At -d blockscout')")
 PSQL_ARGV = shlex.split(PSQL_CMD)
+
+# Mode selection — `dev` (single-validator, deterministic) vs `m3`
+# (real MainNet catch-up, eth_syncing-driven). Default `dev` keeps
+# every existing call site (VM testScript + host-native run-e2e.sh)
+# unchanged.
+PROBE_MODE = os.environ.get("PROBE_MODE", "dev")
+if PROBE_MODE not in ("dev", "m3"):
+    sys.exit(f"PROBE_MODE must be 'dev' or 'm3', got: {PROBE_MODE!r}")
+
+
+def _parse_positive_int(name, default):
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"{name} must be a decimal integer, got: {raw!r}")
+    if value <= 0:
+        sys.exit(f"{name} must be positive, got: {value}")
+    return value
+
+
+# M3-only knobs. Parsed unconditionally so misconfiguration surfaces
+# at startup regardless of mode (no surprise failures partway through
+# a probe sequence). Only consumed by the M3 probe variants.
+PROGRESS_BLOCKS = _parse_positive_int("PROBE_PROGRESS_BLOCKS", 10)
+PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_PROBE_WINDOW_SECONDS", 60)
+BLOCKS_TOLERANCE = _parse_positive_int("PROBE_BLOCKS_TOLERANCE", 5)
+M3_CATCHUP_TIMEOUT = _parse_positive_int("PROBE_M3_CATCHUP_TIMEOUT", 14400)
 
 
 # --------------------------------------------------------------------
@@ -531,24 +601,216 @@ def cross_check_backend_unit_env():
 
 
 # --------------------------------------------------------------------
+# M3-mode probe variants (PROBE_MODE=m3)
+#
+# Implement the contract locked in `docs/m3-sync-probe.md`:
+#
+#   - `eth_syncing` returns an object during catch-up
+#     ({startingBlock, currentBlock, highestBlock, ...}) and
+#     transitions to boolean `false` once the head matches the
+#     network. The probe asserts both states.
+#   - During catch-up, two samples of `currentBlock` separated by
+#     PROBE_WINDOW_SECONDS must show >= PROGRESS_BLOCKS delta.
+#   - Committee size > 0 (real MainNet has multiple validators;
+#     the dev-mode size==1 assertion does not apply).
+#   - psql block count within BLOCKS_TOLERANCE of eth_blockNumber
+#     (Blockscout indexer trails Autonity slightly under steady state;
+#     demanding equality would flap on every block).
+#
+# These are separate functions rather than mode-conditional branches
+# inside the existing dev probes, to keep the dev probe call sites
+# (VM testScript + host-native run-e2e.sh) unchanged.
+# --------------------------------------------------------------------
+
+
+def probe_eth_syncing_caught_up():
+    """M3 Probe 2: eth_syncing transitions object → boolean false,
+    with a minimum block-delta over the probe window during catch-up.
+
+    Polls eth_syncing on a 10s cadence until either:
+      (a) Response is boolean `false` — node is caught up; assert
+          done.
+      (b) Response is an object — node is still catching up; record
+          a baseline `currentBlock`, sleep PROBE_WINDOW_SECONDS,
+          sample again, assert delta >= PROGRESS_BLOCKS, then
+          continue polling.
+
+    Outer deadline is M3_CATCHUP_TIMEOUT (default 4 h). Real MainNet
+    catch-up on a fresh archive node can take hours; tighter
+    deadlines flake on slow OVH catalogue moments.
+    """
+    log(
+        f"M3 probe 2: eth_syncing caught-up "
+        f"(progress >= {PROGRESS_BLOCKS} blocks over {PROBE_WINDOW_SECONDS}s window, "
+        f"timeout {M3_CATCHUP_TIMEOUT}s)"
+    )
+    deadline = time.monotonic() + M3_CATCHUP_TIMEOUT
+    progress_checked = False
+    while True:
+        try:
+            syncing = rpc_result("eth_syncing")
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as exc:
+            log(f"  eth_syncing transient: {exc!r}; retrying in 10s")
+            time.sleep(10)
+            continue
+        if syncing is False:
+            log("  eth_syncing == false — node is caught up")
+            return
+        if not isinstance(syncing, dict):
+            raise AssertionError(
+                f"eth_syncing returned unexpected shape: {syncing!r} "
+                f"(expected dict during catch-up or boolean false once caught up)"
+            )
+        # Object response: record baseline, sample again after window,
+        # assert progress. Only run the progress check ONCE per
+        # invocation — repeated checks would multiply the wall-clock
+        # cost without changing the conclusion.
+        if not progress_checked:
+            current_keys = ("currentBlock", "current_block")
+            current = next((syncing[k] for k in current_keys if k in syncing), None)
+            if current is None:
+                raise AssertionError(
+                    f"eth_syncing object missing currentBlock field: {syncing!r}"
+                )
+            baseline = int(current, 16) if isinstance(current, str) else int(current)
+            log(f"  catch-up in progress (currentBlock={baseline}); checking progress over {PROBE_WINDOW_SECONDS}s")
+            time.sleep(PROBE_WINDOW_SECONDS)
+            try:
+                syncing2 = rpc_result("eth_syncing")
+            except Exception as exc:
+                raise AssertionError(
+                    f"eth_syncing follow-up sample failed: {exc!r}"
+                )
+            if syncing2 is False:
+                log("  caught up during progress window")
+                return
+            if not isinstance(syncing2, dict):
+                raise AssertionError(
+                    f"eth_syncing follow-up returned unexpected shape: {syncing2!r}"
+                )
+            current2 = next((syncing2[k] for k in current_keys if k in syncing2), None)
+            if current2 is None:
+                raise AssertionError(
+                    f"eth_syncing follow-up missing currentBlock: {syncing2!r}"
+                )
+            sample2 = int(current2, 16) if isinstance(current2, str) else int(current2)
+            delta = sample2 - baseline
+            if delta < PROGRESS_BLOCKS:
+                raise AssertionError(
+                    f"chain progress too slow: {delta} blocks over {PROBE_WINDOW_SECONDS}s "
+                    f"(required >= {PROGRESS_BLOCKS}); baseline={baseline}, sample={sample2}"
+                )
+            log(f"  progress OK: {delta} blocks over {PROBE_WINDOW_SECONDS}s; continuing to poll for caught-up")
+            progress_checked = True
+            continue
+        # Progress already verified; just keep polling for the
+        # transition to boolean false.
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"eth_syncing did not transition to false within {M3_CATCHUP_TIMEOUT}s "
+                f"(progress verified, but caught-up state never reached)"
+            )
+        time.sleep(10)
+
+
+def probe_tendermint_committee_present():
+    """M3 Probe 3: tendermint_getCommittee at "0x0" — size > 0.
+
+    Real MainNet has a multi-validator committee (dynamic size
+    depending on stake distribution); the dev-mode `size == 1`
+    assertion does not apply. Asserting `size > 0` catches the
+    "committee empty / chain not initialised" failure mode without
+    pinning the exact validator count.
+    """
+    log("M3 probe 3: tendermint_getCommittee at 0x0 — size > 0")
+    committee = rpc_result("tendermint_getCommittee", ["0x0"])
+    if not (isinstance(committee, dict) and "members" in committee):
+        raise AssertionError(
+            f"tendermint_getCommittee response shape unexpected: {committee!r}"
+        )
+    members = committee["members"]
+    if not isinstance(members, list):
+        raise AssertionError(f"committee.members is not a list: {members!r}")
+    if len(members) == 0:
+        raise AssertionError(
+            f"committee.members is empty: {committee!r}"
+        )
+    log(f"  committee size = {len(members)}")
+
+
+def probe_psql_block_count_matches_eth():
+    """M3 Probe 5: psql count(*) FROM blocks within BLOCKS_TOLERANCE of eth_blockNumber.
+
+    Replaces the dev-mode `count >= BLOCKS_REQUIRED` threshold. Under
+    M3 the indexer trails Autonity slightly during steady-state
+    operation (one block period of lag is typical, sometimes more
+    under DB write pressure); BLOCKS_TOLERANCE absorbs that.
+
+    The assertion is `eth_blockNumber - count <= BLOCKS_TOLERANCE`,
+    NOT `abs(diff) <= tolerance` — count > eth_blockNumber would
+    indicate a corrupted index and is itself a failure to surface.
+    """
+    log(
+        f"M3 probe 5: psql count(*) FROM blocks within {BLOCKS_TOLERANCE} of eth_blockNumber"
+    )
+    deadline = time.monotonic() + 600
+    while True:
+        try:
+            head = block_number()
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError):
+            head = None
+        count = block_count_in_db()
+        if head is not None:
+            lag = head - count
+            if 0 <= lag <= BLOCKS_TOLERANCE:
+                log(f"  caught up: head={head}, count={count}, lag={lag}")
+                return
+            if lag < 0:
+                raise AssertionError(
+                    f"psql count > eth_blockNumber (count={count}, head={head}); "
+                    f"index appears corrupted"
+                )
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"indexer did not catch up within tolerance ({BLOCKS_TOLERANCE}) in 600 s: "
+                f"head={head}, count={count}; "
+                f"last psql rc={last_psql['rc']}, output={last_psql['output']!r}"
+            )
+        time.sleep(5)
+
+
+# --------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------
 
 
 def main():
-    probes = [
-        probe_eth_chain_id,
-        probe_eth_block_number_advances,
-        probe_tendermint_committee,
-        probe_tendermint_core_state_advances,
-        probe_psql_block_count,
-        probe_indexing_status,
-        probe_health_endpoint,
-        cross_check_envs_js,
-        cross_check_backend_unit_env,
-    ]
+    if PROBE_MODE == "m3":
+        probes = [
+            probe_eth_chain_id,
+            probe_eth_syncing_caught_up,
+            probe_tendermint_committee_present,
+            probe_tendermint_core_state_advances,
+            probe_psql_block_count_matches_eth,
+            probe_indexing_status,
+            probe_health_endpoint,
+            cross_check_envs_js,
+            cross_check_backend_unit_env,
+        ]
+    else:
+        probes = [
+            probe_eth_chain_id,
+            probe_eth_block_number_advances,
+            probe_tendermint_committee,
+            probe_tendermint_core_state_advances,
+            probe_psql_block_count,
+            probe_indexing_status,
+            probe_health_endpoint,
+            cross_check_envs_js,
+            cross_check_backend_unit_env,
+        ]
     log(
-        f"starting probe sequence: rpc={RPC_URL} backend={BACKEND_URL} "
+        f"starting probe sequence: mode={PROBE_MODE} rpc={RPC_URL} backend={BACKEND_URL} "
         f"frontend={FRONTEND_URL} chain_id={CHAIN_ID} "
         f"blocks_required={BLOCKS_REQUIRED} backend_unit={BACKEND_UNIT or '(unset)'}"
     )

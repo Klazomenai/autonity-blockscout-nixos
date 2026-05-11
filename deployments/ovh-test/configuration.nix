@@ -1,0 +1,211 @@
+# M3 OVH test-bed host configuration.
+#
+# Composes the six service modules from `modules/default.nix` + disko
+# disk layout. Two host-specific files are merged in at the flake
+# level (NOT imported from this file) when they exist on the
+# operator's machine at deploy time:
+#
+#   - `./hardware-configuration.nix` — generated per-instance by
+#     `nixos-anywhere --generate-hardware-config` on first install;
+#     gitignored. Conditionally imported in `flake.nix` via
+#     `lib.optional (builtins.pathExists …)`.
+#
+#   - `./pharos-runtime.nix` — operator-rendered overlay containing
+#     `server_name` + `acme_email`. Rendered by `make` from the
+#     operator's `~/.config/pharos-secrets/{server_name,acme_email}`
+#     files. Gitignored. Conditionally imported in `flake.nix` via
+#     `lib.optional (builtins.pathExists …)` so `nix flake check`
+#     can evaluate without it.
+#
+# ## Runtime-fed values: two mechanisms, by consumer constraint
+#
+# Two of the four operator-specific values can be read at unit start
+# via systemd `LoadCredential`:
+#
+#   - `secret_key_base`  → blockscout-backend at start
+#   - `database_password` → blockscout-postgresql role setup + blockscout-backend DATABASE_URL composition
+#
+# Both modules already wire LoadCredential internally — this file
+# just points `*File` options at `/var/lib/pharos-secrets/<name>`,
+# and `make install` ships those files via `nixos-anywhere
+# --extra-files` so they land at the right host paths before
+# services start.
+#
+# The other two values are consumed at Nix evaluation, not at runtime:
+#
+#   - `server_name` (blockscout-nginx vhost identity + ACME cert SAN)
+#   - `acme_email`  (Let's Encrypt registration contact)
+#
+# nginx renders its vhost config when Nix builds the system closure,
+# so `LoadCredential` doesn't apply — there is no service binary
+# that reads from `$CREDENTIALS_DIRECTORY` and templates the nginx
+# config. Approaches that try to patch the rendered config via
+# `extraConfig` or activation scripts can't change `server_name`
+# itself, because that string IS the vhost identity in NixOS.
+#
+# The workable mechanism: `make` reads the operator's
+# `~/.config/pharos-secrets/{server_name,acme_email}` files and
+# renders them into a local `./pharos-runtime.nix` overlay (in this
+# directory, gitignored). When `nixos-anywhere` / `nixos-rebuild`
+# builds the closure on the operator's machine, that overlay is
+# `import`ed (conditionally, via `flake.nix`), so the operator's
+# values land in the system config baked into the closure that ships
+# to the target. The target host never sees `pharos-runtime.nix`
+# itself — only the values it configured.
+#
+# This is "runtime" in the sense of "passed in at deploy time, not
+# committed to the repo." Rotating `server_name` or `acme_email`
+# requires re-running `make deploy` so the local overlay regenerates
+# and the closure rebuilds.
+#
+# The placeholders below (`deployment.invalid` / `ops@deployment.invalid`)
+# satisfy the `services.blockscout-nginx` option-type regexes so
+# `nix flake check` evaluates cleanly without `pharos-runtime.nix`
+# present. They are `lib.mkDefault` so the operator overlay
+# overrides them without `mkForce`.
+{ config, lib, ... }:
+
+let
+  pharosSecretsDir = "/var/lib/pharos-secrets";
+in
+{
+  imports = [
+    # Service modules — the six wrappers from this flake's modules/
+    # aggregate. Imported at the flake level via the root flake.nix's
+    # `nixosConfigurations.ovh-test` module list, not here, to keep
+    # the `nixpkgs.overlays` wiring co-located with the modules
+    # attribute the flake exposes.
+
+    # Disk layout — disko.nixosModules.disko is imported at the flake
+    # level alongside the service modules. The per-host disk-config
+    # itself is imported here so the deployment owns it.
+    ./disk-config.nix
+
+    # NOTE: `./hardware-configuration.nix` and `./pharos-runtime.nix`
+    # are intentionally NOT imported here. They are conditionally
+    # added by the flake's `nixosConfigurations.ovh-test` modules
+    # list when they exist on disk, so `nix flake check` can evaluate
+    # the deployment in CI without them.
+  ];
+
+  # ----------------------------------------------------------------
+  # Service modules — enable each, point secret-file options at the
+  # /var/lib/pharos-secrets/ paths populated by --extra-files.
+  # ----------------------------------------------------------------
+
+  services.autonity = {
+    enable = true;
+    # `network = "mainnet"` is the module default; declared explicitly
+    # here to make the deployment's intent obvious in the diff. The
+    # chain ID (services.autonity.chainId) defaults to 65000000 via
+    # the enum-driven default chain at modules/autonity.nix.
+    network = "mainnet";
+  };
+
+  services.blockscout-postgresql = {
+    enable = true;
+    passwordFile = "${pharosSecretsDir}/database_password";
+  };
+
+  services.blockscout-redis.enable = true;
+
+  services.blockscout-backend = {
+    enable = true;
+    secretKeyBaseFile = "${pharosSecretsDir}/secret_key_base";
+    databasePasswordFile = "${pharosSecretsDir}/database_password";
+  };
+
+  services.blockscout-frontend.enable = true;
+
+  # blockscout-nginx — serverName + acme.email default to placeholders
+  # that satisfy the module's option-type regexes so `nix flake check`
+  # evaluates cleanly without `./pharos-runtime.nix` present. The
+  # operator's local `pharos-runtime.nix` (rendered by `make` from
+  # `~/.config/pharos-secrets/{server_name,acme_email}`) overrides
+  # these via the flake's conditional import. `acme.useStaging = true`
+  # keeps Let's Encrypt's production rate limit out of the iteration
+  # loop; flip to false only after the staging cert validates cleanly.
+  services.blockscout-nginx = {
+    enable = true;
+    serverName = lib.mkDefault "deployment.invalid";
+    acme = {
+      enable = true;
+      email = lib.mkDefault "ops@deployment.invalid";
+      useStaging = lib.mkDefault true;
+    };
+  };
+
+  # ----------------------------------------------------------------
+  # Networking
+  # ----------------------------------------------------------------
+
+  # DHCP — OVH provisions the IP via the standard cloud-init/DHCP path.
+  networking.useDHCP = lib.mkDefault true;
+
+  # nginx opens 80 + 443 itself when its NixOS module is enabled. We
+  # add 30303 (TCP) here for Autonity's P2P listener; UDP 30303 is
+  # also used for discovery and is opened separately below.
+  networking.firewall.allowedTCPPorts = [ 30303 ];
+  networking.firewall.allowedUDPPorts = [ 30303 ];
+
+  # Generic hostname — the public DNS name lives in the runtime
+  # `server_name` credential, not here. The kernel hostname is
+  # cosmetic for logs / `hostname` shell output.
+  networking.hostName = lib.mkDefault "pharos-test";
+
+  # ----------------------------------------------------------------
+  # SSH
+  # ----------------------------------------------------------------
+
+  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      PermitRootLogin = "prohibit-password";
+    };
+  };
+
+  # Operator's SSH authorized_keys for root — shipped by the Makefile
+  # into `--extra-files`/root/.ssh/authorized_keys at install time
+  # alongside the secrets. After `make install`, `make deploy` uses
+  # `nixos-rebuild switch --target-host root@<ip>` which expects this
+  # key to be in place. Source file lives at
+  # `~/.config/pharos-secrets/root_authorized_keys` on the operator's
+  # workstation.
+
+  # ----------------------------------------------------------------
+  # Boot loader — UEFI grub. OVH Public Cloud B3-class instances
+  # boot in UEFI mode; if a future SKU surfaces as legacy BIOS, the
+  # operator overrides via the host-specific hardware-configuration.
+  # ----------------------------------------------------------------
+
+  boot.loader.grub = {
+    enable = true;
+    device = "nodev";
+    efiSupport = true;
+  };
+  boot.loader.efi.canTouchEfiVariables = true;
+
+  # ----------------------------------------------------------------
+  # System state version — pins the option-default-compatibility
+  # baseline. Matches the version assumed by the integration tests
+  # in tests/integration.nix.
+  # ----------------------------------------------------------------
+  system.stateVersion = "25.05";
+
+  # ----------------------------------------------------------------
+  # Fail-fast guard: every consuming systemd unit asserts the
+  # required secret files exist before starting. Without this, a
+  # missing file surfaces as a service-specific error deep in the
+  # journal; with this, the failure is a clean
+  # `ConditionPathExists=...was not met` line that names the missing
+  # file.
+  # ----------------------------------------------------------------
+  systemd.services.blockscout-backend.unitConfig.ConditionPathExists = [
+    "${pharosSecretsDir}/secret_key_base"
+    "${pharosSecretsDir}/database_password"
+  ];
+  systemd.services.blockscout-postgresql.unitConfig.ConditionPathExists = [
+    "${pharosSecretsDir}/database_password"
+  ];
+}
