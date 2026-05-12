@@ -344,9 +344,9 @@
                                 GCLOUD_PROJECT=fake DNS_ZONE=fake \
                                 DOMAIN=fake IP=1.2.3.4 \
                                 make --no-print-directory -n "$r" 2>&1); then
-                  echo "make -n $r failed (recipe rename or Makefile parse error?):"
-                  echo "$rendered"
-                  echo "---"
+                  printf 'make -n %s failed (recipe rename or Makefile parse error?):\n' "$r"
+                  printf '%s\n' "$rendered"
+                  printf -- '---\n'
                   failed=1
                   continue
                 fi
@@ -354,17 +354,23 @@
                 # other reason (recipe with no commands, comment-only,
                 # etc.), flag it. Every recipe in the check list is
                 # expected to emit at least one shell command.
-                if [ -z "$(echo "$rendered" | tr -d '[:space:]')" ]; then
-                  echo "make -n $r produced empty output; recipe missing or comment-only"
-                  echo "---"
+                #
+                # Use `printf '%s\n'` rather than `echo` to preserve
+                # the rendered script byte-for-byte: echo can treat
+                # leading `-n` as an option and may interpret
+                # backslash escapes depending on shell settings,
+                # mangling the input that gets piped to shellcheck.
+                if [ -z "$(printf '%s' "$rendered" | tr -d '[:space:]')" ]; then
+                  printf 'make -n %s produced empty output; recipe missing or comment-only\n' "$r"
+                  printf -- '---\n'
                   failed=1
                   continue
                 fi
-                output=$(echo "$rendered" | shellcheck -s bash - 2>&1 || true)
+                output=$(printf '%s\n' "$rendered" | shellcheck -s bash - 2>&1 || true)
                 if [ -n "$output" ]; then
-                  echo "shellcheck issue in recipe $r:"
-                  echo "$output"
-                  echo "---"
+                  printf 'shellcheck issue in recipe %s:\n' "$r"
+                  printf '%s\n' "$output"
+                  printf -- '---\n'
                   failed=1
                 fi
               done

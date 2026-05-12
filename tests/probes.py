@@ -748,10 +748,33 @@ def probe_eth_syncing_caught_up():
                 f"checking progress over {PROBE_WINDOW_SECONDS}s"
             )
             time.sleep(PROBE_WINDOW_SECONDS)
-            try:
-                syncing2 = rpc_result("eth_syncing")
-            except Exception as exc:
-                raise AssertionError(f"eth_syncing follow-up sample failed: {exc!r}")
+            # Follow-up sample uses the same transient-retry shape as
+            # the outer loop. A bare `rpc_result()` call here would
+            # treat any URLError / ConnectionError as a hard failure,
+            # making the probe brittle against a single transient
+            # hiccup during the progress window. Retry up to
+            # M3_TRANSIENT_BUDGET times with a 2s back-off; only fail
+            # if the budget is exhausted (matching the outer loop's
+            # "RPC unreachable" semantics).
+            follow_up_failures = 0
+            while True:
+                try:
+                    syncing2 = rpc_result("eth_syncing")
+                    break
+                except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as exc:
+                    follow_up_failures += 1
+                    if follow_up_failures >= M3_TRANSIENT_BUDGET:
+                        raise AssertionError(
+                            f"eth_syncing follow-up sample unreachable: "
+                            f"{follow_up_failures} consecutive transient failures "
+                            f"(budget {M3_TRANSIENT_BUDGET}). Last error: {exc!r}"
+                        )
+                    log(
+                        f"  follow-up transient "
+                        f"{follow_up_failures}/{M3_TRANSIENT_BUDGET}: "
+                        f"{exc!r}; retrying in 2s"
+                    )
+                    time.sleep(2)
             if syncing2 is False:
                 log("  caught up during progress window")
                 return
