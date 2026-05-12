@@ -323,10 +323,14 @@
         # build time; `writeText` of a config-derived string is the
         # idiomatic eval-only equivalent.
         #
-        # Operator-specific files (hardware-configuration.nix,
-        # pharos-runtime.nix) are absent in CI; the deployment's
-        # `lib.mkDefault` placeholders in `configuration.nix` keep
-        # eval green without them.
+        # The deployment's operator-specific values
+        # (PHAROS_SERVER_NAME / PHAROS_ACME_EMAIL /
+        # PHAROS_HARDWARE_CONFIG) are injected at eval time via
+        # `builtins.getEnv` and require `--impure`. In CI's pure
+        # mode `getEnv` returns "" and the deployment falls back
+        # to the `lib.mkDefault` placeholders in
+        # `configuration.nix` — which is exactly what this check
+        # validates evaluates cleanly.
         checks.deployment-eval = pkgs.writeText "deployment-eval-marker" (
           "deployment ovh-test evaluates: "
           + self.nixosConfigurations.ovh-test.config.system.name

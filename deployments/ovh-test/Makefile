@@ -122,8 +122,11 @@ check-runtime-env:
 #
 # Ships the LoadCredential-style secrets (read by services at unit
 # start) + the operator's SSH authorized_keys for root@. Does NOT
-# ship pharos-runtime.nix — that's consumed locally at flake-eval
-# time, not on the target host.
+# ship server_name / acme_email — those are consumed at Nix-eval
+# time on the operator's machine via the flake's
+# `builtins.getEnv` reads of PHAROS_SERVER_NAME / PHAROS_ACME_EMAIL
+# (with `--impure`), so they end up baked into the closure rather
+# than transferred to the target as files.
 # ----------------------------------------------------------------------
 
 .PHONY: stage

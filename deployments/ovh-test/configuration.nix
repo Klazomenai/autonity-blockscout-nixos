@@ -86,11 +86,19 @@ in
     # itself is imported here so the deployment owns it.
     ./disk-config.nix
 
-    # NOTE: `./hardware-configuration.nix` and `./pharos-runtime.nix`
-    # are intentionally NOT imported here. They are conditionally
-    # added by the flake's `nixosConfigurations.ovh-test` modules
-    # list when they exist on disk, so `nix flake check` can evaluate
-    # the deployment in CI without them.
+    # NOTE: `hardware-configuration.nix` is NOT imported here.
+    # The flake's `nixosConfigurations.ovh-test` reads its
+    # absolute path from the `PHAROS_HARDWARE_CONFIG` env var (via
+    # `builtins.getEnv` under `--impure`) and imports it
+    # conditionally when both the path is set and the file
+    # exists. In CI's pure mode, `getEnv` returns "" and the
+    # import is skipped, so `nix flake check` evaluates without
+    # the per-instance hardware probe.
+    #
+    # Operator runtime values (`serverName`, `acme.email`) are
+    # similarly injected by the flake from `PHAROS_SERVER_NAME` /
+    # `PHAROS_ACME_EMAIL` env vars; this file holds only the
+    # fail-closed placeholders for pure-mode eval.
   ];
 
   # ----------------------------------------------------------------
@@ -124,12 +132,15 @@ in
 
   # blockscout-nginx — serverName + acme.email default to placeholders
   # that satisfy the module's option-type regexes so `nix flake check`
-  # evaluates cleanly without `./pharos-runtime.nix` present. The
-  # operator's local `pharos-runtime.nix` (rendered by `make` from
-  # `~/.config/pharos-secrets/{server_name,acme_email}`) overrides
-  # these via the flake's conditional import. `acme.useStaging = true`
-  # keeps Let's Encrypt's production rate limit out of the iteration
-  # loop; flip to false only after the staging cert validates cleanly.
+  # evaluates cleanly in pure mode (where `builtins.getEnv` returns
+  # `""` for the operator's PHAROS_SERVER_NAME / PHAROS_ACME_EMAIL).
+  # Operator-driven invocations pass `--impure` and the flake's
+  # `nixosConfigurations.ovh-test` reads the env vars + applies a
+  # runtime overlay that overrides these via the standard module
+  # merge (no `mkForce` needed because the placeholders are
+  # `mkDefault`). `acme.useStaging = true` keeps Let's Encrypt's
+  # production rate limit out of the iteration loop; flip to false
+  # only after the staging cert validates cleanly.
   services.blockscout-nginx = {
     enable = true;
     serverName = lib.mkDefault "deployment.invalid";

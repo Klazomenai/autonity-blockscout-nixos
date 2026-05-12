@@ -919,17 +919,33 @@ def probe_psql_block_count_matches_eth():
     """
     log(
         f"M3 probe 5: psql count(*) FROM blocks within {BLOCKS_TOLERANCE} of "
-        f"eth_blockNumber (stall timeout {M3_STALL_TIMEOUT}s)"
+        f"eth_blockNumber (stall timeout {M3_STALL_TIMEOUT}s, "
+        f"transient budget {M3_TRANSIENT_BUDGET} consecutive head failures)"
     )
     last_count_advance_value = -1
     last_count_advance_time = time.monotonic()
     last_head_advance_value = -1
     last_head_advance_time = time.monotonic()
+    head_transient_failures = 0
     while True:
         try:
             head = block_number()
-        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError):
+            head_transient_failures = 0  # reset on success
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as exc:
             head = None
+            head_transient_failures += 1
+            # Bound the head-unreachable loop. If the RPC stays down,
+            # the stall detector below would never fire (it gates on
+            # head_advancing, which is False when head is None), so
+            # the probe would loop forever. Mirrors
+            # probe_eth_syncing_caught_up's transient-budget logic.
+            if head_transient_failures >= M3_TRANSIENT_BUDGET:
+                raise AssertionError(
+                    f"eth_blockNumber unreachable: {head_transient_failures} "
+                    f"consecutive transient failures (budget "
+                    f"{M3_TRANSIENT_BUDGET}). Last error: {exc!r}. "
+                    f"Cannot evaluate indexer catch-up without head."
+                )
         count = block_count_in_db()
         if head is not None:
             lag = head - count
@@ -954,7 +970,9 @@ def probe_psql_block_count_matches_eth():
             # in the same window — if the chain itself is stalled,
             # the eth_syncing probe (already ran) would have caught
             # it; here we're guarding against the indexer specifically
-            # falling behind while the chain progresses.
+            # falling behind while the chain progresses. The
+            # head-RPC transient-budget guard above ensures we don't
+            # silently loop on head==None forever.
             count_stalled_for = time.monotonic() - last_count_advance_time
             head_advancing = (
                 last_head_advance_value > 0
