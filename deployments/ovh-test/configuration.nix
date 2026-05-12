@@ -158,9 +158,16 @@ in
   # DHCP — OVH provisions the IP via the standard cloud-init/DHCP path.
   networking.useDHCP = lib.mkDefault true;
 
-  # nginx opens 80 + 443 itself when its NixOS module is enabled. We
-  # add 30303 (TCP) here for Autonity's P2P listener; UDP 30303 is
-  # also used for discovery and is opened separately below.
+  # `services.blockscout-nginx.openFirewall` (default true, per
+  # modules/blockscout-nginx.nix:191-193) adds 80 + 443 to
+  # `networking.firewall.allowedTCPPorts` via mkIf — that's what
+  # opens the public web ports, not upstream `services.nginx` which
+  # never touches the firewall on its own.
+  #
+  # 30303 (TCP) is Autonity's P2P listener; 30303 (UDP) is its
+  # discovery port. Both need explicit firewall holes here because
+  # the autonity module doesn't open them itself (peer-discovery
+  # geometry varies per deployment).
   networking.firewall.allowedTCPPorts = [ 30303 ];
   networking.firewall.allowedUDPPorts = [ 30303 ];
 

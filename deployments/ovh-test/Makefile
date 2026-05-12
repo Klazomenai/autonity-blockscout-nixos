@@ -7,8 +7,18 @@
 # the equivalent toolchain on PATH: nixos-anywhere, ovh-cli, gcloud,
 # ssh, jq, curl, python3, openssl).
 
-SHELL := /usr/bin/env bash
-.SHELLFLAGS := -euo pipefail -c
+# SHELL must be a single executable path per GNU Make. The
+# `/usr/bin/env bash` shorthand looks tempting but Make would try to
+# exec a literal `/usr/bin/env bash` file (with embedded space) and
+# fail at recipe execution time — `make -n` checks miss this
+# because dry-run doesn't invoke SHELL.
+#
+# Standard idiom: SHELL=/usr/bin/env, SHELLFLAGS prepends `bash` so
+# the actual command becomes `/usr/bin/env bash -euo pipefail -c
+# <recipe>` at runtime. `/usr/bin/env` is universally present on
+# Linux including NixOS hosts; bash is on PATH from `devenv shell`.
+SHELL := /usr/bin/env
+.SHELLFLAGS := bash -euo pipefail -c
 .DEFAULT_GOAL := help
 
 # ----------------------------------------------------------------------
