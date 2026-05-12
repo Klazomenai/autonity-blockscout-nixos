@@ -42,9 +42,9 @@ Env-var contract:
                              `docs/m3-sync-probe.md`.
   PROBE_PROGRESS_BLOCKS      M3-only. Default 10.
                              Minimum eth_syncing.currentBlock delta
-                             over PROBE_PROBE_WINDOW_SECONDS during
+                             over PROBE_WINDOW_SECONDS during
                              the catch-up phase.
-  PROBE_PROBE_WINDOW_SECONDS M3-only. Default 60.
+  PROBE_WINDOW_SECONDS M3-only. Default 60.
                              Sample interval between two
                              currentBlock readings for the
                              progress assertion.
@@ -69,7 +69,7 @@ Env-var contract:
                              who want an ops-side deadline wrap
                              this script with shell `timeout`.
   PROBE_M3_STALL_TIMEOUT     M3-only. Default 120 (2x
-                             PROBE_PROBE_WINDOW_SECONDS).
+                             PROBE_WINDOW_SECONDS).
                              Maximum wall-clock seconds without
                              `currentBlock` advancement during
                              post-progress-check polling. Catches
@@ -232,7 +232,7 @@ def _parse_non_negative_int(name, default):
 # at startup regardless of mode (no surprise failures partway through
 # a probe sequence). Only consumed by the M3 probe variants.
 PROGRESS_BLOCKS = _parse_positive_int("PROBE_PROGRESS_BLOCKS", 10)
-PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_PROBE_WINDOW_SECONDS", 60)
+PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_WINDOW_SECONDS", 60)
 # Tolerance allows 0 (strict head==count) for debugging configurations
 # where the indexer is known to be in lockstep with the chain.
 BLOCKS_TOLERANCE = _parse_non_negative_int("PROBE_BLOCKS_TOLERANCE", 5)
@@ -962,28 +962,51 @@ def probe_psql_block_count_matches_eth():
                 last_head_advance_value = head
                 last_head_advance_time = time.monotonic()
         # Track count advancement (indexer side).
-        if count > last_count_advance_value:
+        count_advanced = count > last_count_advance_value
+        if count_advanced:
             last_count_advance_value = count
             last_count_advance_time = time.monotonic()
-        else:
-            # Count hasn't moved. Only fail if head HAS been moving
-            # in the same window — if the chain itself is stalled,
-            # the eth_syncing probe (already ran) would have caught
-            # it; here we're guarding against the indexer specifically
-            # falling behind while the chain progresses. The
-            # head-RPC transient-budget guard above ensures we don't
-            # silently loop on head==None forever.
-            count_stalled_for = time.monotonic() - last_count_advance_time
-            head_advancing = (
-                last_head_advance_value > 0
-                and (time.monotonic() - last_head_advance_time) < M3_STALL_TIMEOUT
-            )
-            if count_stalled_for > M3_STALL_TIMEOUT and head_advancing:
+
+        # Stall detection — two failure modes covered, both gated on
+        # the head having been seen at least once (otherwise the
+        # transient-budget above is the only meaningful guard).
+        if last_head_advance_value > 0:
+            now = time.monotonic()
+            count_stalled_for = now - last_count_advance_time
+            head_stalled_for = now - last_head_advance_time
+
+            # Indexer-only stall: count stuck while head still moving.
+            # Catches the indexer falling behind under DB pressure
+            # while the chain itself is healthy.
+            if (
+                not count_advanced
+                and count_stalled_for > M3_STALL_TIMEOUT
+                and head_stalled_for < M3_STALL_TIMEOUT
+            ):
                 raise AssertionError(
                     f"indexer stalled: psql count={count} unchanged for "
                     f"{count_stalled_for:.0f}s (timeout {M3_STALL_TIMEOUT}s) "
                     f"while chain head advanced to {head}. "
                     f"Last psql rc={last_psql['rc']}, output={last_psql['output']!r}"
+                )
+
+            # Both-stalled: head AND count both stuck. eth_syncing
+            # probe passed earlier (otherwise we wouldn't be in
+            # probe 5), so the chain WAS healthy at some point —
+            # but it has since gone silent. Without this branch the
+            # probe would hang forever when lag > BLOCKS_TOLERANCE
+            # and neither side is moving.
+            if (
+                head_stalled_for > M3_STALL_TIMEOUT
+                and count_stalled_for > M3_STALL_TIMEOUT
+            ):
+                lag_value = (head - count) if head is not None else "unknown"
+                raise AssertionError(
+                    f"chain stalled during indexer catch-up: head={head} "
+                    f"stalled for {head_stalled_for:.0f}s AND count={count} "
+                    f"stalled for {count_stalled_for:.0f}s "
+                    f"(both > {M3_STALL_TIMEOUT}s); lag={lag_value} will not close. "
+                    f"eth_syncing probe passed earlier but the chain has since gone silent."
                 )
         time.sleep(5)
 
