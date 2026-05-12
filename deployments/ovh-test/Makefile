@@ -319,7 +319,7 @@ test:
 logs:
 	@$(call require_var,IP)
 	@ssh $(SSH_TESTBED_OPTS) "root@$(IP)" \
-	  'journalctl -fu autonity blockscout-backend blockscout-frontend blockscout-postgresql blockscout-redis nginx'
+	  'journalctl -fu autonity blockscout-backend blockscout-frontend postgresql postgresql-setup redis-blockscout nginx'
 
 .PHONY: snapshot
 snapshot:

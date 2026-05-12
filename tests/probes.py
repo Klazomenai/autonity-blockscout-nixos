@@ -969,8 +969,14 @@ def probe_psql_block_count_matches_eth():
 
         # Stall detection — two failure modes covered, both gated on
         # the head having been seen at least once (otherwise the
-        # transient-budget above is the only meaningful guard).
-        if last_head_advance_value > 0:
+        # transient-budget above is the only meaningful guard) AND
+        # the current iteration having a fresh head sample. If
+        # `head is None` (transient RPC failure this tick that
+        # didn't yet exhaust M3_TRANSIENT_BUDGET), skip stall
+        # checks: we can't say the chain is stalled without a
+        # current observation. The transient-budget loop will
+        # raise on its own if the RPC outage persists.
+        if last_head_advance_value > 0 and head is not None:
             now = time.monotonic()
             count_stalled_for = now - last_count_advance_time
             head_stalled_for = now - last_head_advance_time

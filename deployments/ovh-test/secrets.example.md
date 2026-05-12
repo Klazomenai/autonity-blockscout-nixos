@@ -64,7 +64,7 @@ The `printf` form (no trailing newline) is the recommended hygiene even though b
 | Missing / malformed | Symptom |
 |---|---|
 | `secret_key_base` missing | `blockscout-backend.service` fails: `ConditionPathExists=/var/lib/pharos-secrets/secret_key_base was not met` |
-| `database_password` missing | Same shape, on `blockscout-postgresql.service` setup OR `blockscout-backend.service` |
+| `database_password` missing | `postgresql-setup.service` fails: `ConditionPathExists=/var/lib/pharos-secrets/database_password was not met`. (The blockscout-postgresql wrapper extends the upstream `postgresql-setup` unit with the role + password injection — there is no `blockscout-postgresql.service`.) Also fails on `blockscout-backend.service` via its own `ConditionPathExists`. |
 | `server_name` missing during `make install` / `make deploy` | `make` aborts before invoking nixos-anywhere with a clear "missing pharos-secrets file" message |
 | `server_name` malformed (not a DNS hostname) | Nix evaluation fails with the `services.blockscout-nginx.serverName` `types.strMatching` regex error |
 | `acme_email` missing during `make install` / `make deploy` | Same shape as `server_name` missing |

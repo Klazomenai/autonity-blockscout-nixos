@@ -230,11 +230,20 @@ in
   # `ConditionPathExists=...was not met` line that names the missing
   # file.
   # ----------------------------------------------------------------
+  # The blockscout-backend module creates `systemd.services.blockscout-backend`
+  # directly, so this attaches cleanly.
   systemd.services.blockscout-backend.unitConfig.ConditionPathExists = [
     "${pharosSecretsDir}/secret_key_base"
     "${pharosSecretsDir}/database_password"
   ];
-  systemd.services.blockscout-postgresql.unitConfig.ConditionPathExists = [
+
+  # The blockscout-postgresql wrapper does NOT create its own unit —
+  # it configures `services.postgresql` (unit: `postgresql.service`)
+  # and extends `systemd.services.postgresql-setup.script` with the
+  # role+password injection. The setup unit is where the
+  # database_password file is consumed; gating its start on the
+  # file's presence is the precondition we want.
+  systemd.services.postgresql-setup.unitConfig.ConditionPathExists = [
     "${pharosSecretsDir}/database_password"
   ];
 }
