@@ -142,8 +142,18 @@
           # `pathExists` further guards against env-var-set-but-file-
           # absent (happens between `make provision` and the first
           # `nixos-anywhere --generate-hardware-config` run).
-          hwOverlay = nixpkgs.lib.optional (hwPath != "" && builtins.pathExists hwPath) (
-            import (/. + hwPath)
+          #
+          # `hwPath` from `getEnv` is a string; `builtins.pathExists`
+          # requires a Nix path value, so convert string→path via
+          # `/. + hwPath` BEFORE the pathExists check. Without the
+          # conversion, evaluation would fail with "value is a
+          # string while a path was expected" the moment
+          # PHAROS_HARDWARE_CONFIG is set under `--impure`. Pure-
+          # mode CI short-circuits on `hwPath != ""` so the bug
+          # was invisible there.
+          hwPathAsPath = /. + hwPath;
+          hwOverlay = nixpkgs.lib.optional (hwPath != "" && builtins.pathExists hwPathAsPath) (
+            import hwPathAsPath
           );
         in
         nixpkgs.lib.nixosSystem {
