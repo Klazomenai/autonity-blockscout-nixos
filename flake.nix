@@ -380,7 +380,7 @@
                 exit 1
               fi
 
-              echo "all $(echo "$recipes" | wc -w) recipes shellcheck-clean"
+              printf 'all %d recipes shellcheck-clean\n' "$(printf '%s\n' "$recipes" | wc -w)"
               touch $out
             '';
       }

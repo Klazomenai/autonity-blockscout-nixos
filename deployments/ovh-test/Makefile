@@ -24,6 +24,32 @@ SECRETS_DIR  := $(HOME)/.config/pharos-secrets
 STAGING_DIR  := $(CURDIR)/.staging
 RUNTIME_NIX  := $(CURDIR)/pharos-runtime.nix
 
+# SSH options for ephemeral test-bed instances. Two of these are
+# intentionally insecure-by-default for permanent production but
+# are the right choice for this paid-test-bed workflow:
+#
+#   StrictHostKeyChecking=no
+#     Accepts the host key on first connect without prompting. The
+#     test-bed automation (make cruise) cannot pause for interactive
+#     confirmation; without this, the first SSH call would hang.
+#
+#   UserKnownHostsFile=/dev/null
+#     Keeps test-bed host keys out of the operator's
+#     ~/.ssh/known_hosts. Instances are throwaway; on IP reuse, a
+#     stale entry from a prior cycle would trigger a "WARNING:
+#     REMOTE HOST IDENTIFICATION HAS CHANGED" abort.
+#
+# The remaining two (ConnectTimeout / ServerAliveInterval) keep
+# the SSH session alive across OVH's "instance up but cloud-init
+# still finishing" window during install.
+#
+# Production deployments (out of scope per #49) would invert the
+# first two: StrictHostKeyChecking=yes with a managed known_hosts.
+SSH_TESTBED_OPTS := -o StrictHostKeyChecking=no \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=30 \
+                    -o ServerAliveInterval=30
+
 # ----------------------------------------------------------------------
 # Required-var guards. Each recipe lists which vars it needs.
 # ----------------------------------------------------------------------
@@ -201,6 +227,8 @@ install: stage
 	  --extra-files "$(STAGING_DIR)" \
 	  --generate-hardware-config nixos-generate-config \
 	    "$(CURDIR)/hardware-configuration.nix" \
+	  --ssh-option StrictHostKeyChecking=no \
+	  --ssh-option UserKnownHostsFile=/dev/null \
 	  --ssh-option ConnectTimeout=30 \
 	  --ssh-option ServerAliveInterval=30 \
 	  --target-host "root@$(IP)"
@@ -211,7 +239,7 @@ deploy: render-runtime-nix
 	@$(call require_var,IP)
 	@echo "[deploy] nixos-rebuild switch --flake .#ovh-test --target-host root@$(IP)"
 	@echo "[deploy] (operator's local pharos-runtime.nix baked into the closure on this machine; not shipped separately)"
-	@cd ../.. && nixos-rebuild switch \
+	@cd ../.. && NIX_SSHOPTS="$(SSH_TESTBED_OPTS)" nixos-rebuild switch \
 	  --flake '.#ovh-test' \
 	  --target-host "root@$(IP)" \
 	  --use-remote-sudo
@@ -226,7 +254,7 @@ deploy: render-runtime-nix
 test:
 	@$(call require_var,IP)
 	@echo "[test] opening SSH tunnels for ports 8545, 4000, 3000"
-	@ssh -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -fN \
+	@ssh $(SSH_TESTBED_OPTS) -o ExitOnForwardFailure=yes -fN \
 	  -L 8545:127.0.0.1:8545 -L 4000:127.0.0.1:4000 -L 3000:127.0.0.1:3000 \
 	  -M -S /tmp/pharos-test-$(IP).sock "root@$(IP)"
 	@trap 'ssh -S /tmp/pharos-test-$(IP).sock -O exit "root@$(IP)" 2>/dev/null || true' EXIT; \
@@ -246,7 +274,7 @@ test:
 .PHONY: logs
 logs:
 	@$(call require_var,IP)
-	@ssh -o ConnectTimeout=30 "root@$(IP)" \
+	@ssh $(SSH_TESTBED_OPTS) "root@$(IP)" \
 	  'journalctl -fu autonity blockscout-backend blockscout-frontend blockscout-postgresql blockscout-redis nginx'
 
 .PHONY: snapshot

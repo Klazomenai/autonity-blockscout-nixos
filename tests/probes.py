@@ -215,14 +215,37 @@ def _parse_positive_int(name, default):
     return value
 
 
+def _parse_non_negative_int(name, default):
+    """Like _parse_positive_int but accepts 0. Used for tolerance-style
+    knobs where 0 is a valid (strict-equality) configuration."""
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"{name} must be a decimal integer, got: {raw!r}")
+    if value < 0:
+        sys.exit(f"{name} must be non-negative, got: {value}")
+    return value
+
+
 # M3-only knobs. Parsed unconditionally so misconfiguration surfaces
 # at startup regardless of mode (no surprise failures partway through
 # a probe sequence). Only consumed by the M3 probe variants.
 PROGRESS_BLOCKS = _parse_positive_int("PROBE_PROGRESS_BLOCKS", 10)
 PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_PROBE_WINDOW_SECONDS", 60)
-BLOCKS_TOLERANCE = _parse_positive_int("PROBE_BLOCKS_TOLERANCE", 5)
+# Tolerance allows 0 (strict head==count) for debugging configurations
+# where the indexer is known to be in lockstep with the chain.
+BLOCKS_TOLERANCE = _parse_non_negative_int("PROBE_BLOCKS_TOLERANCE", 5)
 M3_TRANSIENT_BUDGET = _parse_positive_int("PROBE_M3_TRANSIENT_BUDGET", 60)
 M3_STALL_TIMEOUT = _parse_positive_int("PROBE_M3_STALL_TIMEOUT", 2 * PROBE_WINDOW_SECONDS)
+
+# Window over which `probe_tendermint_core_state_advances` samples
+# the tendermint height. Dev mode uses a tight 5s window (1 block/s
+# nominal cadence; 5s comfortably exceeds the noise floor). M3 mode
+# uses the full probe window (60s default) per the locked contract
+# in docs/m3-sync-probe.md — real MainNet block cadence is slower
+# and more variable than dev's deterministic ticks.
+CORE_STATE_WINDOW = PROBE_WINDOW_SECONDS if PROBE_MODE == "m3" else 5
 
 
 # --------------------------------------------------------------------
@@ -458,21 +481,34 @@ def probe_tendermint_committee():
 
 
 def probe_tendermint_core_state_advances():
-    """Probe 4: tendermint_getCoreState — height advances over 5 s.
+    """Probe 4: tendermint_getCoreState — height advances over the
+    configured window.
 
     Defends against the failure mode where the chain passed the
     threshold but then stalled (consensus livelock, scheduler
-    starvation under TCG, etc.).
+    starvation under TCG, etc.). The sample window is mode-aware:
+
+      - dev (M2.5): 5 s — block cadence is deterministic 1 block/s,
+        any longer wastes wall-clock.
+      - m3: PROBE_WINDOW_SECONDS (default 60 s) — real MainNet block
+        production is slower and more variable; 60 s gives the chain
+        time to produce a few blocks even under network hiccups,
+        matching the locked contract in docs/m3-sync-probe.md.
+
+    Window comes from the module-level CORE_STATE_WINDOW constant
+    (set at startup from PROBE_MODE).
     """
-    log("probe 4: tendermint_getCoreState — height advances over 5 s")
+    log(
+        f"probe 4: tendermint_getCoreState — height advances over {CORE_STATE_WINDOW} s"
+    )
     state_before = rpc_result("tendermint_getCoreState")
     height_before = core_height(state_before)
-    time.sleep(5)
+    time.sleep(CORE_STATE_WINDOW)
     state_after = rpc_result("tendermint_getCoreState")
     height_after = core_height(state_after)
     if height_after <= height_before:
         raise AssertionError(
-            "tendermint_getCoreState height did not advance over 5 s: "
+            f"tendermint_getCoreState height did not advance over {CORE_STATE_WINDOW} s: "
             f"before={height_before} after={height_after}"
         )
     log(f"  height advanced {height_before} -> {height_after}")
