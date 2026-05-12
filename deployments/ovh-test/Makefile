@@ -49,7 +49,7 @@ help:
 	@echo "  make snapshot IP=<ip>    (TBD) capture state for forensics"
 	@echo "  make halt                Destroy the instance recorded in .last-instance-id"
 	@echo "  make dns-down            Remove the A record DOMAIN -> *"
-	@echo "  make cruise              Full cycle: provision -> dns-up -> install -> deploy -> test -> halt -> dns-down"
+	@echo "  make cruise              Full cycle: provision -> dns-up -> install -> test -> halt -> dns-down (deploy omitted; redundant after fresh install)"
 	@echo ""
 	@echo "Required env vars (subset per recipe):"
 	@echo "  OVH_TOKEN OVH_PROJECT_ID         (provision, halt)"

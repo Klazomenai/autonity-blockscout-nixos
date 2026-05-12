@@ -159,6 +159,12 @@ in
 
   services.openssh = {
     enable = true;
+    # Without this, port 22 isn't added to networking.firewall —
+    # `services.openssh.enable` and the firewall are independent
+    # toggles in nixpkgs. Every deploy / test / logs / halt step
+    # reaches the host over SSH, so a closed port 22 would brick
+    # the deployment after `make install` returns.
+    openFirewall = true;
     settings = {
       PasswordAuthentication = false;
       PermitRootLogin = "prohibit-password";

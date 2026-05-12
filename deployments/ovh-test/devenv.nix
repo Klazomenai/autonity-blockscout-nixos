@@ -34,6 +34,11 @@
     # calling nixos-anywhere.
     curl
 
+    # `dig` for the dns-up propagation poll loop. nixpkgs ships dig
+    # as part of `bind` (the dnsutils suite); split out so the
+    # closure doesn't drag in the full bind server binaries.
+    bind.dnsutils
+
     # Local secret-file generation.
     openssl
 

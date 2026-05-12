@@ -783,20 +783,25 @@ def probe_eth_syncing_caught_up():
         # because a stuck consensus / scheduler starvation /
         # disk-full can leave eth_syncing returning the same
         # object forever.
+        #
+        # Missing currentBlock is treated as "no advancement
+        # observed" — falls through to the stall check rather than
+        # bypassing it. Without this fall-through, a malformed
+        # object response forever would loop indefinitely (the
+        # transient-failures counter is only reset on successful
+        # rpc_result, which this code path already passed).
         cb = _current_block(syncing)
-        if cb is None:
-            # Object response without a currentBlock field is
-            # unusual but not necessarily fatal — treat as
-            # transient and let the budget/stall combo decide.
-            log(f"  eth_syncing object missing currentBlock: {syncing!r}")
-        elif cb > last_advance_block:
+        if cb is not None and cb > last_advance_block:
             last_advance_block = cb
             last_advance_time = time.monotonic()
         else:
+            if cb is None:
+                log(f"  eth_syncing object missing currentBlock: {syncing!r}")
             stalled_for = time.monotonic() - last_advance_time
             if stalled_for > M3_STALL_TIMEOUT:
                 raise AssertionError(
-                    f"chain stalled: currentBlock={cb} unchanged for "
+                    f"chain stalled: currentBlock="
+                    f"{cb if cb is not None else 'missing'} unchanged for "
                     f"{stalled_for:.0f}s (timeout {M3_STALL_TIMEOUT}s). "
                     f"RPC remains responsive but no block production observed."
                 )

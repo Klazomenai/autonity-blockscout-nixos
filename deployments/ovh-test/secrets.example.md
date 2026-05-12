@@ -30,8 +30,11 @@ Run these once (per fresh operator workstation) and re-run only when rotating va
 mkdir -p ~/.config/pharos-secrets
 chmod 0700 ~/.config/pharos-secrets
 
-# Phoenix cookie signing key — 64 bytes base64
-openssl rand -base64 48 > ~/.config/pharos-secrets/secret_key_base
+# Phoenix secret_key_base — 64 bytes of randomness per the
+# blockscout-backend module's stated expectation. The base64
+# encoding produces ~88 ASCII characters; what Phoenix consumes
+# is the random bytes, not the encoded length.
+openssl rand -base64 64 > ~/.config/pharos-secrets/secret_key_base
 chmod 0600 ~/.config/pharos-secrets/secret_key_base
 
 # Postgres role password — 32 bytes base64
