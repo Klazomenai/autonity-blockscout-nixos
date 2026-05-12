@@ -1,21 +1,19 @@
 # M3 OVH test-bed host configuration.
 #
 # Composes the six service modules from `modules/default.nix` + disko
-# disk layout. Two host-specific files are merged in at the flake
-# level (NOT imported from this file) when they exist on the
-# operator's machine at deploy time:
+# disk layout. Host-specific overlays are merged in at the flake
+# level (NOT imported from this file) via `builtins.getEnv` reads
+# requiring `--impure`:
 #
-#   - `./hardware-configuration.nix` — generated per-instance by
+#   - `hardware-configuration.nix` — generated per-instance by
 #     `nixos-anywhere --generate-hardware-config` on first install;
-#     gitignored. Conditionally imported in `flake.nix` via
-#     `lib.optional (builtins.pathExists …)`.
+#     gitignored. Absolute path read from `PHAROS_HARDWARE_CONFIG`
+#     env var; imported by `flake.nix` when set + the file exists.
 #
-#   - `./pharos-runtime.nix` — operator-rendered overlay containing
-#     `server_name` + `acme_email`. Rendered by `make` from the
-#     operator's `~/.config/pharos-secrets/{server_name,acme_email}`
-#     files. Gitignored. Conditionally imported in `flake.nix` via
-#     `lib.optional (builtins.pathExists …)` so `nix flake check`
-#     can evaluate without it.
+#   - `serverName` + `acme.email` overlay — read from
+#     `PHAROS_SERVER_NAME` + `PHAROS_ACME_EMAIL` env vars, populated
+#     by `make` from the operator's `~/.config/pharos-secrets/`
+#     files. Applied by `flake.nix` when both are set.
 #
 # ## Runtime-fed values: two mechanisms, by consumer constraint
 #
@@ -45,24 +43,31 @@
 #
 # The workable mechanism: `make` reads the operator's
 # `~/.config/pharos-secrets/{server_name,acme_email}` files and
-# renders them into a local `./pharos-runtime.nix` overlay (in this
-# directory, gitignored). When `nixos-anywhere` / `nixos-rebuild`
-# builds the closure on the operator's machine, that overlay is
-# `import`ed (conditionally, via `flake.nix`), so the operator's
-# values land in the system config baked into the closure that ships
-# to the target. The target host never sees `pharos-runtime.nix`
-# itself — only the values it configured.
+# exports them as `PHAROS_SERVER_NAME` / `PHAROS_ACME_EMAIL` env
+# vars before invoking `nixos-anywhere` / `nixos-rebuild` with the
+# `--impure` flag. The flake's `nixosConfigurations.ovh-test` reads
+# them via `builtins.getEnv` at evaluation time. Because the closure
+# is built on the operator's machine before being shipped to the
+# target, the operator's values land in the system config baked
+# into the closure that gets installed. The target host never sees
+# the env vars directly — only what nginx config rendering encodes.
+#
+# An earlier draft tried a gitignored `pharos-runtime.nix` imported
+# via `builtins.pathExists`, but Nix's flake source-tree is
+# VCS-filtered — gitignored files are excluded from the store copy
+# `pathExists` queries, so the overlay never applied. `--impure` +
+# `getEnv` sidesteps the source-filter entirely.
 #
 # This is "runtime" in the sense of "passed in at deploy time, not
 # committed to the repo." Rotating `server_name` or `acme_email`
-# requires re-running `make deploy` so the local overlay regenerates
-# and the closure rebuilds.
+# requires re-running `make deploy` so the env vars re-export and
+# the closure rebuilds.
 #
 # The placeholders below (`deployment.invalid` / `ops@deployment.invalid`)
 # satisfy the `services.blockscout-nginx` option-type regexes so
-# `nix flake check` evaluates cleanly without `pharos-runtime.nix`
-# present. They are `lib.mkDefault` so the operator overlay
-# overrides them without `mkForce`.
+# `nix flake check` (which runs in pure mode where `getEnv`
+# returns `""`) evaluates cleanly. They are `lib.mkDefault` so the
+# operator overlay overrides them without `mkForce`.
 { config, lib, ... }:
 
 let

@@ -68,18 +68,19 @@ export IP=51.222.333.444
 # 3. Add the DNS A record for $DOMAIN -> $IP. Polls until propagated.
 make dns-up
 
-# 4. Install NixOS via nixos-anywhere. Renders pharos-runtime.nix
-#    locally and imports it via the flake (the closure built on
-#    YOUR machine carries the operator's serverName + acme_email);
-#    ships secret_key_base + database_password + authorized_keys
-#    via --extra-files. Runs ~10-15 min on a fresh OVH B3 (kexec
+# 4. Install NixOS via nixos-anywhere with --impure. The flake
+#    reads PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL via getEnv (the
+#    Makefile exports them from ~/.config/pharos-secrets/), bakes
+#    them into the closure built on YOUR machine, and ships
+#    secret_key_base + database_password + authorized_keys via
+#    --extra-files. Runs ~10-15 min on a fresh OVH B3 (kexec
 #    + NixOS install + first activation).
 make install
 
 # 5. (Optional, for code-change iteration) Re-deploy without
-#    reinstalling. Re-renders pharos-runtime.nix locally, rebuilds
-#    the closure on your machine, ships it via
-#    `nixos-rebuild switch --target-host`.
+#    reinstalling. Re-reads env vars, rebuilds the closure on your
+#    machine, ships it via `nixos-rebuild switch --impure
+#    --target-host`.
 make deploy
 
 # 6. Run the M3 probe contract via SSH-tunneled ports. Exits 0 on
@@ -187,11 +188,13 @@ The deployment is fully reproducible from a public flake. Operator-specific valu
 ### Two runtime-fed mechanisms, by consumer constraint
 
 - **systemd `LoadCredential`** for values read at unit start on the host (`secret_key_base`, `database_password`). Files ship via `nixos-anywhere --extra-files` to `/var/lib/pharos-secrets/<name>` on the target.
-- **Nix-eval-time overlay** on the **operator's machine** for values consumed when Nix builds the system closure (`server_name`, `acme_email`). `make` renders them into local `./pharos-runtime.nix` (this directory, gitignored), and the flake's `nixosConfigurations.ovh-test` conditionally imports that file via `lib.optional (builtins.pathExists …)`. Because `nixos-anywhere` / `nixos-rebuild` builds the closure locally before shipping it to the target, the operator's values land in the closure that gets installed. The target host never sees `pharos-runtime.nix` itself — only the values it configured.
+- **`--impure` + `builtins.getEnv` at Nix evaluation** on the **operator's machine** for values consumed when Nix builds the system closure (`server_name`, `acme_email`, the absolute path to `hardware-configuration.nix`). `make` exports `PHAROS_SERVER_NAME` / `PHAROS_ACME_EMAIL` / `PHAROS_HARDWARE_CONFIG` from `~/.config/pharos-secrets/` + the per-cycle hardware probe, and passes `--impure` to `nixos-anywhere` / `nixos-rebuild`. The flake's `nixosConfigurations.ovh-test` reads them via `builtins.getEnv` at eval time. Because the closure is built on the operator's machine before being shipped to the target, the operator's values land in the closure that gets installed.
 
 The split exists because nginx renders its vhost config at Nix evaluation, not at unit start — so `server_name` can't be read from a credential file at runtime. See the head comment in [`configuration.nix`](configuration.nix) for the full rationale.
 
-`nix flake check` evaluates the deployment without the operator's `pharos-runtime.nix` present, falling back to the `lib.mkDefault` placeholders in `configuration.nix` (`deployment.invalid` / `ops@deployment.invalid`) which satisfy the option-type regexes.
+`nix flake check` runs in pure mode (no `--impure`), so `builtins.getEnv` returns `""` and the deployment falls back to the `lib.mkDefault` placeholders in `configuration.nix` (`deployment.invalid` / `ops@deployment.invalid`) which satisfy the option-type regexes. This keeps the public flake pure while letting operator-customised builds inject the values cleanly.
+
+An earlier draft used a gitignored `pharos-runtime.nix` file imported via `builtins.pathExists`, but Nix's flake source-tree is VCS-filtered — gitignored files are excluded from the store copy, so `pathExists` always returned false. The current `--impure` + `getEnv` approach sidesteps the source-filter entirely.
 
 ### Probes hit loopback via SSH tunnels
 

@@ -22,7 +22,19 @@ DOMAIN_TTL   ?= 300
 
 SECRETS_DIR  := $(HOME)/.config/pharos-secrets
 STAGING_DIR  := $(CURDIR)/.staging
-RUNTIME_NIX  := $(CURDIR)/pharos-runtime.nix
+HARDWARE_CFG := $(CURDIR)/hardware-configuration.nix
+
+# Env-var injection for flake-eval-time operator values. The flake's
+# nixosConfigurations.ovh-test reads PHAROS_SERVER_NAME +
+# PHAROS_ACME_EMAIL + PHAROS_HARDWARE_CONFIG via builtins.getEnv,
+# requiring `--impure` for non-empty values. This sidesteps Nix's
+# VCS-filtered source tree (which excludes gitignored operator-local
+# files). $$(cat …) is evaluated at recipe-run time, not Make-parse
+# time, so the secret files only need to exist when the recipe runs.
+RUNTIME_ENV = \
+  PHAROS_SERVER_NAME="$$(cat "$(SECRETS_DIR)/server_name")" \
+  PHAROS_ACME_EMAIL="$$(cat "$(SECRETS_DIR)/acme_email")" \
+  PHAROS_HARDWARE_CONFIG="$(HARDWARE_CFG)"
 
 # SSH options for ephemeral test-bed instances. Two of these are
 # intentionally insecure-by-default for permanent production but
@@ -83,31 +95,26 @@ help:
 	@echo "  IP                               (install, deploy, test, logs, snapshot)"
 
 # ----------------------------------------------------------------------
-# pharos-runtime.nix — operator-rendered overlay containing
-# server_name + acme_email. Lives at $(RUNTIME_NIX) (this directory,
-# gitignored). NOT shipped to the host — consumed at Nix evaluation
-# on the operator's machine when building the closure that
-# nixos-anywhere / nixos-rebuild ships to the target. The flake's
-# `nixosConfigurations.ovh-test` conditionally imports it via
-# `lib.optional (builtins.pathExists …)`.
+# check-runtime-env — verify the operator-local files that drive the
+# flake's getEnv-based runtime overlay are present. Called before
+# install / deploy so a missing file fails fast with a clear message
+# instead of yielding an empty PHAROS_* value that silently falls
+# through to the placeholders.
 # ----------------------------------------------------------------------
 
-.PHONY: render-runtime-nix
-render-runtime-nix:
+.PHONY: check-runtime-env
+check-runtime-env:
 	@$(call require_var,DOMAIN)
 	@if [ ! -f "$(SECRETS_DIR)/server_name" ]; then \
-	  echo "[render] missing $(SECRETS_DIR)/server_name; see secrets.example.md"; exit 1; fi
+	  echo "[runtime] missing $(SECRETS_DIR)/server_name; see secrets.example.md"; exit 1; fi
 	@if [ ! -f "$(SECRETS_DIR)/acme_email" ]; then \
-	  echo "[render] missing $(SECRETS_DIR)/acme_email; see secrets.example.md"; exit 1; fi
+	  echo "[runtime] missing $(SECRETS_DIR)/acme_email; see secrets.example.md"; exit 1; fi
 	@server_name=$$(cat "$(SECRETS_DIR)/server_name"); \
-	 acme_email=$$(cat "$(SECRETS_DIR)/acme_email"); \
 	 if [ "$$server_name" != "$(DOMAIN)" ]; then \
-	   echo "[render] WARNING: server_name ($$server_name) != DOMAIN ($(DOMAIN))"; \
-	   echo "[render]          ACME HTTP-01 will validate against DOMAIN; mismatch breaks issuance."; \
-	 fi; \
-	 printf '{\n  services.blockscout-nginx = {\n    serverName = "%s";\n    acme.email = "%s";\n  };\n}\n' \
-	   "$$server_name" "$$acme_email" > "$(RUNTIME_NIX)"
-	@echo "[render] wrote $(RUNTIME_NIX) (gitignored, consumed at Nix-eval on this machine)"
+	   echo "[runtime] WARNING: server_name ($$server_name) != DOMAIN ($(DOMAIN))"; \
+	   echo "[runtime]          ACME HTTP-01 will validate against DOMAIN; mismatch breaks issuance."; \
+	 fi
+	@echo "[runtime] env-var sources OK; flake will read PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL via --impure"
 
 # ----------------------------------------------------------------------
 # Staging dir for --extra-files. Mirrors the on-host layout exactly
@@ -120,7 +127,7 @@ render-runtime-nix:
 # ----------------------------------------------------------------------
 
 .PHONY: stage
-stage: render-runtime-nix
+stage: check-runtime-env
 	@for f in secret_key_base database_password root_authorized_keys; do \
 	  if [ ! -f "$(SECRETS_DIR)/$$f" ]; then \
 	    echo "[stage] missing $(SECRETS_DIR)/$$f; see secrets.example.md"; exit 1; fi; \
@@ -210,9 +217,21 @@ dns-down:
 	@$(call require_var,DNS_ZONE)
 	@$(call require_var,DOMAIN)
 	@echo "[dns-down] removing A record for $(DOMAIN)"
-	@gcloud dns record-sets delete "$(DOMAIN)." --type=A \
-	  --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)" --quiet || \
-	  echo "[dns-down] no record found (already deleted?)"
+	@output=$$(gcloud dns record-sets delete "$(DOMAIN)." --type=A \
+	    --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)" --quiet 2>&1); \
+	 rc=$$?; \
+	 if [ $$rc -eq 0 ]; then \
+	   echo "[dns-down] deleted"; \
+	   exit 0; \
+	 fi; \
+	 if echo "$$output" | grep -qiE 'NOT_FOUND|notFound|was not found'; then \
+	   echo "[dns-down] no record found (already deleted)"; \
+	   exit 0; \
+	 fi; \
+	 echo "[dns-down] gcloud failed (rc=$$rc):"; \
+	 echo "$$output"; \
+	 echo "[dns-down] NOT swallowed — auth / network / permission failures must surface"; \
+	 exit $$rc
 
 # ----------------------------------------------------------------------
 # NixOS install + deploy
@@ -221,26 +240,29 @@ dns-down:
 .PHONY: install
 install: stage
 	@$(call require_var,IP)
-	@echo "[install] nixos-anywhere $(IP) (flake .#ovh-test, --extra-files $(STAGING_DIR))"
-	@cd ../.. && nixos-anywhere \
+	@echo "[install] nixos-anywhere $(IP) (flake .#ovh-test --impure, --extra-files $(STAGING_DIR))"
+	@cd ../.. && $(RUNTIME_ENV) nixos-anywhere \
 	  --flake '.#ovh-test' \
 	  --extra-files "$(STAGING_DIR)" \
 	  --generate-hardware-config nixos-generate-config \
-	    "$(CURDIR)/hardware-configuration.nix" \
+	    "$(HARDWARE_CFG)" \
+	  --build-on-remote false \
+	  --extra-build-args --impure \
 	  --ssh-option StrictHostKeyChecking=no \
 	  --ssh-option UserKnownHostsFile=/dev/null \
 	  --ssh-option ConnectTimeout=30 \
 	  --ssh-option ServerAliveInterval=30 \
 	  --target-host "root@$(IP)"
-	@echo "[install] done; $(CURDIR)/hardware-configuration.nix written (gitignored)"
+	@echo "[install] done; $(HARDWARE_CFG) written (gitignored)"
 
 .PHONY: deploy
-deploy: render-runtime-nix
+deploy: check-runtime-env
 	@$(call require_var,IP)
-	@echo "[deploy] nixos-rebuild switch --flake .#ovh-test --target-host root@$(IP)"
-	@echo "[deploy] (operator's local pharos-runtime.nix baked into the closure on this machine; not shipped separately)"
-	@cd ../.. && NIX_SSHOPTS="$(SSH_TESTBED_OPTS)" nixos-rebuild switch \
+	@echo "[deploy] nixos-rebuild switch --flake .#ovh-test --impure --target-host root@$(IP)"
+	@echo "[deploy] (operator runtime values baked into the closure via PHAROS_* env vars; not shipped separately)"
+	@cd ../.. && $(RUNTIME_ENV) NIX_SSHOPTS="$(SSH_TESTBED_OPTS)" nixos-rebuild switch \
 	  --flake '.#ovh-test' \
+	  --impure \
 	  --target-host "root@$(IP)" \
 	  --use-remote-sudo
 

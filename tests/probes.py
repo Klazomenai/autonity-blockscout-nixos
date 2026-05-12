@@ -903,11 +903,28 @@ def probe_psql_block_count_matches_eth():
     The assertion is `eth_blockNumber - count <= BLOCKS_TOLERANCE`,
     NOT `abs(diff) <= tolerance` — count > eth_blockNumber would
     indicate a corrupted index and is itself a failure to surface.
+
+    NO wall-clock catch-up deadline (mirrors probe_eth_syncing_caught_up
+    per the locked contract in docs/m3-sync-probe.md — catch-up
+    deadlines are SLO concerns, not probe concerns). Operators
+    wanting an ops-side deadline wrap the script with shell
+    `timeout`.
+
+    Stall detection: tracks the highest psql block count observed.
+    If the count fails to advance for M3_STALL_TIMEOUT seconds
+    while the chain head IS advancing, the indexer has stalled and
+    the probe exits with a clear error. Catches indexer-stuck-mid-
+    catch-up — the symmetric failure mode that probe_eth_syncing's
+    stall detector catches on the chain side.
     """
     log(
-        f"M3 probe 5: psql count(*) FROM blocks within {BLOCKS_TOLERANCE} of eth_blockNumber"
+        f"M3 probe 5: psql count(*) FROM blocks within {BLOCKS_TOLERANCE} of "
+        f"eth_blockNumber (stall timeout {M3_STALL_TIMEOUT}s)"
     )
-    deadline = time.monotonic() + 600
+    last_count_advance_value = -1
+    last_count_advance_time = time.monotonic()
+    last_head_advance_value = -1
+    last_head_advance_time = time.monotonic()
     while True:
         try:
             head = block_number()
@@ -924,12 +941,32 @@ def probe_psql_block_count_matches_eth():
                     f"psql count > eth_blockNumber (count={count}, head={head}); "
                     f"index appears corrupted"
                 )
-        if time.monotonic() > deadline:
-            raise AssertionError(
-                f"indexer did not catch up within tolerance ({BLOCKS_TOLERANCE}) in 600 s: "
-                f"head={head}, count={count}; "
-                f"last psql rc={last_psql['rc']}, output={last_psql['output']!r}"
+            # Track head advancement (chain side).
+            if head > last_head_advance_value:
+                last_head_advance_value = head
+                last_head_advance_time = time.monotonic()
+        # Track count advancement (indexer side).
+        if count > last_count_advance_value:
+            last_count_advance_value = count
+            last_count_advance_time = time.monotonic()
+        else:
+            # Count hasn't moved. Only fail if head HAS been moving
+            # in the same window — if the chain itself is stalled,
+            # the eth_syncing probe (already ran) would have caught
+            # it; here we're guarding against the indexer specifically
+            # falling behind while the chain progresses.
+            count_stalled_for = time.monotonic() - last_count_advance_time
+            head_advancing = (
+                last_head_advance_value > 0
+                and (time.monotonic() - last_head_advance_time) < M3_STALL_TIMEOUT
             )
+            if count_stalled_for > M3_STALL_TIMEOUT and head_advancing:
+                raise AssertionError(
+                    f"indexer stalled: psql count={count} unchanged for "
+                    f"{count_stalled_for:.0f}s (timeout {M3_STALL_TIMEOUT}s) "
+                    f"while chain head advanced to {head}. "
+                    f"Last psql rc={last_psql['rc']}, output={last_psql['output']!r}"
+                )
         time.sleep(5)
 
 
