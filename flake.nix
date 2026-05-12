@@ -357,9 +357,11 @@
         # output under `make -n` contains submake-failure chatter
         # that confuses shellcheck (SC2317 / SC2035 cascades). The
         # subtargets it invokes (`provision`, `dns-up`, `install`,
-        # `deploy`, `test`, `halt`, `dns-down`) are each checked
-        # individually below; the orchestrator's quoting is checked
-        # by inspection during PR review.
+        # `test`, `halt`, `dns-down` — `deploy` is omitted from
+        # cruise because it's redundant immediately after a fresh
+        # `install`) are each checked individually below; the
+        # orchestrator's quoting is checked by inspection during
+        # PR review.
         checks.makefile-shellcheck =
           pkgs.runCommand "check-makefile-shellcheck"
             {
