@@ -18,10 +18,11 @@
 
     # SSH for nixos-rebuild --target-host (closure copies host→host
     # over SSH), journalctl streaming, port forwarding for the
-    # probe step. NOT used to ship pharos-runtime.nix — that file
-    # is operator-local and consumed at Nix-eval time on the
-    # operator's machine; the closure is built locally and pushed
-    # to the target via the standard nixos-rebuild mechanism.
+    # probe step. server_name / acme_email are injected at
+    # Nix-eval time via `--impure` + PHAROS_* env vars (see
+    # configuration.nix head comment) — the closure built locally
+    # carries them, so SSH doesn't ship any operator-runtime
+    # values as separate files.
     openssh
 
     # Probe runner — tests/probes.py is plain stdlib.

@@ -36,29 +36,37 @@ RUNTIME_ENV = \
   PHAROS_ACME_EMAIL="$$(cat "$(SECRETS_DIR)/acme_email")" \
   PHAROS_HARDWARE_CONFIG="$(HARDWARE_CFG)"
 
-# SSH options for ephemeral test-bed instances. Two of these are
-# intentionally insecure-by-default for permanent production but
-# are the right choice for this paid-test-bed workflow:
+# SSH options for ephemeral test-bed instances. The pair below is
+# the trade-off between non-interactive automation and MITM
+# resistance:
 #
-#   StrictHostKeyChecking=no
-#     Accepts the host key on first connect without prompting. The
-#     test-bed automation (make cruise) cannot pause for interactive
-#     confirmation; without this, the first SSH call would hang.
+#   StrictHostKeyChecking=accept-new
+#     First contact with a fresh OVH instance accepts its host key
+#     without prompting (automation can't pause). Subsequent
+#     connects within the same cycle VERIFY against the stored
+#     key — if the key changes mid-cycle (e.g. someone MitM'd the
+#     instance), SSH aborts rather than silently accepting the
+#     new key. Far better than StrictHostKeyChecking=no which
+#     accepts ANY key on every connect.
 #
-#   UserKnownHostsFile=/dev/null
-#     Keeps test-bed host keys out of the operator's
-#     ~/.ssh/known_hosts. Instances are throwaway; on IP reuse, a
-#     stale entry from a prior cycle would trigger a "WARNING:
-#     REMOTE HOST IDENTIFICATION HAS CHANGED" abort.
+#   UserKnownHostsFile=$(CURDIR)/.known_hosts
+#     Per-deployment known_hosts file scoped to this directory
+#     (gitignored). Keeps test-bed host keys out of the operator's
+#     ~/.ssh/known_hosts. `make halt` removes this file so the
+#     next cycle's `make install` starts fresh — avoids the
+#     "instance IP reused with new key" abort that would otherwise
+#     occur cross-cycle.
 #
 # The remaining two (ConnectTimeout / ServerAliveInterval) keep
 # the SSH session alive across OVH's "instance up but cloud-init
 # still finishing" window during install.
 #
-# Production deployments (out of scope per #49) would invert the
-# first two: StrictHostKeyChecking=yes with a managed known_hosts.
-SSH_TESTBED_OPTS := -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
+# Production deployments (out of scope per #49) would invert to
+# `StrictHostKeyChecking=yes` against a managed known_hosts file
+# populated out-of-band, eliminating the first-contact TOFU
+# window entirely.
+SSH_TESTBED_OPTS := -o StrictHostKeyChecking=accept-new \
+                    -o UserKnownHostsFile=$(CURDIR)/.known_hosts \
                     -o ConnectTimeout=30 \
                     -o ServerAliveInterval=30
 
@@ -188,7 +196,8 @@ halt:
 	 echo "[halt] destroying instance $$instance_id"; \
 	 ovh-cli cloud project $(OVH_PROJECT_ID) instance delete --instance-id "$$instance_id"; \
 	 if [ -z "$(INSTANCE_ID)" ]; then rm -f .last-instance-id; fi; \
-	 echo "[halt] done"
+	 rm -f .known_hosts; \
+	 echo "[halt] done (cleared .known_hosts so next cycle starts fresh)"
 
 # ----------------------------------------------------------------------
 # Cloud DNS
@@ -251,8 +260,8 @@ install: stage
 	    "$(HARDWARE_CFG)" \
 	  --build-on-remote false \
 	  --extra-build-args --impure \
-	  --ssh-option StrictHostKeyChecking=no \
-	  --ssh-option UserKnownHostsFile=/dev/null \
+	  --ssh-option StrictHostKeyChecking=accept-new \
+	  --ssh-option UserKnownHostsFile=$(CURDIR)/.known_hosts \
 	  --ssh-option ConnectTimeout=30 \
 	  --ssh-option ServerAliveInterval=30 \
 	  --target-host "root@$(IP)"
@@ -305,7 +314,7 @@ logs:
 .PHONY: snapshot
 snapshot:
 	@$(call require_var,IP)
-	@echo "[snapshot] TBD — implement on the first cruise that surfaces a bug worth forensicating."
+	@echo "[snapshot] TBD — implement on the first cruise that surfaces a bug worth investigating."
 	@echo "[snapshot] For now, capture by hand:"
 	@echo "  ssh root@$(IP) 'free -m && df -h && systemctl --no-pager --failed && journalctl -b --no-pager | tail -200'"
 

@@ -6,8 +6,10 @@ hardware-configuration.nix
 # Local staging directory for `--extra-files`. The Makefile builds
 # this from ~/.config/pharos-secrets/ (secret_key_base,
 # database_password, root_authorized_keys); do not commit.
-# Note: pharos-runtime.nix is NOT staged here — it's an
-# operator-local Nix-eval-time overlay, see below.
+# Note: server_name / acme_email are NOT staged here — they're
+# injected at Nix-eval time on the operator's machine via
+# `--impure` + PHAROS_SERVER_NAME / PHAROS_ACME_EMAIL env vars,
+# baked into the closure rather than transferred as files.
 .staging/
 
 # Last-provisioned instance ID, written by `make provision` so
@@ -23,6 +25,14 @@ hardware-configuration.nix
 # Operators distil rows into the README's Discovered Specs section
 # by hand; raw captures stay local.
 captures/
+
+# Per-deployment SSH known_hosts. The Makefile uses
+# `StrictHostKeyChecking=accept-new` against this file so first
+# contact with a fresh OVH instance picks up its host key cleanly,
+# but subsequent connects in the same cycle verify against it
+# (catches mid-cycle key changes). `make halt` clears it so the
+# next cycle's `make install` starts from a fresh first-contact.
+.known_hosts
 
 # Nix build outputs.
 result
