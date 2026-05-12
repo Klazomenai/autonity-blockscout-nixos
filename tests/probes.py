@@ -68,6 +68,17 @@ Env-var contract:
                              not a probe concern"). Operators
                              who want an ops-side deadline wrap
                              this script with shell `timeout`.
+  PROBE_M3_STALL_TIMEOUT     M3-only. Default 120 (2x
+                             PROBE_PROBE_WINDOW_SECONDS).
+                             Maximum wall-clock seconds without
+                             `currentBlock` advancement during
+                             post-progress-check polling. Catches
+                             the failure mode where RPC stays
+                             responsive but the chain stops
+                             producing blocks. NOT a catch-up
+                             deadline — it asserts liveness
+                             (block production), not a target
+                             completion time.
   PROBE_RPC_URL              Default http://127.0.0.1:8545
                              Autonity HTTP JSON-RPC endpoint.
   PROBE_BACKEND_URL          Default http://127.0.0.1:4000
@@ -211,6 +222,7 @@ PROGRESS_BLOCKS = _parse_positive_int("PROBE_PROGRESS_BLOCKS", 10)
 PROBE_WINDOW_SECONDS = _parse_positive_int("PROBE_PROBE_WINDOW_SECONDS", 60)
 BLOCKS_TOLERANCE = _parse_positive_int("PROBE_BLOCKS_TOLERANCE", 5)
 M3_TRANSIENT_BUDGET = _parse_positive_int("PROBE_M3_TRANSIENT_BUDGET", 60)
+M3_STALL_TIMEOUT = _parse_positive_int("PROBE_M3_STALL_TIMEOUT", 2 * PROBE_WINDOW_SECONDS)
 
 
 # --------------------------------------------------------------------
@@ -632,9 +644,29 @@ def cross_check_backend_unit_env():
 # --------------------------------------------------------------------
 
 
+def _current_block(syncing):
+    """Extract the currentBlock value from an eth_syncing object response.
+
+    Tolerates both `currentBlock` (the canonical key) and
+    `current_block` (defensive: in case a future Autonity release
+    re-tags JSON fields). Returns the value as an int; treats both
+    hex strings (`"0x123"`) and integers as valid inputs.
+
+    Returns None if neither key is present — the caller decides how
+    to react (raise AssertionError or treat as transient).
+    """
+    for key in ("currentBlock", "current_block"):
+        if key in syncing:
+            v = syncing[key]
+            return int(v, 16) if isinstance(v, str) else int(v)
+    return None
+
+
 def probe_eth_syncing_caught_up():
     """M3 Probe 2: eth_syncing transitions object → boolean false,
-    with a minimum block-delta over the probe window during catch-up.
+    with a minimum block-delta over the probe window during catch-up
+    AND continuous liveness (no stall) during post-verification
+    polling.
 
     Polls eth_syncing on a 10s cadence until either:
       (a) Response is boolean `false` — node is caught up; assert
@@ -642,7 +674,7 @@ def probe_eth_syncing_caught_up():
       (b) Response is an object — node is still catching up; record
           a baseline `currentBlock`, sleep PROBE_WINDOW_SECONDS,
           sample again, assert delta >= PROGRESS_BLOCKS, then
-          continue polling.
+          continue polling with stall detection (see below).
 
     NO catch-up deadline is enforced — the locked contract in
     `docs/m3-sync-probe.md` excludes catch-up timeouts as an SLO
@@ -650,19 +682,31 @@ def probe_eth_syncing_caught_up():
     as long as the chain is making progress. Operators who want an
     ops-side deadline wrap this script with shell `timeout`.
 
-    A separate `M3_TRANSIENT_BUDGET` bounds consecutive RPC failures
-    (URLError / ConnectionError / JSONDecodeError) so the probe
-    can't loop forever against an unreachable node. The budget
-    resets on any successful eth_syncing response — it tolerates
-    transient hiccups but exits cleanly on a persistent outage.
+    `M3_TRANSIENT_BUDGET` bounds consecutive RPC failures so the
+    probe can't loop forever against an unreachable node. The
+    budget resets on any successful eth_syncing response — it
+    tolerates transient hiccups but exits cleanly on persistent
+    outage.
+
+    `M3_STALL_TIMEOUT` bounds the post-progress-check polling phase
+    against the failure mode where RPC stays responsive but the
+    chain stops producing blocks (currentBlock unchanged forever
+    while `eth_syncing` keeps returning an object). The tracker
+    advances on every observed `currentBlock` increase; if no
+    increase is seen within STALL_TIMEOUT seconds, the probe exits
+    with a chain-stall AssertionError. NOT a catch-up deadline —
+    asserts liveness (block production), not target completion.
     """
     log(
         f"M3 probe 2: eth_syncing caught-up "
         f"(progress >= {PROGRESS_BLOCKS} blocks over {PROBE_WINDOW_SECONDS}s window, "
-        f"transient budget {M3_TRANSIENT_BUDGET} consecutive failures)"
+        f"transient budget {M3_TRANSIENT_BUDGET} consecutive failures, "
+        f"stall timeout {M3_STALL_TIMEOUT}s)"
     )
     progress_checked = False
     transient_failures = 0
+    last_advance_block = None
+    last_advance_time = None
     while True:
         try:
             syncing = rpc_result("eth_syncing")
@@ -691,16 +735,14 @@ def probe_eth_syncing_caught_up():
             )
         # Object response: record baseline, sample again after window,
         # assert progress. Only run the progress check ONCE per
-        # invocation — repeated checks would multiply the wall-clock
-        # cost without changing the conclusion.
+        # invocation — subsequent polling uses the continuous
+        # stall-detection logic below.
         if not progress_checked:
-            current_keys = ("currentBlock", "current_block")
-            current = next((syncing[k] for k in current_keys if k in syncing), None)
-            if current is None:
+            baseline = _current_block(syncing)
+            if baseline is None:
                 raise AssertionError(
                     f"eth_syncing object missing currentBlock field: {syncing!r}"
                 )
-            baseline = int(current, 16) if isinstance(current, str) else int(current)
             log(
                 f"  catch-up in progress (currentBlock={baseline}); "
                 f"checking progress over {PROBE_WINDOW_SECONDS}s"
@@ -717,12 +759,11 @@ def probe_eth_syncing_caught_up():
                 raise AssertionError(
                     f"eth_syncing follow-up returned unexpected shape: {syncing2!r}"
                 )
-            current2 = next((syncing2[k] for k in current_keys if k in syncing2), None)
-            if current2 is None:
+            sample2 = _current_block(syncing2)
+            if sample2 is None:
                 raise AssertionError(
                     f"eth_syncing follow-up missing currentBlock: {syncing2!r}"
                 )
-            sample2 = int(current2, 16) if isinstance(current2, str) else int(current2)
             delta = sample2 - baseline
             if delta < PROGRESS_BLOCKS:
                 raise AssertionError(
@@ -731,14 +772,34 @@ def probe_eth_syncing_caught_up():
                 )
             log(
                 f"  progress OK: {delta} blocks over {PROBE_WINDOW_SECONDS}s; "
-                f"continuing to poll for caught-up"
+                f"continuing to poll for caught-up with stall detection"
             )
             progress_checked = True
+            last_advance_block = sample2
+            last_advance_time = time.monotonic()
             continue
-        # Progress verified; keep polling for transition to boolean
-        # false. Transient-budget logic above also covers this
-        # phase — the RPC must keep answering for the loop to
-        # remain alive.
+        # Post-progress polling: continuous stall detection. The
+        # chain must keep advancing — RPC alone isn't enough,
+        # because a stuck consensus / scheduler starvation /
+        # disk-full can leave eth_syncing returning the same
+        # object forever.
+        cb = _current_block(syncing)
+        if cb is None:
+            # Object response without a currentBlock field is
+            # unusual but not necessarily fatal — treat as
+            # transient and let the budget/stall combo decide.
+            log(f"  eth_syncing object missing currentBlock: {syncing!r}")
+        elif cb > last_advance_block:
+            last_advance_block = cb
+            last_advance_time = time.monotonic()
+        else:
+            stalled_for = time.monotonic() - last_advance_time
+            if stalled_for > M3_STALL_TIMEOUT:
+                raise AssertionError(
+                    f"chain stalled: currentBlock={cb} unchanged for "
+                    f"{stalled_for:.0f}s (timeout {M3_STALL_TIMEOUT}s). "
+                    f"RPC remains responsive but no block production observed."
+                )
         time.sleep(10)
 
 

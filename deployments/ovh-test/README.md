@@ -68,15 +68,18 @@ export IP=51.222.333.444
 # 3. Add the DNS A record for $DOMAIN -> $IP. Polls until propagated.
 make dns-up
 
-# 4. Install NixOS via nixos-anywhere. Generates pharos-runtime.nix
-#    locally from your secrets, stages all credentials at .staging/,
-#    ships everything via --extra-files. Runs ~10-15 min on a fresh
-#    OVH B3 (kexec + NixOS install + first activation).
+# 4. Install NixOS via nixos-anywhere. Renders pharos-runtime.nix
+#    locally and imports it via the flake (the closure built on
+#    YOUR machine carries the operator's serverName + acme_email);
+#    ships secret_key_base + database_password + authorized_keys
+#    via --extra-files. Runs ~10-15 min on a fresh OVH B3 (kexec
+#    + NixOS install + first activation).
 make install
 
 # 5. (Optional, for code-change iteration) Re-deploy without
-#    reinstalling. Re-renders pharos-runtime.nix locally, scp's it
-#    to the host, runs `nixos-rebuild switch --target-host`.
+#    reinstalling. Re-renders pharos-runtime.nix locally, rebuilds
+#    the closure on your machine, ships it via
+#    `nixos-rebuild switch --target-host`.
 make deploy
 
 # 6. Run the M3 probe contract via SSH-tunneled ports. Exits 0 on
@@ -89,7 +92,7 @@ make halt
 make dns-down
 ```
 
-`make cruise` chains 1–7 (skipping 5, since deploy isn't needed on a fresh install). Use sparingly — every cruise burns hardware-time euros.
+`make cruise` chains the 6 non-iteration steps (provision → dns-up → install → test → halt → dns-down), skipping step 5 (`deploy`) because it's redundant immediately after a fresh `install` — the closure is already on the host. Use sparingly — every cruise burns hardware-time euros.
 
 ---
 

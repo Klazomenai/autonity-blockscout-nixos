@@ -1,7 +1,7 @@
 # M3 OVH test-bed Makefile — provision → install → deploy → test → halt.
 #
-# Operator brings env vars (see README.md Prerequisites + ./.envrc.example
-# if you adopt direnv). Each recipe validates its required vars at entry.
+# Operator brings env vars (see README.md Prerequisites). Each recipe
+# validates its required vars at entry.
 #
 # All recipes are designed to run from inside `devenv shell` (or with
 # the equivalent toolchain on PATH: nixos-anywhere, ovh-cli, gcloud,
@@ -105,7 +105,7 @@ stage: render-runtime-nix
 	@install -m 0600 "$(SECRETS_DIR)/database_password" "$(STAGING_DIR)/var/lib/pharos-secrets/database_password"
 	@install -d -m 0700 "$(STAGING_DIR)/root/.ssh"
 	@install -m 0600 "$(SECRETS_DIR)/root_authorized_keys" "$(STAGING_DIR)/root/.ssh/authorized_keys"
-	@echo "[stage] $(STAGING_DIR) ready ($(shell find $(STAGING_DIR) -type f 2>/dev/null | wc -l) files)"
+	@echo "[stage] $(STAGING_DIR) ready ($$(find "$(STAGING_DIR)" -type f 2>/dev/null | wc -l) files)"
 
 # ----------------------------------------------------------------------
 # OVH compute lifecycle
@@ -263,15 +263,16 @@ snapshot:
 .PHONY: cruise
 cruise:
 	@echo "[cruise] WARNING: this provisions a paid OVH instance. Halt is on you."
-	@echo "[cruise] step 1/7: provision"
+	@echo "[cruise] step 1/6: provision"
 	@$(MAKE) provision | tee .cruise.log
 	@ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
 	 if [ -z "$$ip" ]; then echo "[cruise] no IP captured; aborting"; exit 1; fi; \
 	 export IP="$$ip"; \
-	 echo "[cruise] step 2/7: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
-	 echo "[cruise] step 3/7: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
-	 echo "[cruise] step 4/7: deploy IP=$$ip"; $(MAKE) deploy IP="$$ip"; \
-	 echo "[cruise] step 5/7: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
-	 echo "[cruise] step 6/7: halt"; $(MAKE) halt; \
-	 echo "[cruise] step 7/7: dns-down"; $(MAKE) dns-down; \
+	 echo "[cruise] step 2/6: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
+	 echo "[cruise] step 3/6: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
+	 echo "[cruise] step 4/6: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
+	 echo "[cruise] step 5/6: halt"; $(MAKE) halt; \
+	 echo "[cruise] step 6/6: dns-down"; $(MAKE) dns-down; \
 	 echo "[cruise] complete; remember to record discoveries in README.md"
+	@echo "[cruise] note: 'make deploy' is omitted from cruise — redundant after a fresh install."
+	@echo "[cruise]       Use 'make deploy IP=<ip>' explicitly when iterating on code without reprovisioning."
