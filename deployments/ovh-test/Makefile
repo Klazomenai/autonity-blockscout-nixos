@@ -338,33 +338,43 @@ snapshot:
 
 .PHONY: cruise
 cruise:
-	@echo "[cruise] WARNING: this provisions a paid OVH instance."
-	@echo "[cruise] step 1/6: provision"
-	@$(MAKE) provision | tee .cruise.log
-	@ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
-	 if [ -z "$$ip" ]; then echo "[cruise] no IP captured; aborting"; exit 1; fi; \
-	 export IP="$$ip"; \
-	 cleanup() { \
+	@cleanup() { \
 	   rc=$$?; \
 	   set +e; \
 	   echo "[cruise] cleanup (exit=$$rc): tearing down to release paid hardware"; \
-	   $(MAKE) halt IP="$$ip" || echo "[cruise]   halt failed — VERIFY OVH CONSOLE for $$ip"; \
-	   $(MAKE) dns-down       || echo "[cruise]   dns-down failed — VERIFY Cloud DNS CONSOLE for $(DOMAIN)"; \
+	   $(MAKE) halt    || echo "[cruise]   halt failed — VERIFY OVH CONSOLE for instance in .last-instance-id"; \
+	   $(MAKE) dns-down || echo "[cruise]   dns-down failed — VERIFY Cloud DNS CONSOLE for $(DOMAIN)"; \
 	   exit $$rc; \
 	 }; \
 	 trap cleanup EXIT; \
+	 echo "[cruise] WARNING: this provisions a paid OVH instance."; \
+	 echo "[cruise] step 1/6: provision"; \
+	 $(MAKE) provision | tee .cruise.log; \
+	 ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
+	 if [ -z "$$ip" ]; then \
+	   echo "[cruise] no IP captured — cleanup trap will still halt via .last-instance-id"; \
+	   exit 1; \
+	 fi; \
+	 export IP="$$ip"; \
 	 echo "[cruise] step 2/6: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
 	 echo "[cruise] step 3/6: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
 	 echo "[cruise] step 4/6: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
 	 echo "[cruise] cruise body complete; trap will halt + dns-down on EXIT (steps 5/6 + 6/6)"
 	@echo "[cruise] note: 'make deploy' is omitted from cruise — redundant after a fresh install."
 	@echo "[cruise]       Use 'make deploy IP=<ip>' explicitly when iterating on code without reprovisioning."
-	@# Cleanup contract: the trap above runs `halt` + `dns-down`
-	@# on EXIT regardless of why the recipe is leaving (success,
-	@# bash -e on a failing sub-make, or Ctrl-C). Without it, a
-	@# failure in dns-up / install / test would leave the paid
-	@# OVH instance running indefinitely. halt and dns-down
-	@# failures inside cleanup fall through to a loud
-	@# manual-cleanup warning rather than masking the original
-	@# error; the exit code propagates so `make cruise` returns
-	@# non-zero when anything along the way failed.
+	@# Cleanup contract:
+	@#   - trap installed BEFORE `make provision` so that any
+	@#     instance created via provision (which writes
+	@#     .last-instance-id before returning IP) is cleaned up
+	@#     even if provision itself fails partway through (e.g.
+	@#     IP-timeout after instance creation).
+	@#   - halt uses .last-instance-id as its source of truth
+	@#     (no IP needed) — so the cleanup works whether or not
+	@#     we made it past provision's IP-parse step.
+	@#   - dns-down handles "record not found" benignly, so
+	@#     calling it even when dns-up never ran is safe.
+	@#   - halt and dns-down failures inside cleanup fall through
+	@#     to loud manual-cleanup warnings rather than masking
+	@#     the original error; the exit code propagates so
+	@#     `make cruise` returns non-zero when anything along
+	@#     the way failed.
