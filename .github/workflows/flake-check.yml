@@ -49,3 +49,16 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@v13
       - name: nix flake check
         run: nix flake check --print-build-logs
+
+      # Env-var contract check exercises the PHAROS_* runtimeOverlay
+      # path that `nix flake check` (pure-mode) deliberately skips.
+      # Test values satisfy the option-type regexes for serverName
+      # (RFC 1035 DNS label) and acme.email; they never reach a real
+      # ACME / nginx runtime — the check is eval-time only.
+      - name: nix build .#checks.x86_64-linux.env-var-contract (impure)
+        env:
+          PHAROS_SERVER_NAME: test.example.org
+          PHAROS_ACME_EMAIL: ops@test.example.org
+        run: |
+          nix build --impure --print-build-logs \
+            .#checks.x86_64-linux.env-var-contract

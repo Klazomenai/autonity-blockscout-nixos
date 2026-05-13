@@ -349,6 +349,109 @@
           + ")"
         );
 
+        # Env-var contract check for `nixosConfigurations.ovh-test`.
+        # Verifies that PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL flow
+        # through `--impure` + `builtins.getEnv` to the consuming
+        # `services.blockscout-nginx.{serverName,acme.email}` options.
+        #
+        # Failure mode this catches: if a future refactor mistyped
+        # one of the env-var names in `nixosConfigurations.ovh-test`
+        # (e.g. `PHAROS_SERVERNAME` vs `PHAROS_SERVER_NAME`), or if
+        # the runtimeOverlay's gate condition drifted, the placeholders
+        # in `deployments/ovh-test/configuration.nix` would silently
+        # apply and ACME issuance would fail mid-cruise — after the
+        # OVH instance was provisioned and DNS was set up. Asymmetric:
+        # silent-pass at eval time, loud-fail at runtime against paid
+        # hardware. This check converts the silent-pass to a build-
+        # time error.
+        #
+        # Evaluation behaviour:
+        #
+        #   - Pure mode (default `nix flake check`, no env vars set):
+        #     emits a `skipped` sentinel explaining how to exercise
+        #     the check. The skip is intentional — without `--impure`
+        #     and env vars, there's nothing to verify against.
+        #
+        #   - Impure mode, both env vars set: asserts exact-string
+        #     match between PHAROS_* values and the resolved option
+        #     values. Mismatch throws with a diagnostic naming both
+        #     expected and actual (catches placeholder leak-through
+        #     when `--impure` was forgotten on the wrapping invocation).
+        #
+        #   - Impure mode, only one env var set: throws with a
+        #     pointer to the runtimeOverlay's gate (which requires
+        #     BOTH set, by design — half-configured environments
+        #     fall through to placeholders to avoid partial-config
+        #     errors during eval).
+        #
+        # PHAROS_HARDWARE_CONFIG is not asserted here directly: that
+        # value is a path import, not a string comparison, and the
+        # full-closure `deployment-build` check catches its read-
+        # path failures under `--impure` with the env var set.
+        #
+        # CI invocation (in `.github/workflows/flake-check.yml`'s
+        # `check-full` job): a dedicated step exports test values
+        # and runs the check under `--impure`, exercising the
+        # "verified" path. Pure-mode CI in `check-pr` exercises the
+        # "skipped" path (no env vars set, no `--impure`).
+        checks.env-var-contract =
+          let
+            expectedServerName = builtins.getEnv "PHAROS_SERVER_NAME";
+            expectedEmail = builtins.getEnv "PHAROS_ACME_EMAIL";
+            bothSet = expectedServerName != "" && expectedEmail != "";
+            bothUnset = expectedServerName == "" && expectedEmail == "";
+            cfg = self.nixosConfigurations.ovh-test.config.services.blockscout-nginx;
+            actualServerName = cfg.serverName;
+            actualEmail = cfg.acme.email;
+          in
+          if bothUnset then
+            pkgs.writeText "env-var-contract-skipped" ''
+              env-var-contract: skipped (pure-mode evaluation; PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL not set).
+
+              To exercise this check locally:
+                PHAROS_SERVER_NAME=test.example.org \
+                PHAROS_ACME_EMAIL=ops@test.example.org \
+                  nix build --impure .#checks.x86_64-linux.env-var-contract --print-build-logs
+
+              CI exercises the verified path under `check-full`; this skip is the
+              expected outcome under PR-time pure-mode evaluation.
+            ''
+          else if !bothSet then
+            throw ''
+              env-var-contract: only one of PHAROS_SERVER_NAME / PHAROS_ACME_EMAIL is set.
+                PHAROS_SERVER_NAME = ${if expectedServerName == "" then "(unset)" else expectedServerName}
+                PHAROS_ACME_EMAIL  = ${if expectedEmail == "" then "(unset)" else expectedEmail}
+              The flake's runtimeOverlay only applies when BOTH are set; with one
+              set and one unset, the unset half falls back to its placeholder.
+              Set both, or set neither (and let the skipped-sentinel path run).
+            ''
+          else if actualServerName != expectedServerName then
+            throw ''
+              env-var-contract FAILED: serverName mismatch.
+                expected = ${expectedServerName}  (from PHAROS_SERVER_NAME)
+                actual   = ${actualServerName}
+              Placeholder leak-through suggests the runtimeOverlay's getEnv read
+              didn't apply. Confirm `--impure` was passed; if it was, the env-var
+              name in `nixosConfigurations.ovh-test` may have drifted from the
+              PHAROS_SERVER_NAME spelling.
+            ''
+          else if actualEmail != expectedEmail then
+            throw ''
+              env-var-contract FAILED: acme.email mismatch.
+                expected = ${expectedEmail}  (from PHAROS_ACME_EMAIL)
+                actual   = ${actualEmail}
+              Placeholder leak-through suggests the runtimeOverlay's getEnv read
+              didn't apply. Confirm `--impure` was passed; if it was, the env-var
+              name in `nixosConfigurations.ovh-test` may have drifted from the
+              PHAROS_ACME_EMAIL spelling.
+            ''
+          else
+            pkgs.writeText "env-var-contract-verified" ''
+              env-var-contract verified:
+                services.blockscout-nginx.serverName  = ${actualServerName}
+                services.blockscout-nginx.acme.email  = ${actualEmail}
+            '';
+
         # Full-closure build check for `nixosConfigurations.ovh-test`.
         # Where `deployment-eval` (above) catches type errors,
         # assertion failures, and broken imports at evaluation time,
