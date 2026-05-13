@@ -67,14 +67,12 @@
       # used by `apps.<system>.e2e` to construct a host-native runtime
       # PATH that includes the same autonity / blockscout binaries the
       # VM uses.
-      flakeOverlay = (
-        final: _prev: {
-          autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
-          autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
-          blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
-          blockscout-frontend = blockscout-frontend.packages.${final.stdenv.hostPlatform.system}.default;
-        }
-      );
+      flakeOverlay = final: _prev: {
+        autonity = autonity.packages.${final.stdenv.hostPlatform.system}.default;
+        autonity-portable = autonity.packages.${final.stdenv.hostPlatform.system}.autonity-portable;
+        blockscout = blockscout.packages.${final.stdenv.hostPlatform.system}.default;
+        blockscout-frontend = blockscout-frontend.packages.${final.stdenv.hostPlatform.system}.default;
+      };
     in
     {
       # Top-level aggregate module. Service modules are imported from
@@ -261,6 +259,41 @@
               touch $out
             '';
 
+        # statix — Nix anti-pattern linter. Walks every tracked `.nix`
+        # file from the repo root and exits non-zero on findings.
+        # Repo-level lint config lives at `statix.toml` (no leading
+        # dot — statix searches for the unprefixed name); that file
+        # documents the rationale for any globally-disabled rules.
+        # Cheap (~few seconds), runs on every PR via the
+        # `check-pr` job in `.github/workflows/flake-check.yml`.
+        checks.statix =
+          pkgs.runCommand "check-statix"
+            {
+              nativeBuildInputs = [ pkgs.statix ];
+            }
+            ''
+              cd ${self}
+              statix check .
+              touch $out
+            '';
+
+        # deadnix — finds unused symbols (let-bindings, lambda
+        # patterns, function arguments). `--fail` exits non-zero on
+        # findings so CI surfaces them. Convention for keeping
+        # unused-but-intentional lambda patterns is the `_` prefix
+        # (e.g. `_prev` in overlay signatures); deadnix recognises
+        # the prefix and skips those sites.
+        checks.deadnix =
+          pkgs.runCommand "check-deadnix"
+            {
+              nativeBuildInputs = [ pkgs.deadnix ];
+            }
+            ''
+              cd ${self}
+              deadnix --fail .
+              touch $out
+            '';
+
         checks.hardening = import ./tests/hardening-matrix.nix {
           inherit pkgs nixpkgs system;
           flake = self;
@@ -277,7 +310,7 @@
         # `serviceConfig`; this one asserts the units actually run and
         # talk to each other.
         checks.integration = import ./tests/integration.nix {
-          inherit pkgs system;
+          inherit pkgs;
           flake = self;
         };
 
@@ -294,7 +327,7 @@
         # `tests/integration-sync.nix`; the M2.5 epic at #38 tracks the
         # per-PR opt-out CI policy.
         checks.integration-sync = import ./tests/integration-sync.nix {
-          inherit pkgs system;
+          inherit pkgs;
           flake = self;
         };
 
