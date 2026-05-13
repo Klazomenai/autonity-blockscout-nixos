@@ -81,6 +81,43 @@ SSH_TESTBED_OPTS := -o StrictHostKeyChecking=accept-new \
                     -o ServerAliveInterval=30
 
 # ----------------------------------------------------------------------
+# Colour palette — shared by every recipe that emits coloured output.
+#
+# Seven semantic groups + reset. ANSI 8-colour bold codes for broad
+# terminal compatibility (works on every modern terminal emulator
+# without needing 256-colour or true-colour support).
+#
+# Colours emit only when stdout is a TTY AND $NO_COLOR is unset, so
+# piped/captured output stays clean (`make help | less` without -R,
+# capture for docs, log scraping). Per https://no-color.org/.
+#
+#   c_nav     cyan (36)     navigation chrome — chart, title, section
+#                           headers, DNS ops (chart-the-route)
+#   c_sail    yellow (33)   outbound motion — provision, deploy, also
+#                           cleanup-caution (same "in-flight" energy)
+#   c_anchor  green (32)    settled state — install, halt, env-var
+#                           values, success, body-complete
+#   c_probe   magenta (35)  inspect — test (peek through the spyglass)
+#   c_log     blue (34)     passive record — logs, snapshot
+#   c_alert   red (31)      cost-impact / urgent — `make cruise` (the
+#                           spendy one), pirate-banner WARNING, manual-
+#                           action VERIFY CONSOLE messages
+#   c_dim     dim (2)       tagline / de-emphasis
+#
+# Recipes that emit coloured output start with `$(SETUP_COLOURS); …`.
+# Recipes without colour (error guards, env-var checks) skip it.
+define SETUP_COLOURS
+if [ -t 1 ] && [ -z "$${NO_COLOR:-}" ]; then \
+c_nav='\033[1;36m'; c_sail='\033[1;33m'; c_anchor='\033[1;32m'; \
+c_probe='\033[1;35m'; c_log='\033[1;34m'; c_alert='\033[1;31m'; \
+c_dim='\033[2m'; c_reset='\033[0m'; \
+else \
+c_nav=''; c_sail=''; c_anchor=''; c_probe=''; c_log=''; \
+c_alert=''; c_dim=''; c_reset=''; \
+fi
+endef
+
+# ----------------------------------------------------------------------
 # Required-var guards. Each recipe lists which vars it needs.
 # ----------------------------------------------------------------------
 
@@ -94,23 +131,33 @@ endef
 
 .PHONY: help
 help:
-	@echo "M3 OVH test-bed recipes"
-	@echo ""
-	@echo "  make provision           Spin up an OVH instance (writes IP=... line + .last-instance-id)"
-	@echo "  make dns-up IP=<ip>      Add A record DOMAIN -> IP via Cloud DNS"
-	@echo "  make install IP=<ip>     nixos-anywhere install with --extra-files staging"
-	@echo "  make deploy IP=<ip>      nixos-rebuild switch --target-host (after install)"
-	@echo "  make test IP=<ip>        Run M3 probe contract via SSH-tunneled ports"
-	@echo "  make logs IP=<ip>        Stream journalctl of the 6 services"
-	@echo "  make snapshot IP=<ip>    (TBD) capture state for forensics"
-	@echo "  make halt                Destroy the instance recorded in .last-instance-id"
-	@echo "  make dns-down            Remove the A record DOMAIN -> *"
-	@echo "  make cruise              Full cycle: provision -> dns-up -> install -> test -> halt -> dns-down (deploy omitted; redundant after fresh install)"
-	@echo ""
-	@echo "Required env vars (subset per recipe):"
-	@echo "  OVH_TOKEN OVH_PROJECT_ID         (provision, halt)"
-	@echo "  GCLOUD_PROJECT DNS_ZONE DOMAIN   (dns-up, dns-down)"
-	@echo "  IP                               (install, deploy, test, logs, snapshot)"
+	@$(SETUP_COLOURS); \
+	printf "$${c_nav}🧭 M3 OVH test-bed recipes$${c_reset} — $${c_dim}chart, sail, test, scuttle$${c_reset}\n"; \
+	\
+	printf "\n$${c_nav}Aggregate$${c_reset} (full cycle — the operator's primary entry point)\n"; \
+	printf "  $${c_anchor}make cruise$${c_reset}              provision -> dns-up -> install -> test -> halt -> dns-down (deploy omitted; redundant after fresh install)\n"; \
+	\
+	printf "\n$${c_nav}Compute$${c_reset} (OVH API)\n"; \
+	printf "  $${c_sail}make provision$${c_reset}           Spin up an OVH instance (writes IP=... line + .last-instance-id)\n"; \
+	printf "  $${c_alert}make halt$${c_reset}                Scuttle the instance recorded in .last-instance-id\n"; \
+	\
+	printf "\n$${c_nav}DNS$${c_reset} (Cloud DNS)\n"; \
+	printf "  $${c_nav}make dns-up IP=<ip>$${c_reset}      Add A record DOMAIN -> IP\n"; \
+	printf "  $${c_nav}make dns-down$${c_reset}            Remove the A record DOMAIN -> *\n"; \
+	\
+	printf "\n$${c_nav}Install + deploy$${c_reset} (NixOS)\n"; \
+	printf "  $${c_anchor}make install IP=<ip>$${c_reset}     nixos-anywhere install with --extra-files staging\n"; \
+	printf "  $${c_sail}make deploy IP=<ip>$${c_reset}      nixos-rebuild switch --target-host (after install)\n"; \
+	\
+	printf "\n$${c_nav}Observe$${c_reset} (probe + journal)\n"; \
+	printf "  $${c_probe}make test IP=<ip>$${c_reset}        Run M3 probe contract via SSH-tunneled ports\n"; \
+	printf "  $${c_probe}make logs IP=<ip>$${c_reset}        Stream journalctl of the 6 services\n"; \
+	printf "  $${c_probe}make snapshot IP=<ip>$${c_reset}    (TBD) capture state for forensics\n"; \
+	\
+	printf "\n$${c_nav}Required env vars$${c_reset} (subset per recipe)\n"; \
+	printf "  $${c_anchor}OVH_TOKEN OVH_PROJECT_ID$${c_reset}         (provision, halt)\n"; \
+	printf "  $${c_anchor}GCLOUD_PROJECT DNS_ZONE DOMAIN$${c_reset}   (dns-up, dns-down)\n"; \
+	printf "  $${c_anchor}IP$${c_reset}                               (install, deploy, test, logs, snapshot)\n"
 
 # ----------------------------------------------------------------------
 # check-runtime-env — verify the operator-local files that drive the
@@ -132,7 +179,7 @@ check-runtime-env:
 	   echo "[runtime] WARNING: server_name ($$server_name) != DOMAIN ($(DOMAIN))"; \
 	   echo "[runtime]          ACME HTTP-01 will validate against DOMAIN; mismatch breaks issuance."; \
 	 fi
-	@echo "[runtime] env-var sources OK; flake will read PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL via --impure"
+	@echo "[runtime] ⚓ env-var sources OK; flake will read PHAROS_SERVER_NAME + PHAROS_ACME_EMAIL via --impure"
 
 # ----------------------------------------------------------------------
 # Staging dir for --extra-files. Mirrors the on-host layout exactly
@@ -159,7 +206,7 @@ stage: check-runtime-env
 	@install -m 0600 "$(SECRETS_DIR)/database_password" "$(STAGING_DIR)/var/lib/pharos-secrets/database_password"
 	@install -d -m 0700 "$(STAGING_DIR)/root/.ssh"
 	@install -m 0600 "$(SECRETS_DIR)/root_authorized_keys" "$(STAGING_DIR)/root/.ssh/authorized_keys"
-	@echo "[stage] $(STAGING_DIR) ready ($$(find "$(STAGING_DIR)" -type f 2>/dev/null | wc -l) files)"
+	@echo "[stage] ⛵ $(STAGING_DIR) stowed ($$(find "$(STAGING_DIR)" -type f 2>/dev/null | wc -l) files)"
 
 # ----------------------------------------------------------------------
 # OVH compute lifecycle
@@ -170,7 +217,7 @@ provision:
 	@$(call require_var,OVH_TOKEN)
 	@$(call require_var,OVH_PROJECT_ID)
 	@name="pharos-test-$$(date -u +%Y%m%d-%H%M%S)"; \
-	 echo "[provision] flavor=$(OVH_FLAVOR) image=$(OVH_IMAGE) region=$(OVH_REGION) name=$$name"; \
+	 echo "[provision] ⛵ flavor=$(OVH_FLAVOR) image=$(OVH_IMAGE) region=$(OVH_REGION) name=$$name"; \
 	 response=$$(ovh-cli cloud project $(OVH_PROJECT_ID) instance create \
 	   --flavor "$(OVH_FLAVOR)" --image "$(OVH_IMAGE)" --region "$(OVH_REGION)" \
 	   --name "$$name" --output json); \
@@ -178,7 +225,7 @@ provision:
 	 if [ -z "$$instance_id" ]; then \
 	   echo "[provision] FAILED to parse instance ID; raw response:"; echo "$$response"; exit 1; fi; \
 	 echo "$$instance_id" > .last-instance-id; \
-	 echo "[provision] waiting for IP (timeout 300s)..."; \
+	 echo "[provision] awaiting transponder ping (timeout 300s)..."; \
 	 for _ in $$(seq 1 60); do \
 	   ip=$$(ovh-cli cloud project $(OVH_PROJECT_ID) instance show --instance-id "$$instance_id" --output json 2>/dev/null \
 	     | jq -r '.ipAddresses[]? | select(.type=="public" and .version==4) | .ip' | head -1); \
@@ -203,11 +250,11 @@ halt:
 	 else \
 	  echo "[halt] no .last-instance-id; pass instance ID via INSTANCE_ID=..."; exit 1; \
 	 fi; \
-	 echo "[halt] destroying instance $$instance_id"; \
+	 echo "[halt] ⚓ scuttling instance $$instance_id"; \
 	 ovh-cli cloud project $(OVH_PROJECT_ID) instance delete --instance-id "$$instance_id"; \
 	 if [ -z "$(INSTANCE_ID)" ]; then rm -f .last-instance-id; fi; \
 	 rm -f .known_hosts; \
-	 echo "[halt] done (cleared .known_hosts so next cycle starts fresh)"
+	 echo "[halt] ⚓ done — .known_hosts cleared, next cycle starts fresh"
 
 # ----------------------------------------------------------------------
 # Cloud DNS
@@ -219,7 +266,7 @@ dns-up:
 	@$(call require_var,DNS_ZONE)
 	@$(call require_var,DOMAIN)
 	@$(call require_var,IP)
-	@echo "[dns-up] $(DOMAIN) -> $(IP) (zone $(DNS_ZONE), ttl $(DOMAIN_TTL))"
+	@echo "[dns-up] 🧭 $(DOMAIN) -> $(IP) (zone $(DNS_ZONE), ttl $(DOMAIN_TTL))"
 	@gcloud auth print-identity-token >/dev/null 2>&1 || { \
 	  echo "[dns-up] gcloud not authenticated; run 'gcloud auth login' or activate a service account"; exit 1; }
 	@gcloud dns record-sets create "$(DOMAIN)." \
@@ -228,7 +275,7 @@ dns-up:
 	@echo "[dns-up] propagation poll (5 min cap)..."
 	@for _ in $$(seq 1 30); do \
 	  resolved=$$(dig +short "$(DOMAIN)" @8.8.8.8 | head -1); \
-	  if [ "$$resolved" = "$(IP)" ]; then echo "[dns-up] propagated"; exit 0; fi; \
+	  if [ "$$resolved" = "$(IP)" ]; then echo "[dns-up] 🧭 propagated"; exit 0; fi; \
 	  sleep 10; \
 	done; \
 	echo "[dns-up] WARNING: not propagated within 5 min; install may need to retry ACME"
@@ -238,16 +285,16 @@ dns-down:
 	@$(call require_var,GCLOUD_PROJECT)
 	@$(call require_var,DNS_ZONE)
 	@$(call require_var,DOMAIN)
-	@echo "[dns-down] removing A record for $(DOMAIN)"
+	@echo "[dns-down] 🧭 removing A record for $(DOMAIN)"
 	@output=$$(gcloud dns record-sets delete "$(DOMAIN)." --type=A \
 	    --zone="$(DNS_ZONE)" --project="$(GCLOUD_PROJECT)" --quiet 2>&1); \
 	 rc=$$?; \
 	 if [ $$rc -eq 0 ]; then \
-	   echo "[dns-down] deleted"; \
+	   echo "[dns-down] 🧭 deleted"; \
 	   exit 0; \
 	 fi; \
 	 if echo "$$output" | grep -qiE 'NOT_FOUND|notFound|was not found'; then \
-	   echo "[dns-down] no record found (already deleted)"; \
+	   echo "[dns-down] 🧭 no record found (already deleted)"; \
 	   exit 0; \
 	 fi; \
 	 echo "[dns-down] gcloud failed (rc=$$rc):"; \
@@ -262,7 +309,7 @@ dns-down:
 .PHONY: install
 install: stage
 	@$(call require_var,IP)
-	@echo "[install] nixos-anywhere $(IP) (flake .#ovh-test --impure, --extra-files $(STAGING_DIR))"
+	@echo "[install] ⚓ nixos-anywhere $(IP) (flake .#ovh-test --impure, --extra-files $(STAGING_DIR))"
 	@cd ../.. && $(RUNTIME_ENV) nixos-anywhere \
 	  --flake '.#ovh-test' \
 	  --extra-files "$(STAGING_DIR)" \
@@ -275,12 +322,12 @@ install: stage
 	  --ssh-option ConnectTimeout=30 \
 	  --ssh-option ServerAliveInterval=30 \
 	  --target-host "root@$(IP)"
-	@echo "[install] done; $(HARDWARE_CFG) written (gitignored)"
+	@echo "[install] ⚓ moored; $(HARDWARE_CFG) written (gitignored)"
 
 .PHONY: deploy
 deploy: check-runtime-env
 	@$(call require_var,IP)
-	@echo "[deploy] nixos-rebuild switch --flake .#ovh-test --impure --target-host root@$(IP)"
+	@echo "[deploy] ⛵ nixos-rebuild switch --flake .#ovh-test --impure --target-host root@$(IP)"
 	@echo "[deploy] (operator runtime values baked into the closure via PHAROS_* env vars; not shipped separately)"
 	@cd ../.. && $(RUNTIME_ENV) NIX_SSHOPTS="$(SSH_TESTBED_OPTS)" nixos-rebuild switch \
 	  --flake '.#ovh-test' \
@@ -301,12 +348,12 @@ deploy: check-runtime-env
 .PHONY: test
 test:
 	@$(call require_var,IP)
-	@echo "[test] opening SSH tunnels for ports 8545, 4000, 3000"
+	@echo "[test] 🔍 opening SSH tunnels for ports 8545, 4000, 3000"
 	@ssh $(SSH_TESTBED_OPTS) -o ExitOnForwardFailure=yes -fN \
 	  -L 8545:127.0.0.1:8545 -L 4000:127.0.0.1:4000 -L 3000:127.0.0.1:3000 \
 	  -M -S /tmp/pharos-test-$(IP).sock "root@$(IP)"
 	@trap 'ssh -S /tmp/pharos-test-$(IP).sock -O exit "root@$(IP)" 2>/dev/null || true' EXIT; \
-	 echo "[test] tunnels up; running probes.py PROBE_MODE=m3"; \
+	 echo "[test] 🔍 tunnels up; running probes.py PROBE_MODE=m3"; \
 	 PROBE_MODE=m3 \
 	 PROBE_RPC_URL=http://127.0.0.1:8545 \
 	 PROBE_BACKEND_URL=http://127.0.0.1:4000 \
@@ -328,8 +375,8 @@ logs:
 .PHONY: snapshot
 snapshot:
 	@$(call require_var,IP)
-	@echo "[snapshot] TBD — implement on the first cruise that surfaces a bug worth investigating."
-	@echo "[snapshot] For now, capture by hand:"
+	@echo "[snapshot] 📜 TBD — implement on the first cruise that surfaces a bug worth investigating."
+	@echo "[snapshot] 📜 For now, capture by hand:"
 	@echo "  ssh root@$(IP) 'free -m && df -h && systemctl --no-pager --failed && journalctl -b --no-pager | tail -200'"
 
 # ----------------------------------------------------------------------
@@ -338,28 +385,29 @@ snapshot:
 
 .PHONY: cruise
 cruise:
-	@cleanup() { \
-	   rc=$$?; \
-	   set +e; \
-	   echo "[cruise] cleanup (exit=$$rc): tearing down to release paid hardware"; \
-	   $(MAKE) halt    || echo "[cruise]   halt failed — VERIFY OVH CONSOLE for instance in .last-instance-id"; \
-	   $(MAKE) dns-down || echo "[cruise]   dns-down failed — VERIFY Cloud DNS CONSOLE for $(DOMAIN)"; \
-	   exit $$rc; \
-	 }; \
-	 trap cleanup EXIT; \
-	 echo "[cruise] WARNING: this provisions a paid OVH instance."; \
-	 echo "[cruise] step 1/6: provision"; \
-	 $(MAKE) provision | tee .cruise.log; \
-	 ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
-	 if [ -z "$$ip" ]; then \
-	   echo "[cruise] no IP captured — cleanup trap will still halt via .last-instance-id"; \
-	   exit 1; \
-	 fi; \
-	 export IP="$$ip"; \
-	 echo "[cruise] step 2/6: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
-	 echo "[cruise] step 3/6: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
-	 echo "[cruise] step 4/6: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
-	 echo "[cruise] cruise body complete; trap will halt + dns-down on EXIT (steps 5/6 + 6/6)"
+	@$(SETUP_COLOURS); \
+	cleanup() { \
+	  rc=$$?; \
+	  set +e; \
+	  printf "$${c_sail}[cruise] 🛟 cleanup (exit=$$rc): casting off lines, releasing paid hardware$${c_reset}\n"; \
+	  $(MAKE) halt    || printf "$${c_alert}[cruise]   halt failed — VERIFY OVH CONSOLE for instance in .last-instance-id$${c_reset}\n"; \
+	  $(MAKE) dns-down || printf "$${c_alert}[cruise]   dns-down failed — VERIFY Cloud DNS CONSOLE for $(DOMAIN)$${c_reset}\n"; \
+	  exit $$rc; \
+	}; \
+	trap cleanup EXIT; \
+	printf "$${c_alert}[cruise] 🏴‍☠️ WARNING: this provisions a paid OVH instance. Set sail.$${c_reset}\n"; \
+	printf "[cruise] step 1/6: $${c_sail}provision ⛵$${c_reset}\n"; \
+	$(MAKE) provision | tee .cruise.log; \
+	ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
+	if [ -z "$$ip" ]; then \
+	  printf "$${c_alert}[cruise] no IP captured — cleanup trap will still halt via .last-instance-id$${c_reset}\n"; \
+	  exit 1; \
+	fi; \
+	export IP="$$ip"; \
+	printf "[cruise] step 2/6: $${c_nav}dns-up IP=$$ip 🧭$${c_reset}\n";    $(MAKE) dns-up  IP="$$ip"; \
+	printf "[cruise] step 3/6: $${c_anchor}install IP=$$ip ⚓$${c_reset}\n"; $(MAKE) install IP="$$ip"; \
+	printf "[cruise] step 4/6: $${c_probe}test IP=$$ip 🔍$${c_reset}\n";    $(MAKE) test    IP="$$ip"; \
+	printf "$${c_anchor}[cruise] ⛵ cruise body complete; trap will halt + dns-down on EXIT (steps 5/6 + 6/6)$${c_reset}\n"
 	@echo "[cruise] note: 'make deploy' is omitted from cruise — redundant after a fresh install."
 	@echo "[cruise]       Use 'make deploy IP=<ip>' explicitly when iterating on code without reprovisioning."
 	@# Cleanup contract:
