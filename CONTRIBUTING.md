@@ -59,6 +59,26 @@ nix build .#checks.x86_64-linux.deployment-build --print-build-logs
 
 Wall-clock: ~5-15 minutes cold on a fresh checkout, faster on warm cache or Nix-binary-cache hits.
 
+## Env-var contract check
+
+`checks.<system>.env-var-contract` (defined inline in `flake.nix`) verifies that `PHAROS_SERVER_NAME` + `PHAROS_ACME_EMAIL` flow through `--impure` + `builtins.getEnv` to `services.blockscout-nginx.serverName` + `services.blockscout-nginx.acme.email` in `nixosConfigurations.ovh-test`. Catches a class of bug where the env-var name in `flake.nix` drifts from what `deployments/ovh-test/Makefile` exports — silent at eval time, but loud-fail at runtime when ACME tries to issue a cert for `deployment.invalid`.
+
+The check has three eval paths:
+
+- **Pure mode** (default `nix flake check`, no env vars set): emits a `skipped` sentinel explaining how to exercise the verified path. This is the expected outcome under PR-time evaluation.
+- **Impure mode, both PHAROS_* set**: asserts exact-string match. Mismatch throws with a diagnostic naming both expected and actual values.
+- **Impure mode, only one PHAROS_* set**: throws with a pointer to the runtimeOverlay's gate (it requires BOTH set, by design).
+
+**CI invocation**: `check-full` runs a dedicated `--impure` step with test values exported (`test.example.org` / `ops@test.example.org`) exercising the verified path. The test values satisfy the option-type regexes but never reach a real ACME runtime — eval-time only.
+
+Run locally:
+
+```sh
+PHAROS_SERVER_NAME=test.example.org \
+PHAROS_ACME_EMAIL=ops@test.example.org \
+  nix build --impure .#checks.x86_64-linux.env-var-contract --print-build-logs
+```
+
 ## PR workflow
 
 1. Open an issue describing the change.
