@@ -158,18 +158,21 @@ in
   # DHCP — OVH provisions the IP via the standard cloud-init/DHCP path.
   networking.useDHCP = lib.mkDefault true;
 
-  # `services.blockscout-nginx.openFirewall` (default true, per
-  # modules/blockscout-nginx.nix:191-193) adds 80 + 443 to
-  # `networking.firewall.allowedTCPPorts` via mkIf — that's what
-  # opens the public web ports, not upstream `services.nginx` which
-  # never touches the firewall on its own.
+  # Firewall is opened entirely by the two service modules, no
+  # explicit rules needed here:
   #
-  # 30303 (TCP) is Autonity's P2P listener; 30303 (UDP) is its
-  # discovery port. Both need explicit firewall holes here because
-  # the autonity module doesn't open them itself (peer-discovery
-  # geometry varies per deployment).
-  networking.firewall.allowedTCPPorts = [ 30303 ];
-  networking.firewall.allowedUDPPorts = [ 30303 ];
+  #   - `services.blockscout-nginx.openFirewall` (default true, per
+  #     modules/blockscout-nginx.nix:191-193) adds 80 + 443 to
+  #     `networking.firewall.allowedTCPPorts` via mkIf.
+  #
+  #   - `services.autonity.p2p.openFirewall` (default true, per
+  #     modules/autonity.nix:324-332) adds both TCP and UDP on
+  #     `cfg.p2p.port` (default 30303) via mkIf — peer discovery
+  #     needs both families on the same port number.
+  #
+  # An earlier draft duplicated 30303 here under the
+  # mistaken belief that the autonity module didn't open ports
+  # itself; it does.
 
   # Generic hostname — the public DNS name lives in the runtime
   # `server_name` credential, not here. The kernel hostname is
