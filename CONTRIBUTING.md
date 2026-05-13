@@ -45,6 +45,20 @@ The check runs as part of `nix flake check` alongside `fmt` and `hardening`, but
 - Real ACME / Let's Encrypt — a self-signed cert is wired directly into the nginx vhost; live HTTP-01 validation against a public DNS name is M3.
 - Performance / load testing.
 
+## Deployment-build check
+
+`checks.<system>.deployment-build` (defined inline in `flake.nix`) forces realisation of the system closure for `nixosConfigurations.ovh-test`. Where the fast `deployment-eval` check above evaluates the option tree (catching type errors, broken imports, and assertion failures), this check actually builds the closure — surfacing derivation build failures, missing dependencies, package compile errors, and overlay conflicts that eval can't see.
+
+The check layers `tests/stub-hardware-config.nix` on top of the production module list via `extendModules`, supplying the minimum `fileSystems."/"` + boot-initrd declarations that NixOS asserts on at eval time. The production module list defers these to the per-instance `hardware-configuration.nix` generated at install time (loaded from `PHAROS_HARDWARE_CONFIG` under `--impure`); the stub uses `lib.mkDefault` so real hardware-configurations always win automatic merging.
+
+**CI policy**: runs only under `check-full` (push to `main` + nightly cron, per `.github/workflows/flake-check.yml`) — deliberately excluded from `check-pr` to keep PR feedback fast. The split mirrors `integration-sync`'s precedent from M2.5. Run locally before pushing hardware-touching changes:
+
+```sh
+nix build .#checks.x86_64-linux.deployment-build --print-build-logs
+```
+
+Wall-clock: ~5-15 minutes cold on a fresh checkout, faster on warm cache or Nix-binary-cache hits.
+
 ## PR workflow
 
 1. Open an issue describing the change.
