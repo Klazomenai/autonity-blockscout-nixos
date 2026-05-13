@@ -285,8 +285,12 @@ deploy: check-runtime-env
 	@cd ../.. && $(RUNTIME_ENV) NIX_SSHOPTS="$(SSH_TESTBED_OPTS)" nixos-rebuild switch \
 	  --flake '.#ovh-test' \
 	  --impure \
-	  --target-host "root@$(IP)" \
-	  --use-remote-sudo
+	  --target-host "root@$(IP)"
+	@# `--use-remote-sudo` intentionally omitted: we connect as
+	@# root@ already (SSH config disallows password login, accepts
+	@# only the operator's authorized_keys), and a minimal NixOS
+	@# install doesn't enable sudo by default. Forcing remote
+	@# commands through sudo would just add a failure mode.
 
 # ----------------------------------------------------------------------
 # Probes — M3 contract via SSH tunnels (no public TLS dependency for
@@ -334,17 +338,33 @@ snapshot:
 
 .PHONY: cruise
 cruise:
-	@echo "[cruise] WARNING: this provisions a paid OVH instance. Halt is on you."
+	@echo "[cruise] WARNING: this provisions a paid OVH instance."
 	@echo "[cruise] step 1/6: provision"
 	@$(MAKE) provision | tee .cruise.log
 	@ip=$$(grep -E '^IP=' .cruise.log | tail -1 | cut -d= -f2); \
 	 if [ -z "$$ip" ]; then echo "[cruise] no IP captured; aborting"; exit 1; fi; \
 	 export IP="$$ip"; \
+	 cleanup() { \
+	   rc=$$?; \
+	   set +e; \
+	   echo "[cruise] cleanup (exit=$$rc): tearing down to release paid hardware"; \
+	   $(MAKE) halt IP="$$ip" || echo "[cruise]   halt failed — VERIFY OVH CONSOLE for $$ip"; \
+	   $(MAKE) dns-down       || echo "[cruise]   dns-down failed — VERIFY Cloud DNS CONSOLE for $(DOMAIN)"; \
+	   exit $$rc; \
+	 }; \
+	 trap cleanup EXIT; \
 	 echo "[cruise] step 2/6: dns-up IP=$$ip"; $(MAKE) dns-up IP="$$ip"; \
 	 echo "[cruise] step 3/6: install IP=$$ip"; $(MAKE) install IP="$$ip"; \
 	 echo "[cruise] step 4/6: test IP=$$ip"; $(MAKE) test IP="$$ip"; \
-	 echo "[cruise] step 5/6: halt"; $(MAKE) halt; \
-	 echo "[cruise] step 6/6: dns-down"; $(MAKE) dns-down; \
-	 echo "[cruise] complete; remember to record discoveries in README.md"
+	 echo "[cruise] cruise body complete; trap will halt + dns-down on EXIT (steps 5/6 + 6/6)"
 	@echo "[cruise] note: 'make deploy' is omitted from cruise — redundant after a fresh install."
 	@echo "[cruise]       Use 'make deploy IP=<ip>' explicitly when iterating on code without reprovisioning."
+	@# Cleanup contract: the trap above runs `halt` + `dns-down`
+	@# on EXIT regardless of why the recipe is leaving (success,
+	@# bash -e on a failing sub-make, or Ctrl-C). Without it, a
+	@# failure in dns-up / install / test would leave the paid
+	@# OVH instance running indefinitely. halt and dns-down
+	@# failures inside cleanup fall through to a loud
+	@# manual-cleanup warning rather than masking the original
+	@# error; the exit code propagates so `make cruise` returns
+	@# non-zero when anything along the way failed.
