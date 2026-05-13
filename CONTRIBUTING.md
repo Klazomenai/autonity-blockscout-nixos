@@ -45,6 +45,20 @@ The check runs as part of `nix flake check` alongside `fmt` and `hardening`, but
 - Real ACME / Let's Encrypt — a self-signed cert is wired directly into the nginx vhost; live HTTP-01 validation against a public DNS name is M3.
 - Performance / load testing.
 
+## Disko boot test
+
+`checks.<system>.disko-boot` (defined inline in `flake.nix`) verifies that `deployments/ovh-test/disk-config.nix` produces a valid install by booting a QEMU VM, formatting the virtio disks per the disko spec, and running `nixos-install` (which also installs GRUB). Powered by disko's `makeDiskoTest` framework, which automatically rewrites the spec's `/dev/nvme0n1` to `/dev/vda` for the test VM.
+
+Scope is **disk-config + install phase only** — service modules + the per-instance hardware-config are NOT loaded, and `testBoot = false` skips the post-install boot phase. The check catches GPT layout typos, missing ESP + mountpoint wiring, mkfs / fstab errors, and GRUB install failures (the bootloader install runs as part of `switch-to-configuration boot`, before the boot phase). Boot-time failures (vmlinuz path, initrd, post-boot mount) are covered by `#56`'s full-VM integration test.
+
+The `testBoot = false` choice is empirical: under TCG software emulation (no KVM in the local builder sandbox), the boot phase tests pass quickly but the framework's VM teardown hangs in ACPI poweroff for 15+ minutes before the build artifact materialises. Skipping the boot phase lets the check ship reliably in any environment.
+
+**CI policy**: runs under `check-full` (push to `main` + nightly cron) — not added to `check-pr`'s explicit named-check list because the install phase still takes several minutes under TCG. Run locally before pushing disk-config changes:
+
+```sh
+nix build .#checks.x86_64-linux.disko-boot --print-build-logs
+```
+
 ## Deployment-build check
 
 `checks.<system>.deployment-build` (defined inline in `flake.nix`) forces realisation of the system closure for `nixosConfigurations.ovh-test`. Where the fast `deployment-eval` check above evaluates the option tree (catching type errors, broken imports, and assertion failures), this check actually builds the closure — surfacing derivation build failures, missing dependencies, package compile errors, and overlay conflicts that eval can't see.
