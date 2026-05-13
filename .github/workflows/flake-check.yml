@@ -29,10 +29,12 @@ jobs:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v22
       - uses: DeterminateSystems/magic-nix-cache-action@v13
-      - name: nix build .#checks.x86_64-linux.{fmt,hardening,integration}
+      - name: nix build .#checks.x86_64-linux.{fmt,statix,deadnix,hardening,integration}
         run: |
           nix build --print-build-logs \
             .#checks.x86_64-linux.fmt \
+            .#checks.x86_64-linux.statix \
+            .#checks.x86_64-linux.deadnix \
             .#checks.x86_64-linux.hardening \
             .#checks.x86_64-linux.integration
 

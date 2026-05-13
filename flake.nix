@@ -261,9 +261,11 @@
 
         # statix — Nix anti-pattern linter. Walks every tracked `.nix`
         # file from the repo root and exits non-zero on findings.
-        # Repo-level lint config lives at `.statix.toml`; that file
+        # Repo-level lint config lives at `statix.toml` (no leading
+        # dot — statix searches for the unprefixed name); that file
         # documents the rationale for any globally-disabled rules.
-        # Cheap (~few seconds), runs on every PR.
+        # Cheap (~few seconds), runs on every PR via the
+        # `check-pr` job in `.github/workflows/flake-check.yml`.
         checks.statix =
           pkgs.runCommand "check-statix"
             {

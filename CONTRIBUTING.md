@@ -81,7 +81,7 @@ PHAROS_ACME_EMAIL=ops@test.example.org \
 
 ## Nix lint checks
 
-Every PR runs `checks.<system>.statix` and `checks.<system>.deadnix` as part of `nix flake check`. `statix` catches Nix anti-patterns; `deadnix` catches unused let-bindings, lambda patterns, and function arguments (the `_` prefix marks intentionally-unused lambda patterns and is recognised as such). Repo-level statix config lives at `.statix.toml` with rationale for any globally-disabled rules. Both run in a few seconds.
+Every PR runs `checks.<system>.statix` and `checks.<system>.deadnix` via the `check-pr` job in `.github/workflows/flake-check.yml` (explicit `nix build` of the fast-path check list). `statix` catches Nix anti-patterns; `deadnix` catches unused let-bindings, lambda patterns, and function arguments (the `_` prefix marks intentionally-unused lambda patterns and is recognised as such). Repo-level statix config lives at `statix.toml` (no leading dot — statix searches for the unprefixed name) with rationale for any globally-disabled rules. Both run in a few seconds.
 
 ## PR workflow
 
