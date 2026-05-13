@@ -68,7 +68,7 @@
 # `nix flake check` (which runs in pure mode where `getEnv`
 # returns `""`) evaluates cleanly. They are `lib.mkDefault` so the
 # operator overlay overrides them without `mkForce`.
-{ config, lib, ... }:
+{ lib, ... }:
 
 let
   pharosSecretsDir = "/var/lib/pharos-secrets";

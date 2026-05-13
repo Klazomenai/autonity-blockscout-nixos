@@ -72,7 +72,6 @@ let
     mkOption
     mkPackageOption
     mkIf
-    mkBefore
     types
     concatMapStringsSep
     mapAttrsToList

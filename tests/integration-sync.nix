@@ -77,7 +77,6 @@
 {
   pkgs,
   flake,
-  system,
 }:
 
 let
@@ -125,7 +124,6 @@ pkgs.testers.nixosTest {
 
   nodes.machine =
     {
-      config,
       lib,
       ...
     }:

@@ -1,0 +1,31 @@
+# statix lint config — read by `statix check` from the repo root.
+#
+# Disabled rules carry repo-wide rationale below. Rather than ignoring
+# individual sites per rule (which accumulates per-site exemption
+# clutter over time), we make a single global decision so future
+# contributors don't have to relitigate the style call at every
+# offending site.
+disabled = [
+  # manual_inherit_from (W04) — Assignment instead of inherit-from.
+  #
+  # Sites like `cache = cfg.cache;` in option-to-CLI-argv attribute
+  # sets (modules/autonity.nix's argAttrs) sit alongside name-mismatched
+  # assignments (`datadir = cfg.dataDir;`, `syncmode = cfg.syncMode;`).
+  # Rewriting just the name-matched ones to `inherit (cfg) cache;`
+  # would break the visual uniformity of the argv-mapping block.
+  # Conventional Nix accepts both forms; we choose the explicit
+  # assignment form consistently within blocks of this shape.
+  "manual_inherit_from",
+
+  # repeated_keys (W20) — Avoid repeated keys in attribute sets.
+  #
+  # Sites like `services.autonity = {...}; services.blockscout-postgresql
+  # = {...};` use the flat form deliberately to anchor per-service
+  # documentation comments to each top-level stanza. Consolidating
+  # into `services = { autonity = {...}; blockscout-postgresql =
+  # {...}; };` would force all the comments into one nested block
+  # and lose the 1:1 comment-to-stanza relationship that makes
+  # files like deployments/ovh-test/configuration.nix and flake.nix
+  # (per-input `<name>.url = ...; <name>.inputs.* = ...;`) readable.
+  "repeated_keys",
+]
