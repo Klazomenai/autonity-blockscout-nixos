@@ -349,6 +349,41 @@
           + ")"
         );
 
+        # Full-closure build check for `nixosConfigurations.ovh-test`.
+        # Where `deployment-eval` (above) catches type errors,
+        # assertion failures, and broken imports at evaluation time,
+        # this check FORCES realisation of the system closure —
+        # catching derivation build failures, missing dependencies,
+        # package compile errors, and overlay conflicts that eval
+        # can't see.
+        #
+        # CI policy: runs only under `check-full` (push-to-main +
+        # nightly cron, per `.github/workflows/flake-check.yml`) —
+        # deliberately excluded from `check-pr` to keep PR feedback
+        # fast. The M2.5 `integration-sync` split set the precedent
+        # for this PR-vs-main split. Run locally before pushing
+        # hardware-touching changes: `nix build
+        # .#checks.x86_64-linux.deployment-build --print-build-logs`.
+        # Wall-clock ~5-15 minutes cold; faster on warm cache.
+        #
+        # The production module list defers `fileSystems."/"` and the
+        # boot-initrd module list to the per-instance
+        # `hardware-configuration.nix` loaded from
+        # PHAROS_HARDWARE_CONFIG under `--impure`. To make the
+        # closure buildable in pure-mode CI (where no hardware-config
+        # is loaded), this check layers
+        # `tests/stub-hardware-config.nix` on top via `extendModules`.
+        # The stub's `lib.mkDefault` priority ensures real
+        # hardware-configurations win the automatic merge when both
+        # are present.
+        checks.deployment-build =
+          let
+            buildable = self.nixosConfigurations.ovh-test.extendModules {
+              modules = [ ./tests/stub-hardware-config.nix ];
+            };
+          in
+          buildable.config.system.build.toplevel;
+
         # Shellcheck pass over every non-orchestrator Makefile recipe
         # in `deployments/ovh-test/Makefile`. The recipes are the
         # highest-bug-density file in the deployment (Make + Bash
