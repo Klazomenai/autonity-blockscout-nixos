@@ -584,6 +584,43 @@
           in
           buildable.config.system.build.toplevel;
 
+        # Behavioural full-stack VM check for `deployments/ovh-test/
+        # configuration.nix`. Boots the actual deployment config in a
+        # `pkgs.testers.nixosTest` VM (with mkForce overrides for
+        # disko / boot.loader.grub / autonity p2p discovery, which
+        # have no nixosTest analogue) and asserts the deployment-
+        # specific option choices reach the running system:
+        # placeholder serverName flows to the nginx vhost, ACME
+        # staging URL resolves, firewall opens 30303/{tcp,udp} +
+        # 80/443 + 22 without listen-socket conflict, and
+        # ConditionPathExists on backend + postgresql-setup units
+        # both statically references and dynamically enforces the
+        # /var/lib/pharos-secrets/ paths (negative-path test removes
+        # the secret and asserts a clean condition-failure in the
+        # journal).
+        #
+        # Complementary to `checks.<system>.integration` (NOT a
+        # replacement): that one exercises module-default options +
+        # cross-service connectivity; this one exercises the
+        # deployment's option-set choices specifically. Without this
+        # check, a deployment-config-specific drift (placeholder
+        # serverName broken, firewall rule conflict, ConditionPathExists
+        # mistyped) would only surface on first OVH cruise after
+        # paying for hardware.
+        #
+        # CI policy: lives in the flake checks set so `check-full`
+        # (push to `main` + nightly cron) picks it up automatically.
+        # NOT added to `check-pr`'s explicit named-check list — wall-
+        # clock is in the same band as `integration` (~22 min cold)
+        # and per-PR feedback already includes that check; the
+        # marginal value here lands on push-to-main and on nightly,
+        # not on every PR commit.
+        checks.deployment-integration = import ./tests/deployment-integration.nix {
+          inherit pkgs;
+          flake = self;
+          diskoModule = disko.nixosModules.disko;
+        };
+
         # Shellcheck pass over every non-orchestrator Makefile recipe
         # in `deployments/ovh-test/Makefile`. The recipes are the
         # highest-bug-density file in the deployment (Make + Bash
