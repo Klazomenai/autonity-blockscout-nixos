@@ -161,8 +161,8 @@ pkgs.testers.nixosTest {
     }:
     let
       cfg = nodes.machine;
-      acmeServer = cfg.security.acme.certs."deployment.invalid".server or null;
       expectedServerName = cfg.services.blockscout-nginx.serverName;
+      acmeServer = cfg.security.acme.certs.${expectedServerName}.server or null;
     in
     # Eval-time gate: if the deployment's `acme.useStaging = true`
     # ever drifted to false (or the staging URL changed upstream),
