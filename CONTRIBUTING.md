@@ -81,7 +81,7 @@ Without this check, a deployment-config-specific drift (placeholder `serverName`
 
 The check verifies five things:
 
-1. Placeholder `serverName = "deployment.invalid"` flows through to a working nginx vhost (`nginx -t` clean + rendered config carries the placeholder).
+1. Placeholder `serverName = "deployment.invalid"` flows through to a working nginx vhost — verified end-to-end via an HTTPS curl round-trip to `/api/health/liveness` with `--resolve` pinning the hostname to loopback (if nginx weren't `server_name`'d to the placeholder, server-block selection would fail to reach the upstream).
 2. `acme.useStaging = true` resolves to the LE staging directory URL in `security.acme.certs."deployment.invalid".server` (eval-time assertion — the test fails at evaluation if it ever points at production LE).
 3. Firewall opens 30303/{tcp,udp} (autonity p2p), 80/443 (nginx), and 22 (openssh) without listen-socket conflicts. UDP rule presence verified by `iptables-save` inspection because `wait_for_open_port` can't probe UDP listeners.
 4. `ConditionPathExists` set on `blockscout-backend.service` + `postgresql-setup.service` referencing `/var/lib/pharos-secrets/{secret_key_base,database_password}` — both static (option present) and dynamic (negative path: stop backend, remove `secret_key_base`, attempt restart, assert clean condition-failure in journal + unit `inactive`/`failed`, then restore + restart to prove the recovery path).

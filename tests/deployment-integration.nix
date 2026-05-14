@@ -28,7 +28,10 @@
 #      its required secret file absent fails with a clean
 #      `ConditionPathExists=...was not met` line, NOT a service-
 #      specific crash deep in the journal.
-#   5. `networking.hostName = "pharos-test"` propagates to the kernel.
+#
+# `networking.hostName = "pharos-test"` propagation is verified
+# eval-time by `checks.<system>.deployment-eval`, not here — the test
+# framework forces `hostName = "machine"` (see mkForce below).
 #
 # VM-incompatible bits of the deployment config are mkForce'd off:
 #   - `disko.devices.*` — nixosTest provides its own root via
@@ -215,13 +218,20 @@ pkgs.testers.nixosTest {
         # itself must still be present (production deployment runs
         # without those overrides). Inspect the firewall directly.
         iptables_save = machine.succeed("iptables-save")
-        assert "--dport 30303" in iptables_save, (
+
+        # nixpkgs' firewall emits separate `-p tcp` / `-p udp` rules.
+        # Both assertions scan per-line so a UDP rule can't satisfy
+        # the TCP check (the broad `"--dport 30303" in whole_string`
+        # form would pass even when only the UDP rule is present).
+        tcp_rule_present = any(
+            "-p tcp" in line and "--dport 30303" in line
+            for line in iptables_save.splitlines()
+        )
+        assert tcp_rule_present, (
             f"30303/tcp not in iptables filter: {iptables_save!r}"
         )
 
-        # 30303 UDP: nixpkgs' firewall splits TCP/UDP into separate
-        # `iptables -p tcp` / `iptables -p udp` rules; the same
-        # `--dport 30303` line appears with `-p udp` for the UDP rule.
+        # 30303 UDP: same per-line scan.
         udp_rule_present = any(
             "-p udp" in line and "--dport 30303" in line
             for line in iptables_save.splitlines()
