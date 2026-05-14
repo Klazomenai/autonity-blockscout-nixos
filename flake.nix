@@ -485,6 +485,70 @@
                 services.blockscout-nginx.acme.email  = ${actualEmail}
             '';
 
+        # Disko install test for `deployments/ovh-test/disk-config.nix`.
+        # Boots a QEMU VM, formats the virtio disks per the disko
+        # spec, and runs `nixos-install` (which also runs the GRUB
+        # installer via `switch-to-configuration boot`). Powered by
+        # disko's `makeDiskoTest` framework, which automatically
+        # rewrites the spec's `/dev/nvme0n1` to `/dev/vda` for the
+        # test VM.
+        #
+        # Scope: disk-config + install phase only — service modules
+        # + hardware config are NOT loaded, and `testBoot = false`
+        # skips the post-install boot phase. Catches GPT layout
+        # typos, missing ESP + mountpoint wiring, mkfs / fstab
+        # errors, and GRUB install failures (the bootloader install
+        # runs as part of `nixos-enter ... switch-to-configuration
+        # boot`, BEFORE the boot phase). Service-composition
+        # validation in a fuller VM is **planned** under issue #56
+        # (full-VM integration of `deployments/ovh-test/configuration.nix`),
+        # which has not yet shipped — until it does, boot-time
+        # failures (vmlinuz path drift, initrd composition, post-
+        # boot fstab mount, post-boot systemd unit failures) are
+        # NOT covered by any automated check. They surface only on
+        # first real-OVH cycle.
+        #
+        # `testBoot = false` decision rationale (empirical): with
+        # `testBoot = true` (the framework default) the boot phase
+        # tests pass quickly under TCG software emulation (no KVM
+        # available in the local builder sandbox) — ~7 min wallclock
+        # for the test script, both `mountpoint /` and `mountpoint
+        # /boot` succeed cleanly. BUT the framework's VM teardown
+        # then hangs in ACPI poweroff for 15+ more minutes before
+        # the build artifact materialises (QEMU CPU drops to ~7%
+        # but the nixos-test-driver keeps waiting on the QMP
+        # shutdown handshake that never completes cleanly). Skipping
+        # the boot phase cuts wallclock from 20+ min (hung in
+        # shutdown) to 4.1 min clean. Re-enabling `testBoot = true`
+        # can be revisited if (a) #56 lands and supersedes this
+        # check's boot-time coverage, or (b) a CI environment
+        # becomes available offering reliable nested-virt KVM
+        # acceleration.
+        #
+        # `efi = true` matches `boot.loader.grub.efiSupport = true`
+        # in `deployments/ovh-test/configuration.nix`. The 1 MiB
+        # BIOS-boot partition in the spec elicits a non-fatal
+        # `sgdisk --align-end --new=1:0:+1M` warning during the
+        # install phase (alignment vs minimum-size conflict on the
+        # test VM's small disk geometry); disko continues past it
+        # and the partition gets created in the fallback path.
+        # Real OVH B3 instances ship 80+ GiB disks where the
+        # alignment math always succeeds, and they boot UEFI so
+        # the BIOS-boot partition is contingency-only and never
+        # actually consulted.
+        #
+        # CI policy: lives in the flake checks set so `check-full`
+        # (push to `main` + nightly cron) picks it up automatically.
+        # Not added to `check-pr`'s explicit named-check list — the
+        # install phase still takes ~4 min under TCG.
+        checks.disko-install = disko.lib.testLib.makeDiskoTest {
+          inherit pkgs;
+          name = "ovh-test-disk-install";
+          disko-config = ./deployments/ovh-test/disk-config.nix;
+          efi = true;
+          testBoot = false;
+        };
+
         # Full-closure build check for `nixosConfigurations.ovh-test`.
         # Where `deployment-eval` (above) catches type errors,
         # assertion failures, and broken imports at evaluation time,
