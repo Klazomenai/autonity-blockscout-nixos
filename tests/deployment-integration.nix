@@ -175,7 +175,7 @@ pkgs.testers.nixosTest {
     if !(acmeServer != null && pkgs.lib.hasInfix "acme-staging-v02.api.letsencrypt.org" acmeServer) then
       throw ''
         deployment-integration eval-time assertion FAILED:
-          security.acme.certs."deployment.invalid".server = ${builtins.toJSON acmeServer}
+          security.acme.certs."${expectedServerName}".server = ${builtins.toJSON acmeServer}
         Expected the LE staging directory URL (acme-staging-v02.api.letsencrypt.org).
         Set `services.blockscout-nginx.acme.useStaging = true` in
         `deployments/ovh-test/configuration.nix`.
@@ -357,6 +357,6 @@ pkgs.testers.nixosTest {
         #    if it wasn't staging. Echo the resolved URL for the build
         #    log so the test record is self-explanatory.
         # ---------------------------------------------------------------
-        machine.log("ACME server URL (deployment.invalid): ${toString acmeServer}")
+        machine.log("ACME server URL (${expectedServerName}): ${builtins.toJSON acmeServer}")
       '';
 }
