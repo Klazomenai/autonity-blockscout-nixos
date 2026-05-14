@@ -373,7 +373,7 @@ pkgs.testers.nixosTest {
         # Restore the file so the recovery path is exercised — proves
         # the unit isn't permanently disabled by the condition failure.
         machine.succeed(
-            "${pkgs.coreutils}/bin/install -m 0400 -o root -g root /dev/null "
+            "${pkgs.coreutils}/bin/install -m 0600 -o root -g root /dev/null "
             "${pharosSecretsDir}/secret_key_base"
         )
         machine.succeed(
