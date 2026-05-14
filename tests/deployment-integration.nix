@@ -18,9 +18,12 @@
 #      127.0.0.1).
 #   2. `acme.useStaging = true` resolves to the LE staging directory
 #      URL in the merged `security.acme.certs.<name>.server`.
-#   3. Firewall opens 30303/{tcp,udp} (autonity p2p), 80/443 (nginx),
-#      and 22 (openssh) without conflict against the services'
-#      listen sockets.
+#   3. Firewall rules: 22/80/443/4000 verified via actual listener
+#      probe (`wait_for_open_port`); 30303/{tcp,udp} verified via
+#      `iptables-save` inspection only — autonity runs with
+#      `--nodiscover --maxpeers=0` in the VM so no p2p listener
+#      is bound, but the firewall rule is still required for
+#      production (which runs without those overrides).
 #   4. `ConditionPathExists` assertions on
 #      `blockscout-backend.service` + `postgresql-setup.service`
 #      reference the `/var/lib/pharos-secrets/` paths the deployment
@@ -357,6 +360,6 @@ pkgs.testers.nixosTest {
         #    if it wasn't staging. Echo the resolved URL for the build
         #    log so the test record is self-explanatory.
         # ---------------------------------------------------------------
-        machine.log("ACME server URL (${expectedServerName}): ${builtins.toJSON acmeServer}")
+        machine.log("ACME server URL (${expectedServerName}): ${toString acmeServer}")
       '';
 }
