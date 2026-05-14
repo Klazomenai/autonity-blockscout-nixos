@@ -36,20 +36,21 @@
 # eval-time by `checks.<system>.deployment-eval`, not here — the test
 # framework forces `hostName = "machine"` (see mkForce below).
 #
-# VM-incompatible bits of the deployment config are mkForce'd off:
-#   - `disko.devices.*` — nixosTest provides its own root via
-#     `virtualisation.*`; disko has no real disk to format.
-#   - `boot.loader.grub.*` — nixosTest installs its own minimal boot
-#     setup; trying to write GPT / EFI vars in the test VM fails.
-#   - `services.autonity.p2p.maxPeers` + `extraArgs` — kept hermetic
-#     with `--nodiscover --maxpeers=0` so the test doesn't wait on
-#     outbound 30303 reachability. Note `p2p.openFirewall` stays on
-#     so we can still verify the firewall rule.
-#   - `services.blockscout-nginx.acme.enable` — kept ENABLED so the
-#     security.acme.certs config renders and we can read the staging
-#     URL from the merged config. nginx falls back to a self-signed
-#     placeholder cert when the real ACME runner can't reach LE
-#     (which it can't, against `deployment.invalid`).
+# VM fixture choices — mkForce overrides AND deliberate non-overrides:
+#   - `disko.devices.*` — mkForce { }; nixosTest provides its own root
+#     via `virtualisation.*`; disko has no real disk to format.
+#   - `boot.loader.grub.*` — mkForce false; nixosTest installs its own
+#     minimal boot setup; trying to write GPT / EFI vars in the test
+#     VM fails.
+#   - `services.autonity.p2p.maxPeers` + `extraArgs` — mkForce hermetic
+#     (`--nodiscover --maxpeers=0`) so the test doesn't wait on outbound
+#     30303 reachability. `p2p.openFirewall` is NOT overridden so the
+#     iptables rule is still present and can be verified.
+#   - `services.blockscout-nginx.acme.enable` — NOT overridden; kept at
+#     the deployment's value (true) so `security.acme.certs` renders and
+#     we can read the staging URL from the merged config. nginx falls
+#     back to a self-signed placeholder cert when the real ACME runner
+#     can't reach LE (which it can't, against `deployment.invalid`).
 {
   pkgs,
   flake,
