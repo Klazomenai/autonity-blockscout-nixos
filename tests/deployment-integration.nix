@@ -175,12 +175,31 @@ pkgs.testers.nixosTest {
     # underscore prefix only on lambda patterns, not on let
     # bindings; the if/else pattern keeps the assertion load-
     # bearing without a deadnix opt-out.
+    # Gate 1: ACME staging URL.
     if !(acmeServer != null && pkgs.lib.hasInfix "acme-staging-v02.api.letsencrypt.org" acmeServer) then
       throw ''
         deployment-integration eval-time assertion FAILED:
           security.acme.certs."${expectedServerName}".server = ${builtins.toJSON acmeServer}
         Expected the LE staging directory URL (acme-staging-v02.api.letsencrypt.org).
         Set `services.blockscout-nginx.acme.useStaging = true` in
+        `deployments/ovh-test/configuration.nix`.
+      ''
+    # Gate 2: serverName matches the hard-coded `networking.extraHosts`
+    # entry in the node config above. `expectedServerName` is read from
+    # `nodes.machine` so it's unavailable at node-config evaluation
+    # time — the node config hard-codes `deployment.invalid` in
+    # `networking.extraHosts`. If `serverName` drifts, the curl would
+    # try to connect to a name that isn't resolved to loopback; this
+    # gate makes the drift loud at eval time instead.
+    else if expectedServerName != "deployment.invalid" then
+      throw ''
+        deployment-integration eval-time assertion FAILED:
+          services.blockscout-nginx.serverName = "${expectedServerName}"
+        Expected "deployment.invalid" — the hard-coded
+        `networking.extraHosts` entry in this test file resolves only
+        that name to 127.0.0.1. Update the node config's
+        `networking.extraHosts` to match the new serverName, or
+        revert `serverName` to "deployment.invalid" in
         `deployments/ovh-test/configuration.nix`.
       ''
     else
@@ -200,12 +219,16 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("sshd.service")
 
         # ---------------------------------------------------------------
-        # 2. Firewall rules — every required port present + no listen-
-        #    socket conflict. Port-open assertions probe via the actual
-        #    listener; `iptables-save` inspection covers UDP (which
-        #    `wait_for_open_port` doesn't probe) for autonity p2p.
+        # 2. Service reachability + firewall rule presence.
+        #    `wait_for_open_port` probes the actual listener (from
+        #    within the VM — all traffic is on the same loopback
+        #    network, so this validates the service is up and reachable,
+        #    not that external inbound firewall rules are open).
+        #    30303/{tcp,udp} gets explicit `iptables-save` inspection
+        #    because no listener is bound under the hermetic override
+        #    and the production firewall rule still needs to be present.
         # ---------------------------------------------------------------
-        machine.wait_for_open_port(22)    # openssh (openFirewall=true)
+        machine.wait_for_open_port(22)    # openssh listening
         machine.wait_for_open_port(80)    # nginx HTTP (forceSSL redirect)
         machine.wait_for_open_port(443)   # nginx HTTPS
 

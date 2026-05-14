@@ -591,9 +591,10 @@
         # have no nixosTest analogue) and asserts the deployment-
         # specific option choices reach the running system:
         # placeholder serverName flows to the nginx vhost, ACME
-        # staging URL resolves, firewall opens 80/443 + 22
-        # (listener-probed) and 30303/{tcp,udp} (iptables-rule-only;
-        # autonity p2p not bound under hermetic override), and
+        # staging URL resolves, services on 80/443/22/4000 are
+        # listening and reachable (wait_for_open_port; VM-internal
+        # probe), 30303/{tcp,udp} firewall rule present (iptables-save;
+        # no p2p listener under hermetic override), and
         # ConditionPathExists on backend + postgresql-setup units
         # both statically references and dynamically enforces the
         # /var/lib/pharos-secrets/ paths (negative-path test removes
