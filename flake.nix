@@ -596,7 +596,7 @@
         # probe), 30303/{tcp,udp} firewall rule present (iptables-save;
         # no p2p listener under hermetic override), and
         # ConditionPathExists on backend + postgresql-setup units
-        # both statically references and dynamically enforces the
+        # both statically reference and dynamically enforce the
         # /var/lib/pharos-secrets/ paths (negative-path test removes
         # the secret and asserts a clean condition-failure in the
         # journal).
