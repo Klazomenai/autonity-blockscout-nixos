@@ -18,12 +18,12 @@
 #      127.0.0.1).
 #   2. `acme.useStaging = true` resolves to the LE staging directory
 #      URL in the merged `security.acme.certs.<name>.server`.
-#   3. Firewall rules: 22/80/443/4000 verified via actual listener
-#      probe (`wait_for_open_port`); 30303/{tcp,udp} verified via
-#      `iptables-save` inspection only — autonity runs with
-#      `--nodiscover --maxpeers=0` in the VM so no p2p listener
-#      is bound, but the firewall rule is still required for
-#      production (which runs without those overrides).
+#   3. Service reachability + firewall rule presence: 22/80/443/4000
+#      services verified as listening and reachable via
+#      `wait_for_open_port` (VM-internal probe); 30303/{tcp,udp}
+#      firewall rule verified via `iptables-save` inspection — no
+#      p2p listener is bound under the hermetic override, but the
+#      production rule must still be present.
 #   4. `ConditionPathExists` assertions on
 #      `blockscout-backend.service` + `postgresql-setup.service`
 #      reference the `/var/lib/pharos-secrets/` paths the deployment
@@ -133,10 +133,14 @@ pkgs.testers.nixosTest {
       #
       # Placed under `/var/lib/` rather than `/run/` because the
       # deployment expects them to survive reboots — `--extra-files`
-      # ships them to the host filesystem, not a tmpfs. The
-      # `system.activationScripts` shape mirrors the production
-      # sops-nix / agenix flow: a known directory with mode bits per-
-      # consumer (skb 0400 root, db_password 0440 postgres).
+      # ships them to the host filesystem, not a tmpfs.
+      #
+      # Permissions mirror the Makefile's `--extra-files` staging layout
+      # (`deployments/ovh-test/Makefile`, `stage` target): dir 0700,
+      # both files 0600 root-owned. `database_password` does NOT need
+      # postgres ownership here because the module ingests it via
+      # `LoadCredential=` — systemd (root) reads the source file and
+      # places it in `$CREDENTIALS_DIRECTORY` for the service to consume.
       #
       # `${...}` antiquotes the bytes once at derivation-build time,
       # so the activation script body itself contains the literal
@@ -145,10 +149,10 @@ pkgs.testers.nixosTest {
       # for the longer rationale.
       # ---------------------------------------------------------------
       system.activationScripts.test-secrets = ''
-        ${pkgs.coreutils}/bin/install -d -m 0755 ${pharosSecretsDir}
-        ${pkgs.coreutils}/bin/install -m 0400 -o root -g root /dev/null ${pharosSecretsDir}/secret_key_base
+        ${pkgs.coreutils}/bin/install -d -m 0700 ${pharosSecretsDir}
+        ${pkgs.coreutils}/bin/install -m 0600 -o root -g root /dev/null ${pharosSecretsDir}/secret_key_base
         printf '%s' ${lib.escapeShellArg testSecretKeyBase} > ${pharosSecretsDir}/secret_key_base
-        ${pkgs.coreutils}/bin/install -m 0440 -o postgres -g postgres /dev/null ${pharosSecretsDir}/database_password
+        ${pkgs.coreutils}/bin/install -m 0600 -o root -g root /dev/null ${pharosSecretsDir}/database_password
         printf '%s' 'test-password-not-for-production' > ${pharosSecretsDir}/database_password
       '';
     };
