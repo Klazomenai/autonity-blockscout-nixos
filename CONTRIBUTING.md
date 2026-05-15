@@ -49,7 +49,7 @@ The check runs as part of `nix flake check` alongside `fmt` and `hardening`, but
 
 `checks.<system>.disko-install` (defined inline in `flake.nix`) verifies that `deployments/ovh-test/disk-config.nix` produces a valid install by booting a QEMU VM, formatting the virtio disks per the disko spec, and running `nixos-install` (which also installs GRUB). Powered by disko's `makeDiskoTest` framework, which automatically rewrites the spec's `/dev/nvme0n1` to `/dev/vda` for the test VM.
 
-Scope is **disk-config + install phase only** — service modules + the per-instance hardware-config are NOT loaded, and `testBoot = false` skips the post-install boot phase. The check catches GPT layout typos, missing ESP + mountpoint wiring, mkfs / fstab errors, and GRUB install failures (the bootloader install runs as part of `switch-to-configuration boot`, before the boot phase). Boot-time failures (vmlinuz path drift, initrd composition, post-boot fstab mount, post-boot systemd unit failures) are **not currently covered by any automated check** — `#56` is open to track adding a full-VM integration test of `deployments/ovh-test/configuration.nix` that would supersede this check's boot-time coverage; until that lands, those failure modes surface only on first real-OVH cycle.
+Scope is **disk-config + install phase only** — service modules + the per-instance hardware-config are NOT loaded, and `testBoot = false` skips the post-install boot phase. The check catches GPT layout typos, missing ESP + mountpoint wiring, mkfs / fstab errors, and GRUB install failures (the bootloader install runs as part of `switch-to-configuration boot`, before the boot phase). Service-composition correctness on the same disk-config is covered separately by `checks.<system>.deployment-integration` (see below), which boots the full deployment config in a VM. Boot-time failures specific to the post-install boot phase (vmlinuz path drift, initrd composition, post-boot fstab mount, post-boot systemd unit failures) remain uncovered by either check — they surface only on first real-OVH cycle.
 
 The `testBoot = false` choice is empirical: under TCG software emulation (no KVM in the local builder sandbox), the boot phase tests pass quickly but the framework's VM teardown hangs in ACPI poweroff for 15+ minutes before the build artifact materialises. Skipping the boot phase lets the check ship reliably in any environment.
 
@@ -72,6 +72,28 @@ nix build .#checks.x86_64-linux.deployment-build --print-build-logs
 ```
 
 Wall-clock: ~5-15 minutes cold on a fresh checkout, faster on warm cache or Nix-binary-cache hits.
+
+## Full-stack VM deployment-config integration test
+
+`checks.<system>.deployment-integration` (defined by `tests/deployment-integration.nix`) boots `deployments/ovh-test/configuration.nix` itself in a `pkgs.testers.nixosTest` VM and asserts the deployment-specific option choices reach the running system. Complementary to the generic `checks.<system>.integration` (NOT a replacement): that one exercises the six service modules at module-default options; this one exercises the deployment's option-set choices specifically.
+
+Without this check, a deployment-config-specific drift (placeholder `serverName` broken, firewall rule conflict, `ConditionPathExists` mistyped) would only surface on first OVH cruise after paying for hardware.
+
+The check verifies five things:
+
+1. Placeholder `serverName = "deployment.invalid"` flows through to a working nginx vhost — verified end-to-end via an HTTPS curl round-trip to `/api/health/liveness` with `--resolve` pinning the hostname to loopback (if nginx weren't `server_name`'d to the placeholder, server-block selection would fail to reach the upstream).
+2. `acme.useStaging = true` resolves to the LE staging directory URL in `security.acme.certs."deployment.invalid".server` (eval-time assertion — the test fails at evaluation if it ever points at production LE).
+3. Service reachability + firewall rule presence: 22/80/443/4000 verified as listening and reachable via `wait_for_open_port` (VM-internal probe — validates the service is up, not external inbound firewall policy); 30303/{tcp,udp} verified via `iptables-save` per-line inspection — autonity runs `--nodiscover --maxpeers=0` so no p2p listener is bound, but the production firewall rule must still be present.
+4. `ConditionPathExists` set on `blockscout-backend.service` + `postgresql-setup.service` referencing `/var/lib/pharos-secrets/{secret_key_base,database_password}` — both static (option present) and dynamic (negative path: stop backend, remove `secret_key_base`, attempt restart, assert clean condition-failure in journal + unit `inactive`/`failed`, then restore + restart to prove the recovery path).
+5. Closure builds with the actual deployment imports (disko module, GRUB, etc.); VM-incompatible bits are `mkForce`'d off via inline overrides documented in the test file.
+
+**CI policy**: runs only under `check-full` (push to `main` + nightly cron). Excluded from `check-pr` because per-PR feedback already includes the generic `integration` check at similar wall-clock and the marginal value here lands on push-to-main / nightly. Run locally before pushing deployment-config changes:
+
+```sh
+nix build .#checks.x86_64-linux.deployment-integration --print-build-logs
+```
+
+Wall-clock: in the same band as `integration` (~22 min cold), faster on warm cache.
 
 ## Env-var contract check
 
