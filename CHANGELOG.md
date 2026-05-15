@@ -2,6 +2,13 @@
 
 Managed by [release-please](https://github.com/googleapis/release-please). Entries are added automatically from Conventional Commit messages when release PRs are cut.
 
+## [0.2.0-alpha.0](https://github.com/Klazomenai/autonity-blockscout-nixos/compare/autonity-blockscout-nixos-v0.1.0-alpha.0...autonity-blockscout-nixos-v0.2.0-alpha.0) (2026-05-15)
+
+
+### Features
+
+* **deployments:** bootstrap deployments/ovh-test M3 test-bed harness + Makefile shellcheck ⛵ ([#52](https://github.com/Klazomenai/autonity-blockscout-nixos/issues/52)) ([55fba9a](https://github.com/Klazomenai/autonity-blockscout-nixos/commit/55fba9a88c426db8fce13c1681cebf05e19962ca)), closes [#49](https://github.com/Klazomenai/autonity-blockscout-nixos/issues/49)
+
 ## 0.1.0-alpha.0 (2026-05-11)
 
 
